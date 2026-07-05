@@ -8,9 +8,10 @@ set -euo pipefail
 #   ROOT=/path/to/VAE-Traversals bash setup_gat_assets.sh
 #   SKIP_DOWNLOAD=1 EXTRACT_TINY_N=32 bash setup_gat_assets.sh
 #   SKIP_DOWNLOAD=1 EXTRACT_TINY_N=16 RUN_GAT_SMOKE=1 bash setup_gat_assets.sh
-#   JOIN_ARCHIVES=1 EXTRACT_ARCHIVES=1 bash setup_gat_assets.sh
+#   INSTALL_CUDA128_TORCH=1 bash setup_gat_assets.sh
+#   SKIP_DOWNLOAD=1 JOIN_ARCHIVES=0 EXTRACT_ARCHIVES=0 EXTRACT_TINY_N=16 RUN_GAT_SMOKE=1 bash setup_gat_assets.sh
 
-ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PYTHON="${PYTHON:-python3}"
 DATASET_DIR="${DATASET_DIR:-$ROOT/dataset}"
 CHUNKS_DIR="${CHUNKS_DIR:-$DATASET_DIR/_chunks}"
@@ -18,9 +19,9 @@ SDVAE_DIR="${SDVAE_DIR:-$ROOT/pretrained_models/sd-vae-ft-mse}"
 
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
 INSTALL_GAT_REQUIREMENTS="${INSTALL_GAT_REQUIREMENTS:-1}"
-INSTALL_CUDA128_TORCH="${INSTALL_CUDA128_TORCH:-1}"
-JOIN_ARCHIVES="${JOIN_ARCHIVES:-0}"
-EXTRACT_ARCHIVES="${EXTRACT_ARCHIVES:-0}"
+INSTALL_CUDA128_TORCH="${INSTALL_CUDA128_TORCH:-0}"
+JOIN_ARCHIVES="${JOIN_ARCHIVES:-1}"
+EXTRACT_ARCHIVES="${EXTRACT_ARCHIVES:-1}"
 EXTRACT_TINY_N="${EXTRACT_TINY_N:-0}"
 TINY_DATASET_DIR="${TINY_DATASET_DIR:-$ROOT/dataset_tiny_gat}"
 RUN_GAT_SMOKE="${RUN_GAT_SMOKE:-0}"
@@ -70,16 +71,47 @@ if [[ "$JOIN_ARCHIVES" == "1" ]]; then
   # This requires roughly 275G extra beyond the chunk files.
   cat "$CHUNKS_DIR"/images.zip.chunk_* > "$DATASET_DIR/images.zip"
   cat "$CHUNKS_DIR"/vae-sd.zip.chunk_* > "$DATASET_DIR/vae-sd.zip"
+
+  # Free the chunk storage once the joined archives exist.
+  rm -f "$CHUNKS_DIR"/images.zip.chunk_* "$CHUNKS_DIR"/vae-sd.zip.chunk_*
 fi
 
 if [[ "$EXTRACT_ARCHIVES" == "1" ]]; then
   # Extract the full dataset into the directory layout expected by GAT/CAT:
   #   dataset/images/
   #   dataset/vae-sd/
-  # This requires substantially more disk than the compressed chunks.
-  mkdir -p "$DATASET_DIR/images" "$DATASET_DIR/vae-sd"
-  unzip -q "$DATASET_DIR/images.zip" -d "$DATASET_DIR/images"
-  unzip -q "$DATASET_DIR/vae-sd.zip" -d "$DATASET_DIR/vae-sd"
+  # Each joined archive is removed after its extraction is verified to keep
+  # peak disk usage as low as possible.
+  extract_archive() {
+    local zip_path="$1"
+    local out_dir="$2"
+    local verify_path="$3"
+
+    mkdir -p "$out_dir"
+    if command -v unzip >/dev/null 2>&1; then
+      unzip -q "$zip_path" -d "$out_dir"
+    else
+      "$PYTHON" - "$zip_path" "$out_dir" <<'PY'
+import sys
+import zipfile
+from pathlib import Path
+
+zip_path = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+with zipfile.ZipFile(zip_path) as zf:
+    zf.extractall(out_dir)
+PY
+    fi
+
+    if [[ ! -e "$verify_path" ]]; then
+      echo "Expected extracted file missing: $verify_path" >&2
+      exit 1
+    fi
+    rm -f "$zip_path"
+  }
+
+  extract_archive "$DATASET_DIR/images.zip" "$DATASET_DIR/images" "$DATASET_DIR/images/00000/img00000000.png"
+  extract_archive "$DATASET_DIR/vae-sd.zip" "$DATASET_DIR/vae-sd" "$DATASET_DIR/vae-sd/dataset.json"
 fi
 
 if [[ "$EXTRACT_TINY_N" != "0" ]]; then

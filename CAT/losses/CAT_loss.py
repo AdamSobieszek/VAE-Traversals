@@ -5,6 +5,7 @@ from torchvision.transforms import Normalize
 
 from losses.diffaug import DiffAugment as aug
 from cat_pyramid import (
+    cat_alignment_metrics,
     build_cat_fake_pyramid,
     build_cat_real_pyramid,
     cat_consistency_loss,
@@ -221,6 +222,7 @@ class CATLoss:
             "g_adv": g_adv,
             "cons_loss": cons_loss,
         }
+        loss_dict.update(cat_alignment_metrics(stage_outputs))
         extras = {"gen_images": stage_outputs}
         return loss, loss_dict, extras
 

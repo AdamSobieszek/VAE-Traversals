@@ -10,6 +10,7 @@ import torch.nn as nn
 sys.path.insert(0, ".")
 
 from cat_pyramid import (
+    cat_alignment_metrics,
     build_block_diag_attention_mask,
     build_cat_fake_pyramid,
     build_cat_real_pyramid,
@@ -20,6 +21,7 @@ from losses.diffaug import DiffAugment
 from models.discriminator import CATD_models
 from models.discriminator import CATDiscriminator
 from models.generator import CAT_models
+from models.pos_embed import MultiScaleVisionRotaryEmbeddingFast
 
 BLOCK_KWARGS = {"fused_attn": True, "qk_norm": True}
 
@@ -73,6 +75,7 @@ def test_pyramid_and_discriminator(device, block_kwargs):
     B = 2
     G = CAT_models["CAT-G-B/2"](input_size=32, num_classes=1000, z_dims=[768], **block_kwargs).to(device)
     D = CATD_models["CAT-D-B/2"](num_classes=1000, z_dims=[768], **block_kwargs).to(device)
+    assert D.feat_rope is not None
 
     x = torch.zeros(B, 4, 32, 32, device=device)
     y = torch.randint(0, 1000, (B,), device=device)
@@ -107,6 +110,17 @@ def test_attention_mask(device):
     print("attention mask: ok")
 
 
+def test_multiscale_rope(device):
+    rope = MultiScaleVisionRotaryEmbeddingFast(dim=4, grid_sizes=(16, 8, 4, 2)).to(device)
+    x = torch.randn(2, 4, 344, 8, device=device)
+    y = rope(x)
+    assert y.shape == x.shape
+    cls_indices = (0, 257, 322, 339)
+    assert torch.allclose(y[:, :, cls_indices], x[:, :, cls_indices])
+    assert not torch.allclose(y[:, :, 1:], x[:, :, 1:])
+    print("multiscale RoPE: ok")
+
+
 def test_consistency_loss(device):
     B = 2
     stages = [torch.randn(B, 4, 32, 32, device=device, requires_grad=True) for _ in range(4)]
@@ -118,6 +132,28 @@ def test_consistency_loss(device):
         assert stage.grad is not None
         assert torch.isfinite(stage.grad).all()
     print("consistency loss + backward: ok")
+
+
+def test_alignment_metrics(device):
+    stages = [torch.randn(2, 4, 32, 32, device=device, requires_grad=True) for _ in range(4)]
+    metrics = cat_alignment_metrics(stages)
+    expected_keys = {
+        "align/discrep_h0_final",
+        "align/discrep_h1_final",
+        "align/discrep_h2_final",
+        "align/rewrite_h0_h1",
+        "align/rewrite_h1_h2",
+        "align/rewrite_h2_h3",
+        "align/cos_update_h0",
+        "align/cos_update_h1",
+        "align/cos_update_h2",
+    }
+    assert set(metrics.keys()) == expected_keys
+    for value in metrics.values():
+        assert value.ndim == 0
+        assert torch.isfinite(value)
+        assert not value.requires_grad
+    print("alignment metrics: ok")
 
 
 def test_diffaugment_replay_scaling(device):
@@ -320,7 +356,9 @@ def main():
         lambda: test_generator_variants(device, block_kwargs),
         lambda: test_pyramid_and_discriminator(device, block_kwargs),
         lambda: test_attention_mask(device),
+        lambda: test_multiscale_rope(device),
         lambda: test_consistency_loss(device),
+        lambda: test_alignment_metrics(device),
         lambda: test_diffaugment_replay_scaling(device),
         lambda: test_cat_loss_stage_augmentation(device),
         lambda: test_repa_aux_uses_post_transformer_tokens(device),

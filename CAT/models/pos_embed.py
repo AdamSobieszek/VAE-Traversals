@@ -134,3 +134,26 @@ class VisionRotaryEmbeddingFast(nn.Module):
         t_spatial = t[:, :, -self.pt_seq_len**2:]
         t_pe = t_spatial * self.freqs_cos + rotate_half(t_spatial) * self.freqs_sin
         return torch.cat([t[:, :, :-self.pt_seq_len**2], t_pe], dim=2)
+
+
+class MultiScaleVisionRotaryEmbeddingFast(nn.Module):
+    def __init__(self, dim, grid_sizes=(16, 8, 4, 2), **rope_kwargs):
+        super().__init__()
+        self.grid_sizes = tuple(grid_sizes)
+        self.group_lengths = tuple(grid * grid + 1 for grid in self.grid_sizes)
+        self.ropes = nn.ModuleList(
+            [
+                VisionRotaryEmbeddingFast(dim=dim, pt_seq_len=grid, **rope_kwargs)
+                for grid in self.grid_sizes
+            ]
+        )
+
+    def forward(self, t):
+        assert t.shape[2] == sum(self.group_lengths)
+        parts = []
+        start = 0
+        for group_len, rope in zip(self.group_lengths, self.ropes):
+            end = start + group_len
+            parts.append(rope(t[:, :, start:end]))
+            start = end
+        return torch.cat(parts, dim=2)

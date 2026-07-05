@@ -44,6 +44,29 @@ def cat_consistency_loss(stage_outputs, weights=(1 / 3, 1 / 2, 1.0)):
     return sum(losses) / 3
 
 
+@torch.no_grad()
+def cat_alignment_metrics(stage_outputs):
+    h0, h1, h2, h3 = [stage.detach() for stage in stage_outputs]
+    metrics = {
+        "align/discrep_h0_final": F.mse_loss(h0, h3),
+        "align/discrep_h1_final": F.mse_loss(h1, h3),
+        "align/discrep_h2_final": F.mse_loss(h2, h3),
+        "align/rewrite_h0_h1": F.mse_loss(h0, h1),
+        "align/rewrite_h1_h2": F.mse_loss(h1, h2),
+        "align/rewrite_h2_h3": F.mse_loss(h2, h3),
+    }
+
+    final = h3.flatten(1)
+    for idx, (current, next_stage) in enumerate(((h0, h1), (h1, h2), (h2, h3))):
+        update = (next_stage - current).flatten(1)
+        target = final - current.flatten(1)
+        metrics[f"align/cos_update_h{idx}"] = F.cosine_similarity(
+            update, target, dim=1, eps=1e-8
+        ).mean()
+
+    return metrics
+
+
 def build_block_diag_attention_mask(group_lengths, device, dtype):
     total = sum(group_lengths)
     mask = torch.full((total, total), float("-inf"), device=device, dtype=dtype)

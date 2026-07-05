@@ -7,6 +7,7 @@ import numpy as np
 
 from timm.models.vision_transformer import Mlp
 from models.custom_layers import Attention, EqualLinear
+from models.pos_embed import MultiScaleVisionRotaryEmbeddingFast
 from models.swiglu_ffn import SwiGLUFFN
 from cat_pyramid import build_block_diag_attention_mask
 
@@ -121,6 +122,12 @@ class CATDiscriminator(nn.Module):
         self.scale_embed = nn.Parameter(torch.zeros(4, hidden_size))
         self.cls_tokens = nn.Parameter(torch.randn(4, 1, hidden_size) * 0.02)
 
+        half_head_dim = hidden_size // num_heads // 2
+        self.feat_rope = MultiScaleVisionRotaryEmbeddingFast(
+            dim=half_head_dim,
+            grid_sizes=self.SCALE_TOKEN_GRIDS,
+        )
+
         layer_gain = 1e-1
         self.blocks = nn.ModuleList(
             [
@@ -201,7 +208,7 @@ class CATDiscriminator(nn.Module):
                 self.ckpt_wrapper(block),
                 seq,
                 None,
-                None,
+                self.feat_rope,
                 attn_mask,
                 use_reentrant=False,
             )

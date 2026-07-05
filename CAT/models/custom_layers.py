@@ -53,7 +53,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, rope=None, return_attention=False, attn_mask=None):
+    def forward(self, x, rope=None, return_attention=False, attn_mask=None, group_lengths=None):
         bsz, num_tokens, channels = x.shape
         qkv = self.qkv(x).reshape(bsz, num_tokens, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
@@ -64,7 +64,37 @@ class Attention(nn.Module):
             q = rope(q)
             k = rope(k)
 
-        if self.fused_attn and not return_attention:
+        if group_lengths is not None:
+            if attn_mask is not None:
+                raise ValueError("group_lengths and attn_mask are mutually exclusive.")
+            if sum(group_lengths) != num_tokens:
+                raise ValueError(f"group_lengths={group_lengths} do not sum to {num_tokens} tokens.")
+            outputs = []
+            attn = q.new_zeros(bsz, self.num_heads, num_tokens, num_tokens) if return_attention else None
+            start = 0
+            for group_length in group_lengths:
+                end = start + group_length
+                q_group = q[:, :, start:end]
+                k_group = k[:, :, start:end]
+                v_group = v[:, :, start:end]
+                if self.fused_attn and not return_attention:
+                    outputs.append(
+                        torch.nn.functional.scaled_dot_product_attention(
+                            q_group,
+                            k_group,
+                            v_group,
+                            dropout_p=self.attn_drop.p if self.training else 0.0,
+                        )
+                    )
+                else:
+                    attn_group = (q_group * self.scale) @ k_group.transpose(-2, -1)
+                    attn_group = self.attn_drop(attn_group.softmax(dim=-1))
+                    outputs.append(attn_group @ v_group)
+                    if return_attention:
+                        attn[:, :, start:end, start:end] = attn_group
+                start = end
+            x = torch.cat(outputs, dim=2)
+        elif self.fused_attn and not return_attention:
             x = torch.nn.functional.scaled_dot_product_attention(
                 q,
                 k,

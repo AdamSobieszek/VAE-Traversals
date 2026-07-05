@@ -338,6 +338,28 @@ def CAT_G_S_2(**kwargs):
     )
 
 
+def CAT_G_S_4(**kwargs):
+    return CATGenerator(
+        depth=12,
+        hidden_size=384,
+        patch_size=4,
+        num_heads=6,
+        output_layers=(3, 6, 9, 12),
+        **kwargs,
+    )
+
+
+def CAT_G_S_8(**kwargs):
+    return CATGenerator(
+        depth=12,
+        hidden_size=384,
+        patch_size=8,
+        num_heads=6,
+        output_layers=(3, 6, 9, 12),
+        **kwargs,
+    )
+
+
 def CAT_G_B_2(**kwargs):
     return CATGenerator(
         depth=12,
@@ -373,6 +395,8 @@ def CAT_G_H_2(**kwargs):
 
 CAT_models = {
     "CAT-G-S/2": CAT_G_S_2,
+    "CAT-G-S/4": CAT_G_S_4,
+    "CAT-G-S/8": CAT_G_S_8,
     "CAT-G-B/2": CAT_G_B_2,
     "CAT-G-M/2": CAT_G_M_2,
     "CAT-G-H/2": CAT_G_H_2,

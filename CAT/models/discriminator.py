@@ -9,7 +9,6 @@ from timm.models.vision_transformer import Mlp
 from models.custom_layers import Attention, EqualLinear
 from models.pos_embed import MultiScaleVisionRotaryEmbeddingFast
 from models.swiglu_ffn import SwiGLUFFN
-from cat_pyramid import build_block_diag_attention_mask
 
 
 def build_mlp(hidden_size, projector_dim, z_dim):
@@ -67,8 +66,13 @@ class TransformerBlock(nn.Module):
         self.ls_attn = nn.Parameter(torch.ones(hidden_size) * layerscale)
         self.ls_mlp = nn.Parameter(torch.ones(hidden_size) * layerscale)
 
-    def forward(self, x, c=None, feat_rope=None, attn_mask=None):
-        x = x + self.attn(self.norm1(x), rope=feat_rope, attn_mask=attn_mask) * self.ls_attn
+    def forward(self, x, c=None, feat_rope=None, attn_mask=None, group_lengths=None):
+        x = x + self.attn(
+            self.norm1(x),
+            rope=feat_rope,
+            attn_mask=attn_mask,
+            group_lengths=group_lengths,
+        ) * self.ls_attn
         x = x + self.mlp(self.norm2(x)) * self.ls_mlp
         return x
 
@@ -106,6 +110,20 @@ class CATDiscriminator(nn.Module):
         self.hidden_size = hidden_size
         self.depth = depth
         self.cmap_dim = cmap_dim
+
+        if any(size % patch_size != 0 for size in self.SCALE_RESOLUTIONS):
+            raise ValueError(
+                f"patch_size={patch_size} must evenly divide all CAT discriminator "
+                f"scale resolutions {self.SCALE_RESOLUTIONS}."
+            )
+        self.SCALE_TOKEN_GRIDS = tuple(size // patch_size for size in self.SCALE_RESOLUTIONS)
+        self.GROUP_LENGTHS = tuple(grid * grid + 1 for grid in self.SCALE_TOKEN_GRIDS)
+        cls_indices = []
+        start = 0
+        for group_length in self.GROUP_LENGTHS:
+            cls_indices.append(start)
+            start += group_length
+        self.CLS_INDICES = tuple(cls_indices)
 
         self.patch_proj = nn.Conv2d(
             in_channels, hidden_size, kernel_size=patch_size, stride=patch_size, bias=True
@@ -152,12 +170,6 @@ class CATDiscriminator(nn.Module):
         if self.aux_feat_size > 0:
             self.proj = build_mlp(hidden_size, projector_dim, z_dims[0])
 
-        self.register_buffer(
-            "attn_mask",
-            build_block_diag_attention_mask(self.GROUP_LENGTHS, torch.device("cpu"), torch.float32),
-            persistent=False,
-        )
-
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -199,17 +211,15 @@ class CATDiscriminator(nn.Module):
 
         y_emb = self.y_embedder(y, self.training).squeeze(dim=1)
 
-        seq_parts = [self.encode_scale(x, idx) for idx, x in enumerate(xs)]
-        seq = torch.cat(seq_parts, dim=1)
-
-        attn_mask = self.attn_mask.to(device=seq.device, dtype=seq.dtype)
+        seq = torch.cat([self.encode_scale(x, idx) for idx, x in enumerate(xs)], dim=1)
         for block in self.blocks:
             seq = torch.utils.checkpoint.checkpoint(
                 self.ckpt_wrapper(block),
                 seq,
                 None,
                 self.feat_rope,
-                attn_mask,
+                None,
+                self.GROUP_LENGTHS,
                 use_reentrant=False,
             )
 
@@ -272,6 +282,16 @@ def CAT_D_S_2(**kwargs):
     )
 
 
+def CAT_D_S_4(**kwargs):
+    return CATDiscriminator(
+        depth=12,
+        hidden_size=384,
+        patch_size=4,
+        num_heads=6,
+        **kwargs,
+    )
+
+
 def CAT_D_B_2(**kwargs):
     return CATDiscriminator(
         depth=12,
@@ -284,5 +304,6 @@ def CAT_D_B_2(**kwargs):
 
 CATD_models = {
     "CAT-D-S/2": CAT_D_S_2,
+    "CAT-D-S/4": CAT_D_S_4,
     "CAT-D-B/2": CAT_D_B_2,
 }

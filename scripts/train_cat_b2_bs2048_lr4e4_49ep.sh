@@ -27,7 +27,13 @@ expdir="${EXPDIR:-../exps}"
 expname="${EXPNAME:-cat_s2_256_bs2048_lr4e4_49ep}"
 wandb_name="${WANDB_NAME:-CAT S2 bs2048 lr4e-4 49ep}"
 
-accelerate launch --num_processes 1 --main_process_port "${MAIN_PROCESS_PORT:-29502}" train.py \
+accelerate launch \
+  --num_processes 1 \
+  --num_machines 1 \
+  --mixed_precision bf16 \
+  --dynamo_backend no \
+  --main_process_port "${MAIN_PROCESS_PORT:-29502}" \
+  train.py \
   --report-to="${REPORT_TO:-wandb}" \
   --allow-tf32 \
   --mixed-precision="bf16" \

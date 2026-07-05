@@ -221,8 +221,24 @@ def main(args):
     )
 
     if accelerator.is_main_process:
-        logger.info(f"CAT generator parameters: {sum(p.numel() for p in generator.parameters()):,}")
-        logger.info(f"CAT discriminator parameters: {sum(p.numel() for p in discriminator.parameters()):,}")
+        generator_params = sum(p.numel() for p in generator.parameters())
+        discriminator_params = sum(p.numel() for p in discriminator.parameters())
+        discriminator_aux = getattr(discriminator, "proj", None)
+        discriminator_aux_params = (
+            sum(p.numel() for p in discriminator_aux.parameters())
+            if discriminator_aux is not None
+            else 0
+        )
+        discriminator_backbone_params = discriminator_params - discriminator_aux_params
+        logger.info(f"CAT generator parameters: {generator_params:,}")
+        logger.info(
+            f"CAT discriminator backbone parameters: {discriminator_backbone_params:,}"
+        )
+        if discriminator_aux_params > 0:
+            logger.info(
+                f"CAT discriminator auxiliary parameters: {discriminator_aux_params:,}"
+            )
+        logger.info(f"CAT discriminator total parameters: {discriminator_params:,}")
 
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True

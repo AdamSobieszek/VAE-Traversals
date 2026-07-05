@@ -21,6 +21,7 @@ from losses.diffaug import DiffAugment
 from models.discriminator import CATD_models
 from models.discriminator import CATDiscriminator
 from models.generator import CAT_models
+from models.custom_layers import Attention
 from models.pos_embed import MultiScaleVisionRotaryEmbeddingFast
 
 BLOCK_KWARGS = {"fused_attn": True, "qk_norm": True}
@@ -40,8 +41,15 @@ def make_batch(device, batch_size=2):
 
 
 def test_registry():
-    assert set(CAT_models.keys()) == {"CAT-G-S/2", "CAT-G-B/2", "CAT-G-M/2", "CAT-G-H/2"}
-    assert set(CATD_models.keys()) == {"CAT-D-S/2", "CAT-D-B/2"}
+    assert set(CAT_models.keys()) == {
+        "CAT-G-S/2",
+        "CAT-G-S/4",
+        "CAT-G-S/8",
+        "CAT-G-B/2",
+        "CAT-G-M/2",
+        "CAT-G-H/2",
+    }
+    assert set(CATD_models.keys()) == {"CAT-D-S/2", "CAT-D-S/4", "CAT-D-B/2"}
     print("registry: ok")
 
 
@@ -49,6 +57,8 @@ def test_generator_variants(device, block_kwargs):
     B = 2
     configs = {
         "CAT-G-S/2": (3, 6, 9, 12),
+        "CAT-G-S/4": (3, 6, 9, 12),
+        "CAT-G-S/8": (3, 6, 9, 12),
         "CAT-G-B/2": (3, 6, 9, 12),
         "CAT-G-M/2": (6, 12, 18, 24),
         "CAT-G-H/2": (8, 16, 24, 32),
@@ -111,14 +121,16 @@ def test_discriminator_variants(device, block_kwargs):
         torch.randn(B, 4, 4, 4, device=device),
     ]
     configs = {
-        "CAT-D-S/2": (12, 384, 6),
-        "CAT-D-B/2": (12, 768, 12),
+        "CAT-D-S/2": (12, 384, 6, (257, 65, 17, 5)),
+        "CAT-D-S/4": (12, 384, 6, (65, 17, 5, 2)),
+        "CAT-D-B/2": (12, 768, 12, (257, 65, 17, 5)),
     }
-    for name, (depth, hidden_size, num_heads) in configs.items():
+    for name, (depth, hidden_size, num_heads, group_lengths) in configs.items():
         D = CATD_models[name](num_classes=1000, z_dims=[0], **block_kwargs).to(device)
         assert D.depth == depth
         assert D.hidden_size == hidden_size
         assert D.num_heads == num_heads
+        assert D.GROUP_LENGTHS == group_lengths
         assert D.feat_rope is not None
         logits = D(pyramid, y)
         assert logits.shape == (B, 4)
@@ -135,6 +147,25 @@ def test_attention_mask(device):
     print("attention mask: ok")
 
 
+def test_grouped_attention_matches_mask(device):
+    torch.manual_seed(0)
+    group_lengths = (4, 3, 3)
+    attn = Attention(
+        dim=16,
+        num_heads=4,
+        qkv_bias=True,
+        qk_norm=False,
+        fused_attn=False,
+    ).to(device)
+    attn.eval()
+    x = torch.randn(2, sum(group_lengths), 16, device=device)
+    mask = build_block_diag_attention_mask(group_lengths, device, x.dtype)
+    dense_out = attn(x, attn_mask=mask)
+    grouped_out = attn(x, group_lengths=group_lengths)
+    assert torch.allclose(grouped_out, dense_out, atol=1e-5, rtol=1e-5)
+    print("grouped attention: ok")
+
+
 def test_multiscale_rope(device):
     rope = MultiScaleVisionRotaryEmbeddingFast(dim=4, grid_sizes=(16, 8, 4, 2)).to(device)
     x = torch.randn(2, 4, 344, 8, device=device)
@@ -144,6 +175,19 @@ def test_multiscale_rope(device):
     assert torch.allclose(y[:, :, cls_indices], x[:, :, cls_indices])
     assert not torch.allclose(y[:, :, 1:], x[:, :, 1:])
     print("multiscale RoPE: ok")
+
+
+def test_discriminator_param_accounting(block_kwargs):
+    D_backbone = CATD_models["CAT-D-B/2"](num_classes=1000, z_dims=[0], **block_kwargs)
+    backbone_params = sum(p.numel() for p in D_backbone.parameters())
+    assert 96_000_000 <= backbone_params <= 98_000_000
+
+    D_aux = CATD_models["CAT-D-B/2"](num_classes=1000, z_dims=[768], **block_kwargs)
+    total_params = sum(p.numel() for p in D_aux.parameters())
+    aux_params = sum(p.numel() for p in D_aux.proj.parameters())
+    assert total_params - aux_params == backbone_params
+    assert aux_params > 0
+    print("discriminator param accounting: ok")
 
 
 def test_consistency_loss(device):
@@ -389,7 +433,9 @@ def main():
         lambda: test_pyramid_and_discriminator(device, block_kwargs),
         lambda: test_discriminator_variants(device, block_kwargs),
         lambda: test_attention_mask(device),
+        lambda: test_grouped_attention_matches_mask(device),
         lambda: test_multiscale_rope(device),
+        lambda: test_discriminator_param_accounting(block_kwargs),
         lambda: test_consistency_loss(device),
         lambda: test_alignment_metrics(device),
         lambda: test_diffaugment_replay_scaling(device),

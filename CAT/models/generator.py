@@ -327,6 +327,17 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return np.concatenate([emb_sin, emb_cos], axis=1)
 
 
+def CAT_G_S_2(**kwargs):
+    return CATGenerator(
+        depth=12,
+        hidden_size=384,
+        patch_size=2,
+        num_heads=6,
+        output_layers=(3, 6, 9, 12),
+        **kwargs,
+    )
+
+
 def CAT_G_B_2(**kwargs):
     return CATGenerator(
         depth=12,
@@ -361,6 +372,7 @@ def CAT_G_H_2(**kwargs):
 
 
 CAT_models = {
+    "CAT-G-S/2": CAT_G_S_2,
     "CAT-G-B/2": CAT_G_B_2,
     "CAT-G-M/2": CAT_G_M_2,
     "CAT-G-H/2": CAT_G_H_2,

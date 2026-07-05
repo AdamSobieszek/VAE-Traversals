@@ -40,14 +40,15 @@ def make_batch(device, batch_size=2):
 
 
 def test_registry():
-    assert set(CAT_models.keys()) == {"CAT-G-B/2", "CAT-G-M/2", "CAT-G-H/2"}
-    assert set(CATD_models.keys()) == {"CAT-D-B/2"}
+    assert set(CAT_models.keys()) == {"CAT-G-S/2", "CAT-G-B/2", "CAT-G-M/2", "CAT-G-H/2"}
+    assert set(CATD_models.keys()) == {"CAT-D-S/2", "CAT-D-B/2"}
     print("registry: ok")
 
 
 def test_generator_variants(device, block_kwargs):
     B = 2
     configs = {
+        "CAT-G-S/2": (3, 6, 9, 12),
         "CAT-G-B/2": (3, 6, 9, 12),
         "CAT-G-M/2": (6, 12, 18, 24),
         "CAT-G-H/2": (8, 16, 24, 32),
@@ -98,6 +99,30 @@ def test_pyramid_and_discriminator(device, block_kwargs):
     assert aux["x_feat"][0].shape[0] == B
     assert aux["x_feat"][1].shape[0] == B
     print("pyramid + discriminator: ok")
+
+
+def test_discriminator_variants(device, block_kwargs):
+    B = 2
+    y = torch.randint(0, 1000, (B,), device=device)
+    pyramid = [
+        torch.randn(B, 4, 32, 32, device=device),
+        torch.randn(B, 4, 16, 16, device=device),
+        torch.randn(B, 4, 8, 8, device=device),
+        torch.randn(B, 4, 4, 4, device=device),
+    ]
+    configs = {
+        "CAT-D-S/2": (12, 384, 6),
+        "CAT-D-B/2": (12, 768, 12),
+    }
+    for name, (depth, hidden_size, num_heads) in configs.items():
+        D = CATD_models[name](num_classes=1000, z_dims=[0], **block_kwargs).to(device)
+        assert D.depth == depth
+        assert D.hidden_size == hidden_size
+        assert D.num_heads == num_heads
+        assert D.feat_rope is not None
+        logits = D(pyramid, y)
+        assert logits.shape == (B, 4)
+        print(f"discriminator {name}: ok")
 
 
 def test_attention_mask(device):
@@ -260,6 +285,13 @@ def test_loss_steps(device, block_kwargs):
     assert torch.isfinite(g_loss).all()
     assert torch.isfinite(g_dict["g_adv"]).all()
     assert torch.isfinite(g_dict["cons_loss"]).all()
+    assert not any(key.startswith("align/") for key in g_dict)
+
+    _, g_align_dict, _ = loss_fn.step_gen(
+        G, D, None, images, raw_images, 0, model_kwargs, log_alignment=True
+    )
+    assert "align/discrep_h0_final" in g_align_dict
+    assert all(torch.isfinite(value).all() for value in g_align_dict.values())
     assert len(extras["gen_images"]) == 4
     print("loss steps: ok")
 
@@ -355,6 +387,7 @@ def main():
         test_registry,
         lambda: test_generator_variants(device, block_kwargs),
         lambda: test_pyramid_and_discriminator(device, block_kwargs),
+        lambda: test_discriminator_variants(device, block_kwargs),
         lambda: test_attention_mask(device),
         lambda: test_multiscale_rope(device),
         lambda: test_consistency_loss(device),

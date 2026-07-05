@@ -367,8 +367,21 @@ def main(args):
 
             with accelerator.accumulate(generator):
                 accelerator.unwrap_model(generator).requires_grad_(True)
+                next_global_step = global_step + 1 if accelerator.sync_gradients else global_step
+                log_alignment = (
+                    args.alignment_logging_steps > 0
+                    and accelerator.sync_gradients
+                    and next_global_step % args.alignment_logging_steps == 0
+                )
                 loss, gen_loss_dict, _ = loss_fn.step_gen(
-                    generator, discriminator, None, x, raw_image, global_step, model_kwargs
+                    generator,
+                    discriminator,
+                    None,
+                    x,
+                    raw_image,
+                    global_step,
+                    model_kwargs,
+                    log_alignment=log_alignment,
                 )
                 loss = loss.mean()
                 accelerator.backward(loss)
@@ -548,6 +561,12 @@ def parse_args(input_args=None):
     parser.add_argument("--enc-type", type=str, default="dinov2-vit-b")
     parser.add_argument("--lambda-repa", type=float, default=1.0)
     parser.add_argument("--lambda-cons", type=float, default=0.1)
+    parser.add_argument(
+        "--alignment-logging-steps",
+        type=int,
+        default=2500,
+        help="Log CAT alignment diagnostics every N optimizer steps. Set 0 to disable.",
+    )
     parser.add_argument(
         "--cons-weights",
         type=str,

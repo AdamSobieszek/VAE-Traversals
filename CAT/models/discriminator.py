@@ -262,6 +262,16 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return np.concatenate([emb_sin, emb_cos], axis=1)
 
 
+def CAT_D_S_2(**kwargs):
+    return CATDiscriminator(
+        depth=12,
+        hidden_size=384,
+        patch_size=2,
+        num_heads=6,
+        **kwargs,
+    )
+
+
 def CAT_D_B_2(**kwargs):
     return CATDiscriminator(
         depth=12,
@@ -273,5 +283,6 @@ def CAT_D_B_2(**kwargs):
 
 
 CATD_models = {
+    "CAT-D-S/2": CAT_D_S_2,
     "CAT-D-B/2": CAT_D_B_2,
 }

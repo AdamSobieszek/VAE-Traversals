@@ -200,6 +200,7 @@ class CATLoss:
         global_step,
         model_kwargs=None,
         zs=None,
+        log_alignment=False,
         **kwargs,
     ):
         model_kwargs = self._ensure_model_kwargs(generator, images, model_kwargs)
@@ -222,7 +223,8 @@ class CATLoss:
             "g_adv": g_adv,
             "cons_loss": cons_loss,
         }
-        loss_dict.update(cat_alignment_metrics(stage_outputs))
+        if log_alignment:
+            loss_dict.update(cat_alignment_metrics(stage_outputs))
         extras = {"gen_images": stage_outputs}
         return loss, loss_dict, extras
 

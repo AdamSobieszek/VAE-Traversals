@@ -6,10 +6,12 @@ CAT is a class-conditional one-step GAN in Stable Diffusion VAE latent space. Th
 
 | Role | Name | Config |
 | --- | --- | --- |
+| Generator (Small) | `CAT-G-S/2` | depth 12, dim 384, heads 6, outputs at layers 3/6/9/12 |
 | Generator (Base) | `CAT-G-B/2` | depth 12, dim 768, heads 12, outputs at layers 3/6/9/12 |
 | Generator (Medium) | `CAT-G-M/2` | depth 24, dim 768, heads 12, outputs at layers 6/12/18/24 |
 | Generator (Huge) | `CAT-G-H/2` | depth 32, dim 1280, heads 16, outputs at layers 8/16/24/32 |
-| Discriminator | `CAT-D-B/2` | depth 12, dim 768, heads 12, fixed for all generator sizes |
+| Discriminator (Small) | `CAT-D-S/2` | depth 12, dim 384, heads 6 |
+| Discriminator (Base) | `CAT-D-B/2` | depth 12, dim 768, heads 12, default for paper-fidelity runs |
 
 All ImageNet-256 runs use SD-VAE latents (`32×32×4`), batch size 512, learning rate `2e-4` for both generator and discriminator, bf16 mixed precision, and EMA decay `0.999`.
 

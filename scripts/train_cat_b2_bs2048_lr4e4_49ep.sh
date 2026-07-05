@@ -8,9 +8,9 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${script_dir}/../CAT"
 
 # CAT paper hyperparameters, with only the intended overrides:
-# batch size 2048, sqrt-scaled LR 4e-4, and 49 epochs.
-model="${MODEL:-CAT-G-B/2}"
-modelD="${MODELD:-CAT-D-B/2}"
+# small G/D configs, batch size 2048, sqrt-scaled LR 4e-4, and 49 epochs.
+model="${MODEL:-CAT-G-S/2}"
+modelD="${MODELD:-CAT-D-S/2}"
 resolution="${RESOLUTION:-256}"
 batch_size="${BATCH_SIZE:-2048}"
 learning_rate="${LEARNING_RATE:-4e-4}"
@@ -24,8 +24,8 @@ num_workers="${NUM_WORKERS:-4}"
 
 data_path="${DATA_PATH:-../dataset}"
 expdir="${EXPDIR:-../exps}"
-expname="${EXPNAME:-cat_b2_256_bs2048_lr4e4_49ep}"
-wandb_name="${WANDB_NAME:-CAT B2 bs2048 lr4e-4 49ep}"
+expname="${EXPNAME:-cat_s2_256_bs2048_lr4e4_49ep}"
+wandb_name="${WANDB_NAME:-CAT S2 bs2048 lr4e-4 49ep}"
 
 accelerate launch --num_processes 1 --main_process_port "${MAIN_PROCESS_PORT:-29502}" train.py \
   --report-to="${REPORT_TO:-wandb}" \
@@ -40,6 +40,7 @@ accelerate launch --num_processes 1 --main_process_port "${MAIN_PROCESS_PORT:-29
   --enc-type="${ENC_TYPE:-dinov2-vit-b}" \
   --lambda-repa="${LAMBDA_REPA:-1.0}" \
   --lambda-cons="${LAMBDA_CONS:-0.1}" \
+  --alignment-logging-steps="${ALIGNMENT_LOGGING_STEPS:-0}" \
   --cons-weights="${CONS_WEIGHTS:-0.3333333333333333,0.5,1.0}" \
   --output-dir="${expdir}" \
   --exp-name="${expname}" \

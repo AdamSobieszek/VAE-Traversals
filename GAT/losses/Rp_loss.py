@@ -12,6 +12,10 @@ def sum_flat(x):
     return torch.sum(x, dim=list(range(1, len(x.size()))))
 
 
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
 def info_per_layer(N, Imin=0.125):
     idx = np.arange(N)
     lam = idx / (N - 1)           
@@ -147,7 +151,7 @@ class RpGANLoss:
         if model_kwargs == None:
             model_kwargs = {}
         if "z" not in model_kwargs.keys():
-            z = torch.randn(images.shape[0], generator.module.latent_size, device=images.device, dtype=images.dtype)
+            z = torch.randn(images.shape[0], unwrap_model(generator).latent_size, device=images.device, dtype=images.dtype)
             model_kwargs["z"] = z
         if "x" not in model_kwargs.keys():
             model_kwargs["x"] = torch.randn_like(images)
@@ -203,7 +207,7 @@ class RpGANLoss:
         if model_kwargs == None:
             model_kwargs = {}
         if "z" not in model_kwargs.keys():
-            z = torch.randn(images.shape[0], generator.module.latent_size, device=images.device, dtype=images.dtype)
+            z = torch.randn(images.shape[0], unwrap_model(generator).latent_size, device=images.device, dtype=images.dtype)
             model_kwargs["z"] = z
         if "x" not in model_kwargs.keys():
             model_kwargs["x"] = torch.randn_like(images)

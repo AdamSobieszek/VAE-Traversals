@@ -269,6 +269,8 @@ def main(args):
     generator, discriminator, optimizerG, optimizerD, train_dataloader = accelerator.prepare(
         generator, discriminator, optimizerG, optimizerD, train_dataloader
     )
+    generator_model = accelerator.unwrap_model(generator)
+    discriminator_model = accelerator.unwrap_model(discriminator)
     
     update_ema(ema, generator, decay=0)
 
@@ -304,7 +306,7 @@ def main(args):
     ys_vis = torch.tensor([207, 360, 387, 974, 88, 979, 417, 279], device=device).repeat(sample_batch_size // 8)
     ys_vis = ys_vis.to(device)
     n = ys_vis.size(0)
-    zs_vis = torch.randn(size=(sample_batch_size, generator.module.latent_size), device=device)
+    zs_vis = torch.randn(size=(sample_batch_size, generator_model.latent_size), device=device)
     xs_vis = torch.randn((n, 4, latent_size, latent_size), device=device)
     stats_metrics = dict()
     
@@ -323,7 +325,7 @@ def main(args):
 
             model_kwargs = dict(y=y)
             with accelerator.accumulate(discriminator):
-                discriminator.module.requires_grad_(True)
+                discriminator.requires_grad_(True)
                 loss, loss_dict, _ = loss_fn.step_disc(generator, discriminator, None, x, raw_image, global_step, model_kwargs)
                 loss = loss.mean()
                     
@@ -334,10 +336,10 @@ def main(args):
                 optimizerD.step()
                 optimizerD.zero_grad(set_to_none=True)
                     
-                discriminator.module.requires_grad_(False)
+                discriminator.requires_grad_(False)
 
             with accelerator.accumulate(generator):
-                generator.module.requires_grad_(True)
+                generator.requires_grad_(True)
                 loss, _, extras = loss_fn.step_gen(generator, discriminator, None, x, raw_image, global_step, model_kwargs)
 
                 loss = loss.mean()
@@ -350,13 +352,13 @@ def main(args):
                 optimizerG.zero_grad(set_to_none=True)
                 if accelerator.sync_gradients:
                     update_ema(ema, generator)
-                generator.module.requires_grad_(False)
+                generator.requires_grad_(False)
 
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
             
-            if (global_step % args.eval_steps == 0) or (args.resume_step == global_step - 1):
+            if (global_step % args.eval_steps == 0) or (args.resume_step > 0 and args.resume_step == global_step - 1):
                 from metrics import metric_main
 
                 if accelerator.is_main_process:
@@ -378,8 +380,8 @@ def main(args):
             if ((global_step % args.checkpointing_steps == 0) or (global_step % args.latest_checkpointing_steps == 0)) and global_step > 0:
                 if accelerator.is_main_process:
                     checkpoint = {
-                        "generator": generator.module.state_dict(),
-                        "discriminator": discriminator.module.state_dict(),
+                        "generator": generator_model.state_dict(),
+                        "discriminator": discriminator_model.state_dict(),
                         "ema": ema.state_dict(),
                         "optG": optimizerG.state_dict(),
                         "optD": optimizerD.state_dict(),
@@ -425,8 +427,8 @@ def main(args):
             for k in loss_dict.keys():
                 logs[k] = accelerator.gather(loss_dict[k].mean()).mean().detach().item()
 
-            logs["x_last_std"] = accelerator.gather(generator.module.recent_x_std.mean()).mean().detach().item()
-            logs["x_last_std_disc"] = accelerator.gather(discriminator.module.recent_x_std.mean()).mean().detach().item()
+            logs["x_last_std"] = accelerator.gather(generator_model.recent_x_std.mean()).mean().detach().item()
+            logs["x_last_std_disc"] = accelerator.gather(discriminator_model.recent_x_std.mean()).mean().detach().item()
             
             progress_bar.set_postfix(**logs)
 

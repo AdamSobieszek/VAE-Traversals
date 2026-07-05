@@ -1,5 +1,3 @@
-torch
-torchvision
 numpy
 scipy
 pillow
@@ -11,3 +9,7 @@ accelerate
 wandb
 requests
 einops
+safetensors
+huggingface_hub
+opencv-python
+tensorboard

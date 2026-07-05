@@ -121,15 +121,22 @@ class CATLoss:
             model_kwargs["x"] = torch.randn_like(images)
         return model_kwargs
 
-    def _augment_pyramid(self, pyramid):
-        pyramid_aug = []
-        aug_params = None
-        for scale in pyramid:
-            scale_aug, params = aug(scale, prob=self.aug_prob, policy=self.policy)
-            pyramid_aug.append(scale_aug)
-            if aug_params is None:
-                aug_params = params
-        return pyramid_aug, aug_params
+    def _augment_stage_outputs(self, stage_outputs):
+        final_aug, aug_params = aug(stage_outputs[-1], prob=self.aug_prob, policy=self.policy)
+        stage_outputs_aug = [
+            aug(stage, aug_params=aug_params, policy=self.policy)[0]
+            for stage in stage_outputs[:-1]
+        ]
+        stage_outputs_aug.append(final_aug)
+        return stage_outputs_aug, aug_params
+
+    def _augment_fake_pyramid(self, stage_outputs):
+        stage_outputs_aug, aug_params = self._augment_stage_outputs(stage_outputs)
+        return build_cat_fake_pyramid(stage_outputs_aug), aug_params
+
+    def _augment_real_pyramid(self, real_latent):
+        real_aug, aug_params = aug(real_latent, prob=self.aug_prob, policy=self.policy)
+        return build_cat_real_pyramid(real_aug), aug_params
 
     def _gp_indices(self, batch_size, device):
         gp_bs = max(1, int(batch_size * self.gp_batch_frac))
@@ -197,11 +204,8 @@ class CATLoss:
         model_kwargs = self._ensure_model_kwargs(generator, images, model_kwargs)
 
         stage_outputs = generator(update_ema=True, return_stages=True, **model_kwargs)
-        fake_pyramid = build_cat_fake_pyramid(stage_outputs)
-        fake_pyramid, _ = self._augment_pyramid(fake_pyramid)
-
-        real_pyramid = build_cat_real_pyramid(images.detach())
-        real_pyramid, _ = self._augment_pyramid(real_pyramid)
+        fake_pyramid, _ = self._augment_fake_pyramid(stage_outputs)
+        real_pyramid, _ = self._augment_real_pyramid(images.detach())
 
         with torch.no_grad():
             real_logits = discriminator(real_pyramid, y=model_kwargs["y"])
@@ -236,11 +240,9 @@ class CATLoss:
 
         with torch.no_grad():
             stage_outputs = generator(update_ema=False, return_stages=True, **model_kwargs)
-            fake_pyramid = build_cat_fake_pyramid(stage_outputs)
 
-        real_pyramid = build_cat_real_pyramid(images)
-        fake_pyramid, gen_aug_params = self._augment_pyramid(fake_pyramid)
-        real_pyramid, real_aug_params = self._augment_pyramid(real_pyramid)
+        fake_pyramid, gen_aug_params = self._augment_fake_pyramid(stage_outputs)
+        real_pyramid, real_aug_params = self._augment_real_pyramid(images)
 
         real_logits, real_aux = discriminator(real_pyramid, y=model_kwargs["y"], return_aux=True)
         fake_logits = discriminator(fake_pyramid, y=model_kwargs["y"])

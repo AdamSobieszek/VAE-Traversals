@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+
 def DiffAugment(x, prob=1.0, policy='', channels_first=True, aug_params=None):
     if np.random.rand() > prob:
         return x, {}
@@ -71,14 +72,15 @@ def rand_brightness_saturation_contrast(x, params=None, p=0.5):
     
     if params is None:
         noise_bright = torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device)
-        x_mean_sat, noise_sat = x.mean(dim=1, keepdim=True), torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device)
-        x_mean_cont, noise_cont = x.mean(dim=[1, 2, 3], keepdim=True), torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device)
-    
+        noise_sat = torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device)
+        noise_cont = torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device)
         mask = torch.rand(x.size(0), device=x.device)
         mask = mask < p
     else:
-        mask, noise_bright, x_mean_sat, noise_sat, x_mean_cont, noise_cont = params
+        mask, noise_bright, noise_sat, noise_cont = params
         
+    x_mean_sat = x.mean(dim=1, keepdim=True)
+    x_mean_cont = x.mean(dim=[1, 2, 3], keepdim=True)
     x_aug = x + (noise_bright - 0.5)
     x_aug = (x_aug - x_mean_sat) * (noise_sat * 2) + x_mean_sat
     x_aug = (x_aug - x_mean_cont) * (noise_cont + 0.5) + x_mean_cont
@@ -86,10 +88,14 @@ def rand_brightness_saturation_contrast(x, params=None, p=0.5):
     x_out = x.clone()
     x_out[mask] = x_aug[mask]
     
-    params = [mask, noise_bright, x_mean_sat, noise_sat, x_mean_cont, noise_cont]
+    params = [mask, noise_bright, noise_sat, noise_cont]
 
     return x_out, params
     
+
+
+def _scale_int_tensor(value, src_size, dst_size):
+    return torch.round(value.to(torch.float32) * float(dst_size) / float(src_size)).to(torch.long)
 
 
 def rand_translation(x, params=None, ratio=0.125):
@@ -100,7 +106,8 @@ def rand_translation(x, params=None, ratio=0.125):
         params = (translation_x, translation_y, x.shape[2], x.shape[3])
     else:
         translation_x, translation_y, h, w = params
-        translation_x, translation_y = translation_x * h // x.shape[2], translation_y * w // x.shape[3]
+        translation_x = _scale_int_tensor(translation_x, h, x.shape[2])
+        translation_y = _scale_int_tensor(translation_y, w, x.shape[3])
         
     grid_batch, grid_x, grid_y = torch.meshgrid(
         torch.arange(x.size(0), dtype=torch.long, device=x.device),
@@ -122,7 +129,12 @@ def rand_cutout(x, params=None, ratio=0.5):
         params = (cutout_size, offset_x, offset_y, x.shape[2], x.shape[3])
     else:
         cutout_size, offset_x, offset_y, h, w = params
-        cutout_size, offset_x, offset_y = (cutout_size[0] * h // x.shape[2], cutout_size[1] * w // x.shape[3]), offset_x * h // x.shape[2], offset_y * w // x.shape[3]
+        cutout_size = (
+            max(1, round(cutout_size[0] * x.shape[2] / h)),
+            max(1, round(cutout_size[1] * x.shape[3] / w)),
+        )
+        offset_x = _scale_int_tensor(offset_x, h, x.shape[2])
+        offset_y = _scale_int_tensor(offset_y, w, x.shape[3])
         
     grid_batch, grid_x, grid_y = torch.meshgrid(
         torch.arange(x.size(0), dtype=torch.long, device=x.device),

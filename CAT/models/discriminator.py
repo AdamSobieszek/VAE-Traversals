@@ -212,8 +212,9 @@ class CATDiscriminator(nn.Module):
         logits = (self.final_layer(cls_feats) * y_emb.unsqueeze(1)).sum(dim=-1)
 
         if self.aux_feat_size > 0:
-            x32_spatial = seq_parts[0][:, 1:]
-            x32_cls = seq_parts[0][:, :1]
+            x32_tokens = seq[:, : self.GROUP_LENGTHS[0]]
+            x32_cls = x32_tokens[:, :1]
+            x32_spatial = x32_tokens[:, 1:]
             x_feat = [self.proj(x32_cls), self.proj(x32_spatial)]
         else:
             x_feat = None

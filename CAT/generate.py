@@ -10,7 +10,6 @@ from PIL import Image
 from tqdm import tqdm
 
 from models.generator import CAT_models
-from utils import load_legacy_checkpoints
 
 
 def get_checkpoint_state(checkpoint, weight_key):
@@ -59,8 +58,6 @@ def main(args):
     checkpoint = torch.load(args.ckpt, weights_only=False, map_location=f"cuda:{device}")
     args = apply_checkpoint_args(args, checkpoint)
     state_dict, state_key = get_checkpoint_state(checkpoint, args.weight_key)
-    if args.legacy:
-        state_dict = load_legacy_checkpoints(state_dict, encoder_depth=args.encoder_depth)
 
     latent_size = args.resolution // 8
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
@@ -126,7 +123,6 @@ if __name__ == "__main__":
     parser.add_argument("--weight-key", type=str, choices=["ema", "generator", "model"], default="ema")
     parser.add_argument("--model", type=str, choices=list(CAT_models.keys()), default="CAT-G-B/2")
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--encoder-depth", type=int, default=8)
     parser.add_argument("--resolution", type=int, choices=[128, 256], default=256)
     parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=True)
@@ -136,5 +132,4 @@ if __name__ == "__main__":
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
     parser.add_argument("--truncation-psi", type=float, default=0.85)
-    parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False)
     main(parser.parse_args())

@@ -5,6 +5,7 @@ import sys
 import traceback
 
 import torch
+import torch.nn as nn
 
 sys.path.insert(0, ".")
 
@@ -15,7 +16,9 @@ from cat_pyramid import (
     cat_consistency_loss,
 )
 from losses import CATLoss
+from losses.diffaug import DiffAugment
 from models.discriminator import CATD_models
+from models.discriminator import CATDiscriminator
 from models.generator import CAT_models
 
 BLOCK_KWARGS = {"fused_attn": True, "qk_norm": True}
@@ -117,6 +120,91 @@ def test_consistency_loss(device):
     print("consistency loss + backward: ok")
 
 
+def test_diffaugment_replay_scaling(device):
+    B = 1
+    tx = torch.tensor([[[4]]], device=device)
+    ty = torch.tensor([[[-2]]], device=device)
+    x = torch.stack(
+        torch.meshgrid(
+            torch.arange(224, device=device, dtype=torch.float32),
+            torch.arange(224, device=device, dtype=torch.float32),
+            indexing="ij",
+        ),
+        dim=0,
+    ).unsqueeze(0)
+    translated, _ = DiffAugment(
+        x,
+        policy="translation",
+        aug_params={"translation": [(tx, ty, 32, 32)]},
+    )
+    assert translated[0, 0, 100, 100].item() == 128
+    assert translated[0, 1, 100, 100].item() == 86
+
+    ones = torch.ones(B, 1, 224, 224, device=device)
+    cutout, _ = DiffAugment(
+        ones,
+        policy="cutout",
+        aug_params={
+            "cutout": [
+                (
+                    (16, 16),
+                    torch.tensor([[[16]]], device=device),
+                    torch.tensor([[[16]]], device=device),
+                    32,
+                    32,
+                )
+            ]
+        },
+    )
+    assert (cutout == 0).sum().item() == 112 * 112
+    print("diffaugment replay scaling: ok")
+
+
+def test_cat_loss_stage_augmentation(device):
+    loss_fn = CATLoss(encoders=[], encoder_types=[], architectures=[], lambda_repa=0.0)
+    stages = [torch.randn(2, 4, 32, 32, device=device) for _ in range(4)]
+    stages_aug, aug_params = loss_fn._augment_stage_outputs(stages)
+    assert len(stages_aug) == 4
+    assert all(stage.shape == (2, 4, 32, 32) for stage in stages_aug)
+    assert set(aug_params.keys()) == {"color", "translation", "cutout", "flip"}
+    fake_pyramid, _ = loss_fn._augment_fake_pyramid(stages)
+    assert [t.shape[-1] for t in fake_pyramid] == [32, 16, 8, 4]
+    real_pyramid, _ = loss_fn._augment_real_pyramid(stages[-1])
+    assert [t.shape[-1] for t in real_pyramid] == [32, 16, 8, 4]
+    print("CAT loss augmentation helpers: ok")
+
+
+def test_repa_aux_uses_post_transformer_tokens(device):
+    D = CATDiscriminator(
+        hidden_size=32,
+        depth=2,
+        num_heads=4,
+        z_dims=[8],
+        projector_dim=16,
+        cmap_dim=16,
+        fused_attn=False,
+        qk_norm=True,
+    ).to(device)
+    y = torch.randint(0, 1000, (2,), device=device)
+    pyramid = [
+        torch.randn(2, 4, 32, 32, device=device),
+        torch.randn(2, 4, 16, 16, device=device),
+        torch.randn(2, 4, 8, 8, device=device),
+        torch.randn(2, 4, 4, 4, device=device),
+    ]
+    _, aux = D(pyramid, y, return_aux=True)
+    aux_loss = aux["x_feat"][0].mean() + aux["x_feat"][1].mean()
+    aux_loss.backward()
+    block_grad = sum(
+        p.grad.abs().sum().item()
+        for block in D.blocks
+        for p in block.parameters()
+        if p.grad is not None
+    )
+    assert block_grad > 0
+    print("REPA aux post-transformer gradients: ok")
+
+
 def test_loss_steps(device, block_kwargs):
     B = 2
     G = CAT_models["CAT-G-B/2"](input_size=32, num_classes=1000, z_dims=[0], **block_kwargs).to(device)
@@ -197,6 +285,7 @@ def test_all_generators_with_base_discriminator(device, block_kwargs):
 def test_train_imports():
     import train
     import generate
+    from accelerate import Accelerator
 
     args = train.parse_args(
         [
@@ -212,6 +301,11 @@ def test_train_imports():
     assert args.modelD == "CAT-D-B/2"
     assert args.learning_rate == 2e-4
     assert args.batch_size == 512
+    assert train.uses_wandb("wandb")
+    assert not train.uses_wandb("none")
+    accelerator = Accelerator()
+    prepared = accelerator.prepare(nn.Linear(1, 1))
+    assert accelerator.unwrap_model(prepared).__class__ is nn.Linear
     assert "CAT_models" in generate.__dict__ or hasattr(generate, "main")
     print("train/generate imports: ok")
 
@@ -227,6 +321,9 @@ def main():
         lambda: test_pyramid_and_discriminator(device, block_kwargs),
         lambda: test_attention_mask(device),
         lambda: test_consistency_loss(device),
+        lambda: test_diffaugment_replay_scaling(device),
+        lambda: test_cat_loss_stage_augmentation(device),
+        lambda: test_repa_aux_uses_post_transformer_tokens(device),
         lambda: test_loss_steps(device, block_kwargs),
         lambda: test_backward_paths(device, block_kwargs),
         lambda: test_all_generators_with_base_discriminator(device, block_kwargs),

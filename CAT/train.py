@@ -27,7 +27,6 @@ from utils import load_encoders
 from dataset import CustomDataset, CustomDataset_DiT
 from diffusers.models import AutoencoderKL
 
-import wandb
 import math
 from torchvision.utils import make_grid
 
@@ -35,6 +34,11 @@ from datetime import timedelta
 from accelerate.utils import InitProcessGroupKwargs
 
 logger = get_logger(__name__)
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 def array2grid(x):
@@ -104,16 +108,24 @@ def parse_cons_weights(cons_weights_str):
     return tuple(float(x.strip()) for x in cons_weights_str.split(","))
 
 
+def uses_wandb(report_to):
+    if report_to is None:
+        return False
+    trackers = [tracker.strip().lower() for tracker in str(report_to).split(",")]
+    return "wandb" in trackers
+
+
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=logging_dir
     )
+    log_with = None if str(args.report_to).lower() in ("none", "no", "false", "") else args.report_to
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=log_with,
         project_config=accelerator_project_config,
         kwargs_handlers=[
             DistributedDataParallelKwargs(broadcast_buffers=False),
@@ -152,12 +164,13 @@ def main(args):
     assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.resolution // 8
 
-    if args.enc_type != "None":
-        encoders, encoder_types, architectures = load_encoders(
-            args.enc_type, device, args.resolution
-        )
-    else:
-        encoders, encoder_types, architectures = [], [], []
+    with accelerator.main_process_first():
+        if args.enc_type != "None":
+            encoders, encoder_types, architectures = load_encoders(
+                args.enc_type, device, args.resolution
+            )
+        else:
+            encoders, encoder_types, architectures = [], [], []
 
     z_dims = [encoder.embed_dim for encoder in encoders] if args.enc_type != "None" else [0]
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
@@ -183,7 +196,8 @@ def main(args):
     discriminator = discriminator.to(device)
     ema = deepcopy(generator).to(device)
 
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
+    with accelerator.main_process_first():
+        vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
     requires_grad(ema, False)
 
     latents_scale = torch.tensor([0.18215] * 4).view(1, 4, 1, 1).to(device)
@@ -234,7 +248,17 @@ def main(args):
 
     train_dataset = build_train_dataset(args)
 
+    if args.batch_size % accelerator.num_processes != 0:
+        raise ValueError(
+            f"--batch-size ({args.batch_size}) must be divisible by num_processes "
+            f"({accelerator.num_processes})."
+        )
     local_batch_size = int(args.batch_size // accelerator.num_processes)
+    if local_batch_size < 1:
+        raise ValueError(
+            f"Local batch size must be at least 1; got {local_batch_size} from "
+            f"batch_size={args.batch_size}, num_processes={accelerator.num_processes}."
+        )
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=local_batch_size,
@@ -273,25 +297,29 @@ def main(args):
         generator, discriminator, optimizerG, optimizerD, train_dataloader
     )
 
-    update_ema(ema, generator, decay=0)
+    update_ema(ema, accelerator.unwrap_model(generator), decay=0)
 
     generator.train()
     discriminator.train()
     ema.eval()
 
-    if accelerator.is_main_process:
+    use_wandb = uses_wandb(args.report_to)
+    if use_wandb and wandb is None:
+        raise ImportError("wandb is required when --report-to includes 'wandb'.")
+    if accelerator.is_main_process and log_with is not None:
         tracker_config = vars(copy.deepcopy(args))
+        init_kwargs = {}
+        if use_wandb:
+            init_kwargs["wandb"] = {
+                "dir": save_dir,
+                "name": f"{args.exp_name}",
+                "id": wandb_run_id,
+                "resume": is_resume,
+            }
         accelerator.init_trackers(
             project_name=args.wandb_name,
             config=tracker_config,
-            init_kwargs={
-                "wandb": {
-                    "dir": save_dir,
-                    "name": f"{args.exp_name}",
-                    "id": wandb_run_id,
-                    "resume": is_resume,
-                }
-            },
+            init_kwargs=init_kwargs,
         )
 
     progress_bar = tqdm(
@@ -306,7 +334,7 @@ def main(args):
         max(1, sample_batch_size // 8)
     )
     n = ys_vis.size(0)
-    zs_vis = torch.randn(size=(n, generator.module.latent_size), device=device)
+    zs_vis = torch.randn(size=(n, accelerator.unwrap_model(generator).latent_size), device=device)
     xs_vis = torch.randn((n, 4, latent_size, latent_size), device=device)
     stats_metrics = dict()
 
@@ -325,8 +353,8 @@ def main(args):
 
             model_kwargs = dict(y=y)
             with accelerator.accumulate(discriminator):
-                discriminator.module.requires_grad_(True)
-                loss, loss_dict, _ = loss_fn.step_disc(
+                accelerator.unwrap_model(discriminator).requires_grad_(True)
+                loss, disc_loss_dict, _ = loss_fn.step_disc(
                     generator, discriminator, None, x, raw_image, global_step, model_kwargs
                 )
                 loss = loss.mean()
@@ -335,11 +363,11 @@ def main(args):
                     accelerator.clip_grad_norm_(discriminator.parameters(), args.max_grad_norm)
                 optimizerD.step()
                 optimizerD.zero_grad(set_to_none=True)
-                discriminator.module.requires_grad_(False)
+                accelerator.unwrap_model(discriminator).requires_grad_(False)
 
             with accelerator.accumulate(generator):
-                generator.module.requires_grad_(True)
-                loss, loss_dict, _ = loss_fn.step_gen(
+                accelerator.unwrap_model(generator).requires_grad_(True)
+                loss, gen_loss_dict, _ = loss_fn.step_gen(
                     generator, discriminator, None, x, raw_image, global_step, model_kwargs
                 )
                 loss = loss.mean()
@@ -349,8 +377,8 @@ def main(args):
                 optimizerG.step()
                 optimizerG.zero_grad(set_to_none=True)
                 if accelerator.sync_gradients:
-                    update_ema(ema, generator, decay=args.ema_decay)
-                generator.module.requires_grad_(False)
+                    update_ema(ema, accelerator.unwrap_model(generator), decay=args.ema_decay)
+                accelerator.unwrap_model(generator).requires_grad_(False)
 
             if accelerator.sync_gradients:
                 progress_bar.update(1)
@@ -390,15 +418,17 @@ def main(args):
             ) and global_step > 0:
                 if accelerator.is_main_process:
                     checkpoint = {
-                        "generator": generator.module.state_dict(),
-                        "discriminator": discriminator.module.state_dict(),
+                        "generator": accelerator.unwrap_model(generator).state_dict(),
+                        "discriminator": accelerator.unwrap_model(discriminator).state_dict(),
                         "ema": ema.state_dict(),
                         "optG": optimizerG.state_dict(),
                         "optD": optimizerD.state_dict(),
                         "args": args,
                         "steps": global_step,
                         "wallclock_time": progress_bar.format_dict["elapsed"],
-                        "wandb_run_id": accelerator.get_tracker("wandb").run.id,
+                        "wandb_run_id": (
+                            accelerator.get_tracker("wandb").run.id if use_wandb else None
+                        ),
                     }
                     if global_step % args.checkpointing_steps == 0:
                         checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
@@ -427,22 +457,27 @@ def main(args):
                     samples_notruc = (samples_notruc + 1) / 2.0
 
                 out_samples = accelerator.gather(samples.to(torch.float32))
-                accelerator.log({"samples": wandb.Image(array2grid(out_samples))})
+                if use_wandb:
+                    accelerator.log({"samples": wandb.Image(array2grid(out_samples))})
 
                 out_samples_notruc = accelerator.gather(samples_notruc.to(torch.float32))
-                accelerator.log({"samples w/o trunc": wandb.Image(array2grid(out_samples_notruc))})
+                if use_wandb:
+                    accelerator.log(
+                        {"samples w/o trunc": wandb.Image(array2grid(out_samples_notruc))}
+                    )
 
                 logging.info("Generating EMA samples done.")
 
             logs = {}
-            for k in loss_dict.keys():
-                logs[k] = accelerator.gather(loss_dict[k].mean()).mean().detach().item()
+            for loss_dict in (disc_loss_dict, gen_loss_dict):
+                for k in loss_dict.keys():
+                    logs[k] = accelerator.gather(loss_dict[k].mean()).mean().detach().item()
 
             logs["x_last_std"] = (
-                accelerator.gather(generator.module.recent_x_std.mean()).mean().detach().item()
+                accelerator.gather(accelerator.unwrap_model(generator).recent_x_std.mean()).mean().detach().item()
             )
             logs["x_last_std_disc"] = (
-                accelerator.gather(discriminator.module.recent_x_std.mean()).mean().detach().item()
+                accelerator.gather(accelerator.unwrap_model(discriminator).recent_x_std.mean()).mean().detach().item()
             )
 
             progress_bar.set_postfix(**logs)

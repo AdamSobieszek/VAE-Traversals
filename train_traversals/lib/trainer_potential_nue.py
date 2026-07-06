@@ -27,9 +27,6 @@ from .aux import (
 
 DTYPE = torch.float32
 
-# Enable anomaly detection
-torch.autograd.set_detect_anomaly(True)
-
 
 class DataParallelPassthrough(nn.DataParallel):
     def __getattr__(self, name):
@@ -295,7 +292,6 @@ class TrainerPotential(object):
 
         support_sets_optim = build_adamw(
             [
-                {"params": support_sets.PSI.parameters(), "weight_decay": support_set_wd, "lr": self.params.support_set_lr},
                 {"params": support_sets.F.parameters(), "weight_decay": support_set_wd, "lr": self.params.support_set_lr},
                 {"params": [support_sets.c], "weight_decay": 0.0, "lr": self.params.support_set_lr},
             ],
@@ -393,6 +389,7 @@ class TrainerPotential(object):
 
         half_range = int(self.T // 2)
         target_step = int(half_range - 1)
+        latent_dim_correction = 1 / (generator.dim_z.item() if isinstance(generator.dim_z, torch.Tensor) else generator.dim_z)**0.5
 
         init_truncation = float(getattr(self.params, "z_truncation", 1.0))
         acc_steps = max(1, int(getattr(self.params, "accumulate_grad_steps", 1)))
@@ -435,7 +432,7 @@ class TrainerPotential(object):
             B = int(self.params.batch_size)
             z = sample_z(B, generator, self.params, self.device)
 
-            dt = self.sample_dt(B, half_range, total_opt_steps)
+            dt = self.sample_dt(B, half_range, total_opt_steps) 
             t_idx = self.sample_t_idx(B, target_step)
 
             loss_dict, logits_det, logits0_det, targets, potential_preds_det, img1_bk, img2_bk, latent2_bk_det = self.loss_allK(

@@ -97,8 +97,9 @@ class StackedSemanticPotential(nn.Module):
             W = self.dir_linear.weight  # [K, n_out, n_in]
             W.zero_()
             for k in range(self.K):
-                W[k, 0, k % self.n_in] = 0.1
-            W.add_(torch.randn_like(W) * 1e-3)
+                sign = 1 if ((k-(k % self.n_in)) // self.n_in) % 2 == 0 else -1
+                W[k, 0, k % self.n_in] = sign * 0.1
+            W.add_(torch.randn_like(W) * 1e-7)
 
         # Scalar per-k gain on the fc4 branch
         self.c = nn.Parameter(torch.full((self.K, 1), 1.0))
@@ -198,6 +199,7 @@ class TraversalPDE(nn.Module):
             F=self.F,
             epsilon=epsilon,
             prior_score=prior_score,
+            dim_correction=1/(self.support_vectors_dim**0.5),
         )
 
         # for telemetry
@@ -213,7 +215,7 @@ class TraversalPDE(nn.Module):
         st = PDEState(
             f=self.F,
             z=z_bkd,
-            direction=direction,
+            direction=torch.ones(1,),
             need_next=self._needs_next,
             dt_value=dt,
             **self._pde_cfg,

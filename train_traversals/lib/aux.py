@@ -1022,9 +1022,10 @@ class ImageViz:
 
     @staticmethod
     def to_uint01(x: torch.Tensor) -> torch.Tensor:
-        x = x.detach().cpu()
+        x = x.detach().float().cpu()
         if torch.numel(x) == 0:
             return x
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
         if x.min() < 0.0:
             x = (x + 1.0) / 2.0
         return x.clamp(0.0, 1.0)
@@ -2389,35 +2390,67 @@ def collect_wave_stats(support_sets, potential_preds: torch.Tensor) -> dict:
 # =========================
 # TB logging blocks (short names)
 # =========================
+def _tb_finite_float(value):
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            return None
+        value = value.detach().float().cpu().item()
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _tb_finite_tensor(t: torch.Tensor) -> torch.Tensor | None:
+    if t is None:
+        return None
+    t = t.detach().float().cpu().reshape(-1)
+    finite = torch.isfinite(t)
+    if not finite.any():
+        return None
+    return t[finite]
+
+
 def tb_scalars(writer, step: int, win_means: dict, stat_tracker):
     for k, v in win_means.items():
-        writer.add_scalar(f"train/{k}", float(v), step)
-    writer.add_scalar("train/support_sets_lr", float(stat_tracker.last_support_lr), step)
-    writer.add_scalar("train/recognizer_lr", float(stat_tracker.last_recognizer_lr), step)
+        v = _tb_finite_float(v)
+        if v is not None:
+            writer.add_scalar(f"train/{k}", v, step)
+    support_lr = _tb_finite_float(stat_tracker.last_support_lr)
+    recognizer_lr = _tb_finite_float(stat_tracker.last_recognizer_lr)
+    if support_lr is not None:
+        writer.add_scalar("train/support_sets_lr", support_lr, step)
+    if recognizer_lr is not None:
+        writer.add_scalar("train/recognizer_lr", recognizer_lr, step)
 
 
 def tb_grad_norms(writer, step: int, support_sets=None, recognizer=None, freq: int = 1):
     if step % freq != 0:
         return
     if support_sets is not None:
-        gn_support = module_grad_norm(support_sets.PSI) + module_grad_norm(support_sets.F)
-        writer.add_scalar("train/grad_norm/support_sets", gn_support, step)
+        gn_support = module_grad_norm(support_sets.F)
+        gn_support = _tb_finite_float(gn_support)
+        if gn_support is not None:
+            writer.add_scalar("train/grad_norm/support_sets", gn_support, step)
     if recognizer is not None:
         gn_recon = module_grad_norm(recognizer)
-        writer.add_scalar("train/grad_norm/recognizer", gn_recon, step)
+        gn_recon = _tb_finite_float(gn_recon)
+        if gn_recon is not None:
+            writer.add_scalar("train/grad_norm/recognizer", gn_recon, step)
 
 
 def tb_hists(writer, step: int, *, logits_det: torch.Tensor,
              potential_preds_det: torch.Tensor | None,
              K: int, log_potential: bool = True):
-    writer.add_histogram("train/logits", logits_det, step)
+    logits_tb = _tb_finite_tensor(logits_det)
+    if logits_tb is not None:
+        writer.add_histogram("train/logits", logits_tb, step)
     if log_potential and potential_preds_det is not None:
         for k in range(K):
-            writer.add_histogram(
-                f"potential_distribution/{k}",
-                potential_preds_det[:, k].reshape(-1).detach(),
-                step
-            )
+            potential_tb = _tb_finite_tensor(potential_preds_det[:, k])
+            if potential_tb is not None:
+                writer.add_histogram(f"potential_distribution/{k}", potential_tb, step)
 
 
 def tb_figs(writer, step: int, stat_tracker, K: int, log_freq: int):

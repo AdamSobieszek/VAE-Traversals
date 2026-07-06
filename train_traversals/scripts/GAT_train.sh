@@ -1,11 +1,11 @@
 gan_type="GAT"
-num_support_sets=64
+num_support_sets=100
 num_support_timesteps=20
 warmup_fraction=0.001
 accumulate_grad_steps=2
 recognizer_type="ResNet"
 z_truncation=0.75
-batch_size=4
+batch_size=5
 max_iter=3000
 tensorboard=true
 new_experiment=true

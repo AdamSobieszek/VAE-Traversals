@@ -1,5 +1,6 @@
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,16 @@ from models.SNGAN.distribution import NormalDistribution
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GAT_ROOT = REPO_ROOT / "GAT"
+
+
+def _amp_dtype_from_mixed_precision(mixed_precision):
+    if mixed_precision in (None, "", "no", False):
+        return None
+    if mixed_precision == "fp16":
+        return torch.float16
+    if mixed_precision == "bf16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported mixed precision mode: {mixed_precision!r}")
 
 
 
@@ -177,6 +188,7 @@ class GATWrapper(nn.Module):
         vae_variant="ema",
         projector_embed_dims=(768, 1024),
         vae=None,
+        mixed_precision="no",
     ):
         super(GATWrapper, self).__init__()
         self.G = G
@@ -196,6 +208,7 @@ class GATWrapper(nn.Module):
         self.uses_vae_latent_shape = False
 
         self.vae = vae
+        self.set_mixed_precision(mixed_precision)
         self.register_buffer(
             "latents_scale",
             torch.tensor([0.18215] * self.latent_channels).view(1, self.latent_channels, 1, 1),
@@ -206,6 +219,19 @@ class GATWrapper(nn.Module):
             torch.zeros(1, self.latent_channels, 1, 1),
             persistent=False,
         )
+
+    def set_mixed_precision(self, mixed_precision="no"):
+        self.mixed_precision = mixed_precision or "no"
+        self.amp_dtype = _amp_dtype_from_mixed_precision(self.mixed_precision)
+        if hasattr(self.G, "w_avg"):
+            target_dtype = self.amp_dtype or torch.float32
+            self.G.w_avg = self.G.w_avg.to(dtype=target_dtype)
+
+    def _amp_context(self, device):
+        enabled = self.amp_dtype is not None and torch.device(device).type == "cuda"
+        if not enabled:
+            return nullcontext()
+        return torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=True)
 
     def mixed_classes(self, batch_size):
         if len(self.target_classes.data.shape) == 0:
@@ -233,7 +259,8 @@ class GATWrapper(nn.Module):
             dtype=z.dtype,
         )
         y = self.mixed_classes(batch_size).to(device=z.device)
-        return self.G(x=x, y=y, z=z, truncation_psi=self.truncation_psi)
+        with self._amp_context(z.device):
+            return self.G(x=x, y=y, z=z, truncation_psi=self.truncation_psi)
 
     def decode_with_vae(self, latents):
         if latents.ndim == 2:
@@ -244,10 +271,11 @@ class GATWrapper(nn.Module):
                 self.latent_size,
             )
         self._ensure_vae(latents.device)
-        latents = latents.to(dtype=next(self.vae.parameters()).dtype)
+        latents = latents.to(dtype=torch.float32)
         scale = self.latents_scale.to(device=latents.device, dtype=latents.dtype)
         bias = self.latents_bias.to(device=latents.device, dtype=latents.dtype)
-        return self.vae.decode((latents - bias) / scale).sample
+        with torch.amp.autocast(device_type=latents.device.type, enabled=False):
+            return self.vae.decode((latents - bias) / scale).sample
 
 
 def build_gat(
@@ -265,6 +293,7 @@ def build_gat(
     legacy=False,
     encoder_depth=8,
     load_vae=False,
+    mixed_precision="no",
 ):
     gat_root = str(GAT_ROOT)
     if gat_root not in sys.path:
@@ -311,4 +340,5 @@ def build_gat(
         vae_variant=vae_variant,
         projector_embed_dims=projector_embed_dims,
         vae=vae,
+        mixed_precision=mixed_precision,
     )

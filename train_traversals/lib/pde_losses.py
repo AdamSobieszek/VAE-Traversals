@@ -80,7 +80,8 @@ class BB(PDELoss):
     name = "bb"
 
     def _loss(self, st: PDEState) -> torch.Tensor:
-        return 1.0 / (st.f_grad("now").pow(2).sum(dim=-1, keepdim=True) + 1e-12)
+        eps = float(self.ctx.get("epsilon", 1e-8))
+        return 1.0 / (st.f_grad("now").pow(2).sum(dim=-1, keepdim=True) + eps)
 
 class UnitSpeed(PDELoss):
     """(<grad f, v> - 1)^2, with grad f detached to avoid batch-coupled grads."""

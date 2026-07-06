@@ -36,6 +36,7 @@ def load_gat_generator(args, script_dir, device):
     print(f"  \\__Checkpoint : {ckpt_path}")
     print(f"  \\__Model      : {args.gat_model or gan_cfg.get('model', 'GAT-XL/2')}")
     print(f"  \\__Resolution : {resolution}")
+    print(f"  \\__Precision  : {args.mixed_precision}")
 
     return build_gat(
         str(ckpt_path),
@@ -44,6 +45,7 @@ def load_gat_generator(args, script_dir, device):
         resolution=resolution,
         vae_variant=args.vae_variant or gan_cfg.get("vae_variant", "ema"),
         truncation_psi=args.truncation_psi,
+        mixed_precision=args.mixed_precision,
         load_vae=True,
     ).to(device)
 
@@ -131,6 +133,13 @@ def main():
     parser.add_argument("--log-freq", default=10, type=int, help="logging frequency")
     parser.add_argument("--ckp-freq", default=1000, type=int, help="checkpoint frequency")
     parser.add_argument("--tensorboard", action="store_true", help="enable TensorBoard logging")
+    parser.add_argument(
+        "--mixed-precision",
+        type=str,
+        default="bf16",
+        choices=["no", "bf16"],
+        help="shared precision for frozen GAT and trainable recognizer",
+    )
 
     # === Restart ================================================================================ #
     parser.add_argument("--new-experiment", action="store_true", default=False,

@@ -1,6 +1,5 @@
 import json
 import sys
-from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -15,11 +14,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GAT_ROOT = REPO_ROOT / "GAT"
 
 
-def _amp_dtype_from_mixed_precision(mixed_precision):
+def _dtype_from_mixed_precision(mixed_precision):
     if mixed_precision in (None, "", "no", False):
-        return None
-    if mixed_precision == "fp16":
-        return torch.float16
+        return torch.float32
     if mixed_precision == "bf16":
         return torch.bfloat16
     raise ValueError(f"Unsupported mixed precision mode: {mixed_precision!r}")
@@ -222,16 +219,8 @@ class GATWrapper(nn.Module):
 
     def set_mixed_precision(self, mixed_precision="no"):
         self.mixed_precision = mixed_precision or "no"
-        self.amp_dtype = _amp_dtype_from_mixed_precision(self.mixed_precision)
-        if hasattr(self.G, "w_avg"):
-            target_dtype = self.amp_dtype or torch.float32
-            self.G.w_avg = self.G.w_avg.to(dtype=target_dtype)
-
-    def _amp_context(self, device):
-        enabled = self.amp_dtype is not None and torch.device(device).type == "cuda"
-        if not enabled:
-            return nullcontext()
-        return torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=True)
+        self.compute_dtype = _dtype_from_mixed_precision(self.mixed_precision)
+        self.G.to(dtype=self.compute_dtype)
 
     def mixed_classes(self, batch_size):
         if len(self.target_classes.data.shape) == 0:
@@ -249,6 +238,7 @@ class GATWrapper(nn.Module):
 
     def forward(self, z, shift=None):
         z = z if shift is None else z + shift
+        z_gat = z.to(dtype=self.compute_dtype)
         batch_size = z.shape[0]
         x = torch.randn(
             batch_size,
@@ -256,11 +246,10 @@ class GATWrapper(nn.Module):
             self.latent_size,
             self.latent_size,
             device=z.device,
-            dtype=z.dtype,
+            dtype=self.compute_dtype,
         )
         y = self.mixed_classes(batch_size).to(device=z.device)
-        with self._amp_context(z.device):
-            return self.G(x=x, y=y, z=z, truncation_psi=self.truncation_psi)
+        return self.G(x=x, y=y, z=z_gat, truncation_psi=self.truncation_psi)
 
     def decode_with_vae(self, latents):
         if latents.ndim == 2:

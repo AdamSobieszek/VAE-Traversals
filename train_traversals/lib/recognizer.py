@@ -1,5 +1,3 @@
-from contextlib import nullcontext
-
 import torch
 from torch import nn
 from torchvision.models import resnet18
@@ -10,13 +8,12 @@ def save_hook(module, input, output):
 
 
 class Recognizer(nn.Module):
-    def __init__(self, recognizer_type, dim_index, channels=3, pool_size=1, mixed_precision="no"):
+    def __init__(self, recognizer_type, dim_index, channels=3, pool_size=1):
         super(Recognizer, self).__init__()
         self.recognizer_type = recognizer_type
         self.dim_index = dim_index
         self.channels = channels
         self.pool_size = pool_size
-        self.set_mixed_precision(mixed_precision)
         if self.pool_size > 1:
             self.avg_pool = nn.AvgPool2d(kernel_size=(self.pool_size, self.pool_size), stride=self.pool_size)
 
@@ -64,46 +61,23 @@ class Recognizer(nn.Module):
             # Define classification head (for predicting warping functions (paths) indices)
             self.path_indices = nn.Linear(512, self.dim_index)
 
-    def set_mixed_precision(self, mixed_precision="no"):
-        self.mixed_precision = mixed_precision or "no"
-        if self.mixed_precision == "fp16":
-            self.amp_dtype = torch.float16
-        elif self.mixed_precision == "bf16":
-            self.amp_dtype = torch.bfloat16
-        elif self.mixed_precision == "no":
-            self.amp_dtype = None
         else:
-            raise ValueError(f"Unsupported mixed precision mode: {self.mixed_precision!r}")
-
-    def _amp_context(self, x):
-        enabled = self.amp_dtype is not None and x.device.type == "cuda"
-        if not enabled:
-            return nullcontext()
-        return torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=True)
-
-    def _fp32_context(self, x):
-        enabled = self.amp_dtype is not None and x.device.type == "cuda"
-        if not enabled:
-            return nullcontext()
-        return torch.amp.autocast(device_type="cuda", enabled=False)
+            raise ValueError(f"Unsupported recognizer type: {self.recognizer_type!r}")
 
     def forward(self, x1, x2):
-        with self._amp_context(x1):
-            if self.pool_size > 1:
-                x1 = self.avg_pool(x1)
-                x2 = self.avg_pool(x2)
-            if self.recognizer_type == 'LeNet':
-                features = self.feature_extractor(torch.cat([x1, x2], dim=1))
-                features = features.mean(dim=[-1, -2]).view(x1.shape[0], -1)
-                with self._fp32_context(features):
-                    logits = self.path_indices(features.float()).view(x1.shape[0], -1)
-                    return logits, None
-            elif self.recognizer_type == 'ResNet':
-                self.features_extractor(torch.cat([x1, x2], dim=1))
-                features = self.features.output.view([x1.shape[0], -1])
-                with self._fp32_context(features):
-                    logits = self.path_indices(features.float()).view(x1.shape[0], -1)
-                    return logits, None
+        if self.pool_size > 1:
+            x1 = self.avg_pool(x1)
+            x2 = self.avg_pool(x2)
+        if self.recognizer_type == 'LeNet':
+            features = self.feature_extractor(torch.cat([x1, x2], dim=1))
+            features = features.mean(dim=[-1, -2]).view(x1.shape[0], -1)
+            logits = self.path_indices(features).view(x1.shape[0], -1)
+            return logits, None
+        elif self.recognizer_type == 'ResNet':
+            self.features_extractor(torch.cat([x1, x2], dim=1))
+            features = self.features.output.view([x1.shape[0], -1])
+            logits = self.path_indices(features).view(x1.shape[0], -1)
+            return logits, None
         raise ValueError(f"Unsupported recognizer type: {self.recognizer_type!r}")
 
 

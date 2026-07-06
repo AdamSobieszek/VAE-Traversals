@@ -6,6 +6,7 @@ import time
 import math
 import json
 import shutil
+from contextlib import nullcontext
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Optional
@@ -45,6 +46,14 @@ class TrainerPotential(object):
         self.use_cuda = self.device.type == "cuda"
         self.use_mps = self.device.type == "mps"
         self.multi_gpu = bool(multi_gpu)
+        self.mixed_precision = getattr(self.params, "mixed_precision", "no") or "no"
+        if self.mixed_precision == "bf16":
+            self.amp_dtype = torch.bfloat16
+        elif self.mixed_precision == "no":
+            self.amp_dtype = None
+        else:
+            raise ValueError(f"Unsupported mixed precision mode: {self.mixed_precision!r}")
+        self.amp_enabled = self.use_cuda and self.amp_dtype is not None
 
         # dirs
         self.tensorboard = bool(getattr(self.params, "tensorboard", False))
@@ -147,6 +156,16 @@ class TrainerPotential(object):
             return torch.randint(2, target_step, (B, 1), device=self.device, dtype=torch.long)
         return torch.full((B, 1), int(target_step), device=self.device, dtype=torch.long)
 
+    def gan_recognizer_context(self):
+        if not self.amp_enabled:
+            return nullcontext()
+        return torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=True)
+
+    def fp32_context(self):
+        if not self.use_cuda:
+            return nullcontext()
+        return torch.amp.autocast(device_type=self.device.type, enabled=False)
+
     # ------------------------ forward+loss (all K) ------------------------
     def loss_allK(self, support_sets, generator, recognizer,
                   z, t_index, dt, acc_denominator: int,
@@ -155,9 +174,8 @@ class TrainerPotential(object):
         One forward for all K in parallel.
         Optional: only materialize img*_bk if need_images=True (for TB logging).
         """
-
-
-        potential_preds, latent1_bk, latent2_bk, pde_loss, dt = support_sets(z, t_index, dt=dt, direction=dt)
+        with self.fp32_context():
+            potential_preds, latent1_bk, latent2_bk, pde_loss, dt = support_sets(z, t_index, dt=dt, direction=dt)
         B, K, D = latent1_bk.shape
 
         lat1_flat, targets, _, (B, K) = _pack_BK(latent1_bk)
@@ -166,20 +184,26 @@ class TrainerPotential(object):
         z0 = z.clone().unsqueeze(1).expand(B, K, D)
         lat0_flat, _, _, _ = _pack_BK(z0)
 
+        lat0_for_gen = lat0_flat
+        lat1_for_gen = lat1_flat
+        lat2_for_gen = lat2_flat
         DO_VAE_RESHAPE = getattr(generator, "uses_vae_latent_shape", False)
         if DO_VAE_RESHAPE:
             reshape_z = lambda z: z.reshape(z.shape[0], generator.latent_channels, generator.latent_size, generator.latent_size).contiguous() if z.ndim == 2 else z
-            lat0_flat = reshape_z(lat0_flat)
-            lat1_flat = reshape_z(lat1_flat)
-            lat2_flat = reshape_z(lat2_flat)
+            lat0_for_gen = reshape_z(lat0_for_gen)
+            lat1_for_gen = reshape_z(lat1_for_gen)
+            lat2_for_gen = reshape_z(lat2_for_gen)
 
-        with torch.no_grad():
-            img0 = generator(lat0_flat)
-            img1 = generator(lat1_flat)
+        lat2_bridge = lat2_for_gen.detach().requires_grad_(True)
+
+        with torch.no_grad(), self.gan_recognizer_context():
+            img0 = generator(lat0_for_gen)
+            img1 = generator(lat1_for_gen)
             detach_img1 = bool(getattr(self.params, "detach_img1_for_cls", False))
             img1 = img1.detach() if detach_img1 else img1
        
-        img2 = generator(lat2_flat)
+        with self.gan_recognizer_context():
+            img2 = generator(lat2_bridge)
 
 
         DO_ANTISYMMETRIC_LOSS = True # TODO: Remove
@@ -189,33 +213,62 @@ class TrainerPotential(object):
                 with torch.no_grad() if not with_g else torch.enable_grad():
                     return (2*a-b, b) if sign>0 else (b, 2*a-b)
 
-            logits0, magnitudes0 = recognizer(*uv(img0, img1, with_g=False, sign=1))   # [B*K, K]
-            _logits0, _magnitudes0 = recognizer(*uv(img0, img1, with_g=False, sign=-1))
+            with self.gan_recognizer_context():
+                logits0, magnitudes0 = recognizer(*uv(img0, img1, with_g=False, sign=1))   # [B*K, K]
+                _logits0, _magnitudes0 = recognizer(*uv(img0, img1, with_g=False, sign=-1))
 
 
-            logits, magnitudes = recognizer(*uv(img1, img2, with_g=True, sign=1))   # [B*K, K]
-            _logits, _magnitudes = recognizer(*uv(img1, img2, with_g=True, sign=-1))
+                logits, magnitudes = recognizer(*uv(img1, img2, with_g=True, sign=1))   # [B*K, K]
+                _logits, _magnitudes = recognizer(*uv(img1, img2, with_g=True, sign=-1))
 
-            cls_loss = self.cross_entropy((logits-_logits)/2, targets) + self.cross_entropy((logits0-_logits0)/2, targets)
+            with self.fp32_context():
+                cls_loss = (
+                    self.cross_entropy((logits.float() - _logits.float()) / 2, targets)
+                    + self.cross_entropy((logits0.float() - _logits0.float()) / 2, targets)
+                )
         else:
-            logits0= torch.zeros(B*K, K, device=self.device)
-            logits, magnitudes = recognizer(img1, img2)   # [B*K, K]
-            cls_loss = self.cross_entropy(logits, targets)
+            logits0= torch.zeros(B*K, K, device=self.device, dtype=torch.float32)
+            with self.gan_recognizer_context():
+                logits, magnitudes = recognizer(img1, img2)   # [B*K, K]
+            with self.fp32_context():
+                cls_loss = self.cross_entropy(logits.float(), targets)
 
 
-        mse_loss = torch.zeros(1, device=self.device)
+        mse_loss = torch.zeros(1, device=self.device, dtype=torch.float32)
 
-        loss = (
-            self.params.lambda_cls * cls_loss
-            + self.params.lambda_reg * mse_loss
-            + self.params.lambda_pde * pde_loss
-        )
-        loss = loss / max(1, int(acc_denominator))
-        loss.backward()
+        acc_denominator = max(1, int(acc_denominator))
+        with self.fp32_context():
+            total_loss = (
+                self.params.lambda_cls * cls_loss.float()
+                + self.params.lambda_reg * mse_loss
+                + self.params.lambda_pde * pde_loss.float()
+            )
+            loss = total_loss / acc_denominator
+            cls_backward_loss = self.params.lambda_cls * cls_loss.float() / acc_denominator
+            support_backward_loss = self.params.lambda_pde * pde_loss.float() / acc_denominator
+
+        if float(self.params.lambda_cls) != 0.0:
+            cls_backward_loss.backward()
+            if lat2_bridge.grad is None:
+                raise RuntimeError("GAT+Recognizer loss did not produce a gradient for lat2_bridge.")
+            bridge_grad = lat2_bridge.grad.detach().to(dtype=lat2_for_gen.dtype)
+        else:
+            bridge_grad = torch.zeros_like(lat2_for_gen)
+
+        support_outputs = []
+        support_grads = []
+        if lat2_for_gen.requires_grad:
+            support_outputs.append(lat2_for_gen)
+            support_grads.append(bridge_grad)
+        if support_backward_loss.requires_grad:
+            support_outputs.append(support_backward_loss)
+            support_grads.append(torch.ones_like(support_backward_loss))
+        if support_outputs:
+            torch.autograd.backward(support_outputs, grad_tensors=support_grads)
 
         # Cheap metrics needed every step
         with torch.no_grad():
-            ent = entropy_from_logits(logits)
+            ent = entropy_from_logits(logits.float())
             z_bk = z.unsqueeze(1).expand(B, K, D)
             d2 = (latent2_bk - latent1_bk).norm(dim=-1).min()
             d1 = (latent1_bk - z_bk).norm(dim=-1).min()
@@ -375,6 +428,9 @@ class TrainerPotential(object):
         generator.requires_grad_(False)
         support_sets = support_sets.to(self.device).train()
         recognizer = recognizer.to(self.device).train()
+        for module in (generator, recognizer):
+            if hasattr(module, "set_mixed_precision"):
+                module.set_mixed_precision(self.mixed_precision)
 
         if self.multi_gpu:
             print(f"#. Parallelize G, R over {torch.cuda.device_count()} GPUs...")
@@ -413,6 +469,7 @@ class TrainerPotential(object):
 
         print(f"#. Start training from micro-step {starting_micro}")
         print(f"#. Training loop: {starting_micro} to {self.params.max_iter}")
+        print(f"#. GAT+Recognizer precision: {self.mixed_precision}")
 
         last_ckp_step = None  # avoid redundant saves
 

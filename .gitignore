@@ -2,3 +2,6 @@
 /train_eqvae/pretrained_models
 /train_eqvae/taming/modules/autoencoder/lpips
 *.pyc
+*.pt
+**/.DS_Store
+**/__pycache__

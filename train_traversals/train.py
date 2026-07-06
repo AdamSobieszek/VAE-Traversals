@@ -6,7 +6,7 @@ from lib import (
     GAN_WEIGHTS,
     Reconstructor,
     TrainerPotential,
-    WavePDE,
+    TraversalPDE,
     create_exp_dir,
     load_sd_vae_generator,
 )
@@ -29,10 +29,10 @@ def main():
         --support-set-lr           : set learning rate for learning support sets
 
         ===[ Reconstructor (R) ]========================================================================================
-        --reconstructor-type       : set reconstructor network type
+        --recognizer-type       : set recognizer network type
         --min-shift-magnitude      : set minimum shift magnitude
         --max-shift-magnitude      : set maximum shift magnitude
-        --reconstructor-lr         : set learning rate for reconstructor R optimization
+        --recognizer-lr         : set learning rate for recognizer R optimization
 
         ===[ Training ]=================================================================================================
         --max-iter                 : set maximum number of training iterations
@@ -72,10 +72,10 @@ def main():
     parser.add_argument('--only-potential', type=bool, default=True, help="only train potential")
 
     # === Reconstructor (R) ========================================================================================== #
-    parser.add_argument('--reconstructor-lr', type=float, default=2e-4,
-                        help="set learning rate for reconstructor R optimization")
-    parser.add_argument('--reconstructor-type', type=str, default='ResNet',
-                        help='set reconstructor network type')
+    parser.add_argument('--recognizer-lr', type=float, default=2e-4,
+                        help="set learning rate for recognizer R optimization")
+    parser.add_argument('--recognizer-type', type=str, default='ResNet',
+                        help='set recognizer network type')
 
     # === Training =================================================================================================== #
     parser.add_argument('--max-iter', type=int, default=100000, help="set maximum number of training iterations")
@@ -138,7 +138,7 @@ def main():
     print("  \\__Number of Timesteps : {}".format(args.num_support_timesteps))
     print("  \\__Support Vectors dim       : {}".format(G.dim_z))
 
-    S = WavePDE(num_support_sets=args.num_support_sets,
+    S = TraversalPDE(num_support_sets=args.num_support_sets,
                     num_support_timesteps=args.num_support_timesteps,
                     support_vectors_dim=G.dim_z,
                     only_potential = args.only_potential,
@@ -148,10 +148,10 @@ def main():
     # Count number of trainable parameters
     print("  \\__Trainable parameters: {:,}".format(sum(p.numel() for p in S.parameters() if p.requires_grad)))
 
-    # Build reconstructor model R
-    print("#. Build reconstructor model R...")
+    # Build recognizer model R
+    print("#. Build recognizer model R...")
 
-    R = Reconstructor(reconstructor_type=args.reconstructor_type,
+    R = Reconstructor(recognizer_type=args.recognizer_type,
                       dim_index=S.num_support_sets,
                       dim_time=S.num_support_timesteps,
                       channels=3,
@@ -166,7 +166,7 @@ def main():
     trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
 
     # Train
-    trn.train(generator=G, support_sets=S, reconstructor=R)
+    trn.train(generator=G, support_sets=S, recognizer=R)
 
 
 if __name__ == '__main__':

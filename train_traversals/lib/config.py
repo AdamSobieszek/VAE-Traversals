@@ -22,7 +22,8 @@ GAN_RESOLUTIONS = {
     'SNGAN_AnimeFaces': 64,
     'BigGAN': 128,
     'ProgGAN': 1024,
-    'StyleGAN2': 1024
+    'StyleGAN2': 1024,
+    'GAT': 256,
 }
 
 GAN_WEIGHTS = {
@@ -60,6 +61,15 @@ GAN_WEIGHTS = {
             256: 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-256-550000.pt',
             1024: 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-config-f.pt'
         }
+    },
+    'GAT': {
+        'url': 'https://drive.google.com/uc?id=1eMDfFlhFB_doTIJuLLZ9qpS1NknD0Ss2',
+        'sha256sum': 'a45aee3c9a4e16ca725c9d263719a1caa884a5b2e0f00bb8975ffa681bcbc7bf',
+        'weights': {
+            GAN_RESOLUTIONS['GAT']: '../GAT/checkpoints/GAT-XL-2.pt',
+        },
+        'model': 'GAT-XL/2',
+        'vae_variant': 'ema',
     }
 }
 

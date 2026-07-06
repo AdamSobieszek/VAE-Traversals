@@ -1,10 +1,11 @@
-gan_type="SD-VAE"
-num_support_sets=4
-num_support_timesteps=4
+gan_type="GAT"
+num_support_sets=64
+num_support_timesteps=20
 warmup_fraction=0.001
-accumulate_grad_steps=1
-recognizer_type="LeNet"
-batch_size=1
+accumulate_grad_steps=2
+recognizer_type="ResNet"
+z_truncation=0.75
+batch_size=4
 max_iter=3000
 tensorboard=true
 new_experiment=true
@@ -21,7 +22,7 @@ if $new_experiment ; then
   new="--new-experiment"
 fi
 
-python train.py $tb \
+python train_GAT.py $tb \
                 --gan-type=${gan_type} \
                 --recognizer-type=${recognizer_type} \
                 --num-support-sets=${num_support_sets} \
@@ -30,8 +31,9 @@ python train.py $tb \
                 --max-iter=${max_iter} \
                 --warmup-fraction=${warmup_fraction} \
                 --accumulate-grad-steps=${accumulate_grad_steps} \
+                --z-truncation=${z_truncation} \
                 --log-freq=50 \
-                --ckp-freq=1000 \
+                --ckp-freq=100 \
                 --reset_lr \
                 --reset_weight_decay \
                 --reset_schedulers \

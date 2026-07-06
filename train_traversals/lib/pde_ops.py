@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------
 # Minimal, self-contained PDE ops for two-potential PINNs.
 # Single class PDEState with lazy, cached primitives:
-#   x, f, f_grad, f_laplace, psi, psi_grad, psi_laplace, psi_t, psi_tt, Xf, v, v_div
+#   x, f, f_grad, f_laplace, Xf, v, v_div
 # Timepoint handled via when ∈ {"now","next"} (default "now"}.
 # ---------------------------------------------------------------------
 
@@ -126,15 +126,13 @@ class PDEState:
 
     Required:
       - f: nn.Module mapping x->[B,K,1]
-      - psi: nn.Module mapping (x,t)->[B,K,1]
       - z: current latents [B,D] or [B,K,D]
       - direction: +1 or -1
 
     Config kwargs (all optional):
       detach_between_steps: bool = False
       dt_value: float = 1.0
-      detach_time_for_psi: bool = True
-      time_ad: str = "reverse"  # "reverse" or "forward" for psi_t / psi_tt
+      time_ad: str = "reverse"  # "reverse" or "forward"
       track_param_through_xgrads: bool = True
       eps_norm2: float = 1e-8
       laplace_probes: int = 1
@@ -146,12 +144,10 @@ class PDEState:
 
     def __init__(self,
                  f: nn.Module,
-                 psi: nn.Module,
                  z: torch.Tensor,
                  direction: int = +1,
                  **config):
         self.f_m = f
-        self.psi_m = psi
 
         z_bk, K = _ensure_bkd(z)
         self.B, self.K, self.D = z_bk.shape
@@ -162,7 +158,6 @@ class PDEState:
         self.cfg: Dict[str, Any] = {
             "detach_between_steps": False,
             "dt_value": 1.0,
-            "detach_time_for_psi": True,
             "time_ad": "reverse",
             "track_param_through_xgrads": True,
             "eps_norm2": 1e-8,
@@ -231,12 +226,14 @@ class PDEState:
         return self.state[key]
 
     def f_laplace(self, when: When = "now", probes: Optional[int] = None) -> torch.Tensor:
-        key = ("f_laplace", probes, when)
+        p = int(self.cfg["laplace_probes"] if probes is None else probes)
+        key = ("f_laplace", when, p)
+
         if key not in self.state:
-            p = int(self.cfg["laplace_probes"] if probes is None else probes)
+            x_ref = self.x() if when == "now" else self.x_next()
             self.state[key] = _laplacian_hutch(
                 g=self.f_grad(when),
-                x=self.x() if when == "now" else self.x_next(),
+                x=x_ref,
                 probes=p,
                 mode=self.cfg["rng"],
                 gen=self._gen,
@@ -262,135 +259,39 @@ class PDEState:
             return self.state[key]
         if when == "now":
             t = self.f(when)
-            if self.cfg["detach_time_for_psi"]:
-                t = t.detach()
         elif when == "next":
             if not self.cfg["need_next"]:
                 raise ValueError("NEXT requested but need_next=False; set need_next=True in config.")
             t = self._t("now") + self.dt()
         else:
             raise ValueError("when must be 'now' or 'next'")
+        t = t.detach()
         self.state[key] = t
         return t
-
-    # ------------- psi and spatial derivatives -------------
-
-    def psi(self, when: When = "now") -> torch.Tensor:
-        key = ("psi", when)
-        if key not in self.state:
-            self.state[key] = self.psi_m(self.x() if when == "now" else self.x_next(), self._t(when))
-
-        return self.state[key]
-
-    def psi_grad(self, when: When = "now") -> torch.Tensor:
-        key = ("psi_grad", when)
-        if key not in self.state:
-            create_graph = bool(self.cfg["track_param_through_xgrads"])
-            self.state[key] = grad(self.psi(when).sum(), self.x(), create_graph=create_graph)[0]
-        return self.state[key]
-
-    def psi_laplace(self, when: When = "now", probes: Optional[int] = None) -> torch.Tensor:
-        key = ("psi_laplace", when, probes)
-        if key not in self.state:
-            p = int(self.cfg["laplace_probes"] if probes is None else probes)
-            self.state[key] = _laplacian_hutch(
-                g=self.psi_grad(when),
-                x=self.x(),
-                probes=p,
-                mode=self.cfg["rng"],
-                gen=self._gen,
-                create_graph=True
-            )
-        return self.state[key]
-
-    # ------------- time derivatives of psi -------------
-
-    def psi_t(self, when: When = "now") -> torch.Tensor:
-        key = ("psi_t", when)
-        if key in self.state:
-            return self.state[key]
-
-        # hold x fixed when differentiating wrt t
-        x_fixed = self.x().detach()
-        t_in = self._t(when)
-        if self.cfg["detach_time_for_psi"]:
-            t_in = t_in.detach()
-
-        mode = self.cfg["time_ad"]
-        if mode == "reverse":
-            t_leaf = t_in.clone().requires_grad_(True)
-            u = self.psi_m(x_fixed, t_leaf)
-            ut = grad(u.sum(), t_leaf, create_graph=True)[0]
-        elif mode == "forward":
-            try:
-                from torch.func import jvp
-            except Exception as e:
-                raise RuntimeError("time_ad='forward' requires torch.func.jvp") from e
-            _, ut = jvp(lambda tt: self.psi_m(x_fixed, tt), (t_in,), (torch.ones_like(t_in),))
-        else:
-            raise ValueError("time_ad must be 'reverse' or 'forward'")
-
-        self.state[key] = ut
-        return ut
-
-    def psi_tt(self, when: When = "now") -> torch.Tensor:
-        key = ("psi_tt", when)
-        if key in self.state:
-            return self.state[key]
-
-        mode = self.cfg["time_ad"]
-        if mode == "reverse":
-            # Recompute with a time leaf so we can differentiate ut w.r.t. t
-            x_fixed = self.x().detach()
-            t_in = self._t(when)
-            if self.cfg["detach_time_for_psi"]:
-                t_in = t_in.detach()
-            t_leaf = t_in.clone().requires_grad_(True)
-            u = self.psi_m(x_fixed, t_leaf)
-            ut = grad(u.sum(), t_leaf, create_graph=True)[0]
-            utt = grad(ut.sum(), t_leaf)[0]
-        elif mode == "forward":
-            try:
-                from torch.func import jvp
-            except Exception as e:
-                raise RuntimeError("time_ad='forward' requires torch.func.jvp") from e
-            x_fixed = self.x().detach()
-            t_in = self._t(when)
-            if self.cfg["detach_time_for_psi"]:
-                t_in = t_in.detach()
-            def ut_fun(tt):
-                return jvp(lambda s: self.psi_m(x_fixed, s),
-                        (tt,), (torch.ones_like(tt),))[1]
-            _, utt = jvp(ut_fun, (t_in,), (torch.ones_like(t_in),))
-        else:
-            raise ValueError("time_ad must be 'reverse' or 'forward'")
-
-        self.state[key] = utt
-        return utt
-
 
     # ------------- velocity and divergence -------------
 
     def v(self, when: When = "now") -> torch.Tensor:
         key = ("v", when)
         if key not in self.state:
-            self.state[key] = self.Xf(when) + self.psi_grad(when)
+            self.state[key] = self.Xf(when)
         return self.state[key]
 
     def v_div(self, when: When = "now", probes: Optional[int] = None) -> torch.Tensor:
-        key = ("v_div", when, probes)
+        p = int(self.cfg["divergence_probes"] if probes is None else probes)
+        key = ("v_div", when, p)
+
         if key not in self.state:
-            p = int(self.cfg["divergence_probes"] if probes is None else probes)
+            x_ref = self.x() if when == "now" else self.x_next()
             self.state[key] = _divergence_hutch(
                 v_field=self.v(when),
-                x=self.x(),
+                x=x_ref,
                 probes=p,
                 mode=self.cfg["rng"],
                 gen=self._gen,
                 create_graph=True
             )
         return self.state[key]
-
     # ------------- optional convenience -------------
 
     def x_next(self) -> torch.Tensor:

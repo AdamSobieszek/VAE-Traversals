@@ -50,7 +50,7 @@ class PhasedCosineWithRestarts(_LRScheduler):
     Notes:
       • base_lrs are captured from the optimizer's param_groups at construction.
       • min_lr can be scalar or per-group list (length == len(base_lrs)).
-      • phase is a scalar in radians (e.g., 0 for support, π for reconstructor).
+      • phase is a scalar in radians (e.g., 0 for support, π for recognizer).
       • last_epoch is the *number of steps already taken* (PyTorch convention).
     """
     def __init__(self, optimizer,
@@ -175,7 +175,7 @@ def create_exp_dir(args, new_experiment=False):
 
     Experiment's directory name format:
 
-        <gan_type>(-<stylegan2_resolution>)(-{Z,W})-<reconstructor_type>-K<num_support_sets>-
+        <gan_type>(-<stylegan2_resolution>)(-{Z,W})-<recognizer_type>-K<num_support_sets>-
             D<num_support_dipoles>(-LearnAlphas)(-LearnGammas)-eps<min_shift_magnitude>_<max_shift_magnitude>
     E.g.:
 
@@ -199,7 +199,7 @@ def create_exp_dir(args, new_experiment=False):
         for c in args.biggan_target_classes:
             biggan_classes += '{}'.format(c)
         exp_dir += '{}'.format(biggan_classes)
-    exp_dir += "-{}".format(args.reconstructor_type)
+    exp_dir += "-{}".format(args.recognizer_type)
     exp_dir += "-K{}-D{}".format(args.num_support_sets, args.num_support_timesteps)
     if new_experiment:
         exp_dir += f"__{time.strftime('%Y%m%d_%H%M%S')}"
@@ -463,7 +463,7 @@ class TrainingStatTracker(object):
 
         # LRs (latest seen per optimizer-step)
         self.last_support_lr = 0.0
-        self.last_recon_lr = 0.0
+        self.last_recognizer_lr = 0.0
 
         # Timing
         self.iter_times = np.array([])  # seconds per opt step
@@ -718,9 +718,9 @@ class TrainingStatTracker(object):
             self.iter_history = self.iter_history[-self.ema_max_history:]
 
     # ---------- LRs ----------
-    def set_lrs(self, support_lr: float, recon_lr: float):
+    def set_lrs(self, support_lr: float, recognizer_lr: float):
         self.last_support_lr = float(support_lr)
-        self.last_recon_lr = float(recon_lr)
+        self.last_recognizer_lr = float(recognizer_lr)
 
     # Allow trainer to sync starting index (resume)
     def set_opt_step(self, step_idx: int):
@@ -752,7 +752,7 @@ class TrainingStatTracker(object):
 
         rec.update({
             'support_sets_lr': self.last_support_lr,
-            'reconstructor_lr': self.last_recon_lr,
+            'recognizer_lr': self.last_recognizer_lr,
             'mean_step_time_sec': float(mean_step_time),
             'elapsed_sec': float(elapsed_from_start),
             'eta_sec': float(eta_seconds),
@@ -1521,14 +1521,14 @@ class ImageViz:
     def compute_lambda_and_confusion(
         *,
         support_sets,
-        reconstructor,
+        recognizer,
         z_bd: torch.Tensor,   # [B,D]
         dt: torch.Tensor,     # [B,1] or [B,K]
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Compute:
           - Λ_ij = E_b[(û_{b,i} · û_{b,j})^2] from per-class step vectors (squared cosine similarity)
-          - Σ = p(pred|true) row-normalized confusion, using the reconstructor on the same uv transform as training.
+          - Σ = p(pred|true) row-normalized confusion, using the recognizer on the same uv transform as training.
         """
         if z_bd.dim() != 2:
             raise ValueError(f"Expected z_bd [B,D], got {tuple(z_bd.shape)}")
@@ -1548,7 +1548,7 @@ class ImageViz:
         b = (z_bkd + delta_bkd).reshape(B * K, D)
         u_in = 2.0 * a - b
         v_in = b
-        logits, _ = reconstructor(u_in, v_in)  # [B*K,K]
+        logits, _ = recognizer(u_in, v_in)  # [B*K,K]
         preds = logits.argmax(dim=-1)          # [B*K]
         targets = torch.arange(K, device=preds.device).repeat(B)  # [B*K]
 
@@ -2393,18 +2393,18 @@ def tb_scalars(writer, step: int, win_means: dict, stat_tracker):
     for k, v in win_means.items():
         writer.add_scalar(f"train/{k}", float(v), step)
     writer.add_scalar("train/support_sets_lr", float(stat_tracker.last_support_lr), step)
-    writer.add_scalar("train/reconstructor_lr", float(stat_tracker.last_recon_lr), step)
+    writer.add_scalar("train/recognizer_lr", float(stat_tracker.last_recognizer_lr), step)
 
 
-def tb_grad_norms(writer, step: int, support_sets=None, reconstructor=None, freq: int = 1):
+def tb_grad_norms(writer, step: int, support_sets=None, recognizer=None, freq: int = 1):
     if step % freq != 0:
         return
     if support_sets is not None:
         gn_support = module_grad_norm(support_sets.PSI) + module_grad_norm(support_sets.F)
         writer.add_scalar("train/grad_norm/support_sets", gn_support, step)
-    if reconstructor is not None:
-        gn_recon = module_grad_norm(reconstructor)
-        writer.add_scalar("train/grad_norm/reconstructor", gn_recon, step)
+    if recognizer is not None:
+        gn_recon = module_grad_norm(recognizer)
+        writer.add_scalar("train/grad_norm/recognizer", gn_recon, step)
 
 
 def tb_hists(writer, step: int, *, logits_det: torch.Tensor,
@@ -2441,12 +2441,27 @@ def tb_figs(writer, step: int, stat_tracker, K: int, log_freq: int):
 
 
 @torch.no_grad()
+def decode_generator_output_for_viz(generator, output):
+    """Decode latent generator outputs to RGB for TensorBoard / image logging."""
+    base = generator.module if hasattr(generator, "module") else generator
+    decode = getattr(base, "decode_with_vae", None)
+    if decode is None:
+        return output
+    leading = output.shape[:-3]
+    flat = output.reshape(-1, *output.shape[-3:])
+    images = decode(flat)
+    return images.reshape(*leading, *images.shape[1:])
+
+
+@torch.no_grad()
 def tb_images(img_logger, step: int, *, generator, z_first: torch.Tensor,
               img1_bk: torch.Tensor, img2_bk: torch.Tensor, n_vis: int):
-    first_img = generator(z_first)  # [1,C,H,W]
+    first_img = decode_generator_output_for_viz(generator, generator(z_first))
+    img1_viz = decode_generator_output_for_viz(generator, img1_bk)
+    img2_viz = decode_generator_output_for_viz(generator, img2_bk)
     img_logger.log_triplet(
         tag_prefix="images",
-        x0=img1_bk, x1=img2_bk, x2=first_img,
+        x0=img1_viz, x1=img2_viz, x2=first_img,
         step=step,
         n_vis=n_vis,
     )
@@ -2528,7 +2543,7 @@ def tb_information_matrix_figs(
     *,
     stat_tracker,
     support_sets,
-    reconstructor,
+    recognizer,
     z_bd: torch.Tensor,
     dt: torch.Tensor,
     save_dir: str | Path | None = None,
@@ -2542,7 +2557,7 @@ def tb_information_matrix_figs(
     """
     lam, conf = ImageViz.compute_lambda_and_confusion(
         support_sets=support_sets,
-        reconstructor=reconstructor,
+        recognizer=recognizer,
         z_bd=z_bd,
         dt=dt,
     )

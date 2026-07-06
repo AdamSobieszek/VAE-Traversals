@@ -2,7 +2,7 @@
 """
 Quick reference: PDEState (from lib.pde_ops) — shapes and helpers
 -----------------------------------------------------------------
-State wraps your two-potential PINN step with lazy, cached primitives.
+State wraps a single-potential PINN step with lazy, cached primitives.
 Everything returns shape [B,K,1] for scalars and [B,K,D] for vectors,
 unless noted. `when` is "now" or "next" (default "now").
 
@@ -15,38 +15,30 @@ Core tensors:
 
 Semantic potential f and geometry:
   - st.f(when)        -> [B,K,1]  f(x) or f(x_next)
-  - st.f_grad(when)   -> [B,K,D]  ∇_x f at x or x_next
+  - st.f_grad(when)   -> [B,K,D]  grad_x f at x or x_next
   - st.f_laplace(when, probes=None) -> [B,K,1]  Hutchinson Laplacian of f
-  - st.Xf(when)       -> [B,K,D]  ∇f / (||∇f||^2 + eps_norm2)
-
-Slice energy ψ and spatial derivatives:
-  - st.psi(when)      -> [B,K,1]  ψ(x, t_when), where t_now=f(x), t_next=t_now+dt
-  - st.psi_grad(when) -> [B,K,D]  ∇_x ψ at x (or x_next)
-  - st.psi_laplace(when, probes=None) -> [B,K,1]  Hutchinson Laplacian of ψ
-
-Time derivatives of ψ (keep x fixed):
-  - st.psi_t(when)    -> [B,K,1]  ∂ψ/∂t
-  - st.psi_tt(when)   -> [B,K,1]  ∂²ψ/∂t²
+  - st.Xf(when)       -> [B,K,D]  grad f / (||grad f||^2 + eps_norm2)
 
 Velocity and divergence:
-  - st.v(when)        -> [B,K,D]  X_f(when) + ∇ψ(when)
+  - st.v(when)        -> [B,K,D]  X_f(when)
   - st.v_div(when, probes=None) -> [B,K,1]  Hutchinson divergence of v(when)
 
 Misc:
   - st.delta_y()      -> [B,K,1]  f(next) - f(now).detach()
   - Config keys (st.cfg): eps_norm2, laplace_probes, divergence_probes, rng,
-    seed, dt_value, need_next, time_ad, detach_time_for_psi, etc.
+    seed, dt_value, need_next, time_ad, detach_between_steps, etc.
 
 Notes:
-  • All primitives cache results; you can call them freely in losses.
-  • Hutchinson traces/divergences are robust to affine/constant fields.
-  • Prefer these helpers over manual autograd where possible for brevity and
-    to inherit the project’s numerical safety choices.
+  - All primitives cache results; you can call them freely in losses.
+  - Hutchinson traces/divergences are robust to affine/constant fields.
+  - Prefer these helpers over manual autograd where possible for brevity and
+    to inherit the project's numerical safety choices.
 """
 
 from __future__ import annotations
-from typing import Dict, List, Tuple, Optional, Callable, Type
-import inspect, sys
+from typing import Dict, List, Tuple, Type
+import inspect
+import sys
 import math
 import torch
 from torch import nn
@@ -79,84 +71,72 @@ class PDELoss(nn.Module):
 class OT(PDELoss):
     """Placeholder; define your optimal transport term here."""
     name = "ot"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         return st.zeros()
 
 class BB(PDELoss):
-    """Benamou–Brenier kinetic energy: ||v||^2."""
+    """Benamou-Brenier kinetic energy for v = grad f / ||grad f||^2."""
     name = "bb"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
-        return 1/(st.f_grad("now").pow(2).sum(dim=-1, keepdim=True) + 1e-12)
+        return 1.0 / (st.f_grad("now").pow(2).sum(dim=-1, keepdim=True) + 1e-12)
 
 class UnitSpeed(PDELoss):
-    """(<∇f, v> - 1)^2, with ∇f detached to avoid batch-coupled grads."""
+    """(<grad f, v> - 1)^2, with grad f detached to avoid batch-coupled grads."""
     name = "unitspeed"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
-        return ((st.f_grad().detach() * st.v("now")).sum(dim=-1, keepdim=True) - 1.0).pow(2)
+        return ((st.f_grad("now").detach() * st.v("now")).sum(dim=-1, keepdim=True) - 1.0).pow(2)
 
 class SliceHJ(PDELoss):
-    r"""Slice HJ residual at now: (ψ + 0.5||∇ψ||^2 - 0.5 ε^2 Δψ)^2."""
+    r"""Backward-compatible alias: f-only HJ residual at now."""
     name = "slicehj"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         eps = float(self.ctx.get("epsilon", 0.0))
-        H = 0.5 * st.psi_grad("now").pow(2).sum(dim=-1, keepdim=True)
-        lap = st.psi_laplace("now") if eps > 0.0 else st.zeros()
-        return (st.psi("now") + H - 0.5 * (eps**2) * lap).pow(2)
+        g = st.f_grad("now")
+        H = 0.5 * g.pow(2).sum(dim=-1, keepdim=True)
+        lap = st.f_laplace("now") if eps > 0.0 else st.zeros()
+        return (st.f("now") + H - 0.5 * (eps**2) * lap).pow(2)
 
 class HJ(PDELoss):
-    r"""HJ residual at now: (ψ + 0.5||∇ψ||^2 - 0.5 ε^2 Δψ)^2."""
+    r"""f-only HJ residual at now: (f + 0.5||grad f||^2 - 0.5 eps^2 Delta f)^2."""
     name = "hj"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         eps = float(self.ctx.get("epsilon", 0.0))
-        H = 0.5 * st.psi_grad("now").pow(2).sum(dim=-1, keepdim=True)
-        lap = st.psi_laplace("now") if eps > 0.0 else st.zeros()
-        return (st.psi("now") + H - 0.5 * (eps**2) * lap).pow(2)
-
-class Kinetic(PDELoss):
-    r"""
-    Wave-like kinetic term:
-        ψ_tt(next) - ||∇ψ(next)|| / ||∇f(x + ∇ψ(next))||.
-    """
-    name = "kin"
-    def _loss(self, st: PDEState) -> torch.Tensor:
-        eps = float(st.cfg["eps_norm2"])
-        gpsi = st.psi_grad("next")
-        x_hat = st.x() + gpsi
-        # ∇f at x_hat (one grad call; PDEState doesn't cache this location)
-        t_hat = st.f_m(x_hat)
-        gf_hat = grad(t_hat.sum(), x_hat, create_graph=True)[0]
-        return (st.psi_tt("next") - gpsi.norm(dim=-1, keepdim=True) /
-                gf_hat.pow(2).sum(dim=-1, keepdim=True).add(eps).sqrt()).pow(2)
+        g = st.f_grad("now")
+        H = 0.5 * g.pow(2).sum(dim=-1, keepdim=True)
+        lap = st.f_laplace("now") if eps > 0.0 else st.zeros()
+        return (st.f("now") + H - 0.5 * (eps**2) * lap).pow(2)
 
 class Footpoint(PDELoss):
-    r"""Footpoint: f(x + ∇ψ(now)) ≈ f(x) + dt."""
+    r"""Footpoint-style f consistency: f(x_next) ≈ f(x) + dt."""
     name = "foot"
+    needs_next = True
+
     def _loss(self, st: PDEState) -> torch.Tensor:
-        t_next_from_hat = st.f_m(st.x() + st.psi_grad("now"))
-        return (t_next_from_hat - (st.f() + st.dt())).pow(2)
+        return (st.f("next") - (st.f("now") + st.dt())).pow(2)
 
 class DivPrior(PDELoss):
     r"""
     Divergence prior: ( div v(now) + <s(x), v(now)> )^2, s(x)=-x by default.
     """
     name = "div"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         s = self.ctx.get("prior_score", None)
         score = s(st.x()) if callable(s) else -st.x()
         return (st.v_div("now") + (score * st.v("now")).sum(dim=-1, keepdim=True)).pow(2)
 
-class Tangency(PDELoss):
-    """(<∇f, ∇ψ>)^2."""
-    name = "tan"
-    def _loss(self, st: PDEState) -> torch.Tensor:
-        return (st.f_grad() * st.psi_grad()).sum(dim=-1, keepdim=True).pow(2)
-
 class FConvex(PDELoss):
     r"""
-    Convexity via average curvature (Hutchinson trace of ∇²f):
-      hinge( margin - tr(∇²f) )^2.
+    Convexity via average curvature (Hutchinson trace of Hessian f):
+      hinge( margin - tr(Hessian f) )^2.
     """
     name = "fconvex"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         q = st.f_laplace(probes=int(self.ctx.get("probes", 1)))  # [B,K,1]
         margin = float(self.ctx.get("margin", 1e-3))
@@ -166,6 +146,7 @@ class DeltaY(PDELoss):
     """(f(next)-f(now).detach() - dt)^2 - (f(next)-f(now).detach())."""
     name = "deltay"
     needs_next = True
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         dy = st.delta_y()
         return (dy - st.dt()).pow(2) - dy
@@ -187,17 +168,13 @@ class GaussianKSD(PDELoss):
         eps = float(self.ctx.get("eps", 1e-8))
         mean_correction = bool(self.ctx.get("mean_correction", True))
         bandwidth = self.ctx.get("bandwidth", None)
-        truncation  = getattr(st, 'truncation', 1.0)
 
         y = st.f()  # [B,K,1]
         z = y
         if mean_correction:
             with torch.no_grad():
                 current_mean = y.mean(dim=0, keepdim=True)
-                # running_mean = self.ctx.get("running_mean", torch.zeros_like(y[:1]))
-                # running_mean.lerp_(y.mean(dim=0, keepdim=True), 0.95)
-                # self.ctx["running_mean"] = running_mean
-            z = (y - current_mean)/st.f_m.running_output_std
+            z = (y - current_mean) / st.f_m.running_output_std
 
         B, K, C = z.shape
         if B < 2:  # not enough pairs; return zeros
@@ -208,25 +185,25 @@ class GaussianKSD(PDELoss):
         eye_mask = ~torch.eye(B, dtype=torch.bool, device=z.device)
 
         if bandwidth is None:
-            med = dist2[eye_mask].view(B*(B-1), K).median(dim=0).values.clamp_min(eps)
+            med = dist2[eye_mask].view(B * (B - 1), K).median(dim=0).values.clamp_min(eps)
             h2 = 0.5 * med
         else:
-            h2 = torch.full((K,), float(bandwidth), device=z.device, dtype=z.dtype)**2
+            h2 = torch.full((K,), float(bandwidth), device=z.device, dtype=z.dtype) ** 2
 
-        Kmat = torch.exp(-dist2 / (2.0 * h2.view(1,1,K)))          # [B,B,K]
+        Kmat = torch.exp(-dist2 / (2.0 * h2.view(1, 1, K)))        # [B,B,K]
         s = -z                                                     # score of N(0,1)
         s_dot = torch.einsum("bkc,jkc->bjk", s, s)                 # [B,B,K]
         sx_diff = (s.unsqueeze(1) * diff).sum(-1)                  # [B,B,K]
         sy_diff = (s.unsqueeze(0) * (-diff)).sum(-1)               # [B,B,K]
-        trace_xy = Kmat * (C / h2.view(1,1,K) - dist2 / (h2.view(1,1,K)**2))
-        U = s_dot * Kmat + (sx_diff + sy_diff) * (Kmat / h2.view(1,1,K)) + trace_xy
-        ksd2_k = U[eye_mask].view(B*(B-1), K).mean(dim=0)          # [K]
+        trace_xy = Kmat * (C / h2.view(1, 1, K) - dist2 / (h2.view(1, 1, K) ** 2))
+        U = s_dot * Kmat + (sx_diff + sy_diff) * (Kmat / h2.view(1, 1, K)) + trace_xy
+        ksd2_k = U[eye_mask].view(B * (B - 1), K).mean(dim=0)      # [K]
         return ksd2_k.view(1, K, 1).expand(B, K, 1)
 
 class CurvatureCD(PDELoss):
     r"""
     Central-difference curvature penalty on f (near-affine prior):
-      E_u [ ( f(x+εu) - 2f(x) + f(x-εu) ) / ε^2 ]^2.
+      E_u [ ( f(x+eps u) - 2f(x) + f(x-eps u) ) / eps^2 ]^2.
 
     Ctx:
       - eps: float (default 1e-2)
@@ -234,6 +211,7 @@ class CurvatureCD(PDELoss):
       - unit_dirs: bool (default True)
     """
     name = "curv"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         h = float(self.ctx.get("eps", 1e-2))
         n_dirs = int(self.ctx.get("n_dirs", 2))
@@ -246,7 +224,7 @@ class CurvatureCD(PDELoss):
             u = torch.randn_like(x)
             if unit:
                 u = u / (u.flatten(-1).norm(dim=-1, keepdim=True).unsqueeze(-1) + 1e-8)
-            d2 = (f(x + h*u) - 2*y0 + f(x - h*u)) / (h*h)
+            d2 = (f(x + h * u) - 2 * y0 + f(x - h * u)) / (h * h)
             acc = acc + d2.pow(2)
         return acc / float(n_dirs)
 
@@ -254,9 +232,10 @@ class CurvatureCD(PDELoss):
 
 class YMarginalScore(PDELoss):
     """
-    1-D score matching on blurred marginal p_Y^ε to push y=f(x) toward N(0,1).
+    1-D score matching on blurred marginal p_Y^epsilon to push y=f(x) toward N(0,1).
     """
     name = "ynormal"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         eps = float(self.ctx.get("epsilon_y", 0.1))
         stopgrad = bool(self.ctx.get("stopgrad_in_weights", True))
@@ -265,7 +244,7 @@ class YMarginalScore(PDELoss):
 
         y_s = y.squeeze(-1)                                    # [B,K]
         ytil_s = ytil.squeeze(-1)                              # [B,K]
-        q = ( (ytil_s.detach() if stopgrad else ytil_s).unsqueeze(1) - y_s.unsqueeze(0) )  # [B,B,K]
+        q = ((ytil_s.detach() if stopgrad else ytil_s).unsqueeze(1) - y_s.unsqueeze(0))  # [B,B,K]
         w = (-0.5 * q.pow(2) / eps).softmax(dim=1)             # [B,B,K]
         mu_hat = (w * y_s.unsqueeze(0)).sum(dim=1)             # [B,K]
         score_hat = (mu_hat - ytil_s) / eps                    # [B,K]
@@ -273,10 +252,11 @@ class YMarginalScore(PDELoss):
 
 class ContinuityKnownY(PDELoss):
     r"""
-    Continuity residual with p_Y = N(0,1), y = f(x)+√ε ξ (detached in ψ):
-      R = [(f - y)/ε + y] + div v + v · [ s_X(x) + ((y-f)/ε) ∇f ].
+    Continuity residual with p_Y = N(0,1), y = f(x)+sqrt(eps) xi:
+      R = [(f - y)/eps + y] + div v + v · [ s_X(x) + ((y-f)/eps) grad f ].
     """
     name = "ce_y"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         eps = float(self.ctx.get("epsilon", 0.0))
         assert eps > 0.0, "ContinuityKnownY needs epsilon > 0"
@@ -300,6 +280,7 @@ class VNormEMA(PDELoss):
       - eps: float (default 1e-8)
     """
     name = "vnorm"
+
     @torch.no_grad()
     def _update_ema(self, st: PDEState, vnorm_mean_k: torch.Tensor):
         # keep [1,K,1] EMA in ctx
@@ -324,21 +305,16 @@ class VNormEMA(PDELoss):
 
 class GradGroupSecondMomentOrtho(PDELoss):
     r"""
-    Group orthogonality via second-moment Gram off-diagonals.
+    Group orthogonality via second-moment Gram off-diagonals of grad f.
     """
     name = "g2orth"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
-        field = str(self.ctx.get("field", "f"))
-        when  = str(self.ctx.get("when", "now"))
+        when = str(self.ctx.get("when", "now"))
         normalize = bool(self.ctx.get("normalize", True))
         eps = float(self.ctx.get("eps", st.cfg.get("eps_norm2", 1e-8)))
 
-        if field == "psi":
-            g = st.psi_grad(when)
-        elif field == "v":
-            g = st.v(when)
-        else:
-            g = st.f_grad(when)
+        g = st.f_grad(when)
 
         if normalize:
             g = g / (g.pow(2).sum(dim=-1, keepdim=True).add(eps).sqrt())
@@ -349,21 +325,16 @@ class GradGroupSecondMomentOrtho(PDELoss):
 
 class SignedGradGroupSecondMomentOrtho(PDELoss):
     r"""
-    Signed group orthogonality via positive second-moment Gram off-diagonals.
+    Signed group orthogonality via positive second-moment Gram off-diagonals of grad f.
     """
     name = "signed_g2orth"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
-        field = str(self.ctx.get("field", "f"))
-        when  = str(self.ctx.get("when", "now"))
+        when = str(self.ctx.get("when", "now"))
         normalize = bool(self.ctx.get("normalize", True))
         eps = float(self.ctx.get("eps", st.cfg.get("eps_norm2", 1e-8)))
 
-        if field == "psi":
-            g = st.psi_grad(when)
-        elif field == "v":
-            g = st.v(when)
-        else:
-            g = st.f_grad(when)
+        g = st.f_grad(when)
 
         if normalize:
             g = g / (g.pow(2).sum(dim=-1, keepdim=True).add(eps).sqrt())
@@ -374,15 +345,12 @@ class SignedGradGroupSecondMomentOrtho(PDELoss):
 
 class Poisson(PDELoss):
     r"""
-    Weighted Poisson consistency using only state primitives:
-
-      Δ_p ψ + div_p X_f
-      = (Δψ + s·∇ψ) + (div X_f + s·X_f)
-      = div v + s·(∇ψ + X_f)     (since div v = div X_f + Δψ)
-
-    So the residual reduces to:  div v + s·v  (clean and cheap).
+    Weighted divergence consistency using only state primitives:
+      residual = div v + s(x) · v,
+    with v = X_f and s(x)=-x by default.
     """
     name = "poisson"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         s_fn = self.ctx.get("prior_score", None)
         s = s_fn(st.x()) if callable(s_fn) else -st.x()
@@ -392,9 +360,10 @@ class Poisson(PDELoss):
 class FCurvUpper(PDELoss):
     r"""
     Upper hinge on average curvature (Laplacian) of f:
-      L = max(0, tr(∇² f) - kappa_max)^2
+      L = max(0, tr(Hessian f) - kappa_max)^2
     """
     name = "fcurvmax"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         kappa_max = float(self.ctx.get("kappa_max", 0.05))
         q = st.f_laplace(probes=int(self.ctx.get("probes", 1)))  # [B,K,1]
@@ -403,33 +372,33 @@ class FCurvUpper(PDELoss):
 class FAlongCurv(PDELoss):
     r"""
     Along-flow curvature control for f:
-      q = v̂ᵀ (∇² f) v̂,   v̂ = normalized ∇f (or X_f direction)
-    Penalize (q - target)^2 or hinge on q <= q_max.
+      q = vhat^T (Hessian f) vhat, with vhat from grad f or X_f direction.
 
     Ctx:
-      - use_xf_dir: bool (default False)  # if True, use direction of X_f; else ∇f
+      - use_xf_dir: bool (default False)  # if True, use direction of X_f; else grad f
       - target: Optional[float] (default None)  # if set, use (q - target)^2
       - q_max: Optional[float] (default None)   # if set, use max(0, q - q_max)^2
       - eps: float (default st.cfg["eps_norm2"])
     """
     name = "fcurvalong"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         eps = float(self.ctx.get("eps", st.cfg.get("eps_norm2", 1e-8)))
         use_xf_dir = bool(self.ctx.get("use_xf_dir", False))
 
-        # direction v̂
+        # direction vhat
         if use_xf_dir:
             v = st.Xf()                                  # [B,K,D]
             vhat = v / (v.pow(2).sum(-1, keepdim=True).add(eps).sqrt())
         else:
-            g = st.f_grad()                               # [B,K,D]
+            g = st.f_grad()                              # [B,K,D]
             vhat = g / (g.pow(2).sum(-1, keepdim=True).add(eps).sqrt())
 
-        # HVP: (∇² f) v̂ via one autograd call
-        g = st.f_grad()                                   # [B,K,D]
+        # HVP: (Hessian f) vhat via one autograd call
+        g = st.f_grad()                                  # [B,K,D]
         s = (g * vhat).sum()
-        Hv = grad(s, st.x(), create_graph=True)[0]        # [B,K,D]
-        q = (Hv * vhat).sum(-1, keepdim=True)             # [B,K,1]
+        Hv = grad(s, st.x(), create_graph=True)[0]       # [B,K,D]
+        q = (Hv * vhat).sum(-1, keepdim=True)            # [B,K,1]
 
         if "q_max" in self.ctx and self.ctx["q_max"] is not None:
             return (q - float(self.ctx["q_max"])).clamp_min(0.0).pow(2)
@@ -440,7 +409,7 @@ class FAlongCurv(PDELoss):
 class StraightXf(PDELoss):
     r"""
     Straightness of the flow X_f via finite differences (no second-order AD):
-      a ≈ (X_f(x + h v̂) - X_f(x)) / h,  v̂ = X_f / ||X_f||
+      a approx (X_f(x + h vhat) - X_f(x)) / h, vhat = X_f / ||X_f||
       L = ||a||^2
 
     Ctx:
@@ -448,6 +417,7 @@ class StraightXf(PDELoss):
       - unit_dir: bool (default True)
     """
     name = "straightxf"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         h = float(self.ctx.get("h", 1e-2))
         unit_dir = bool(self.ctx.get("unit_dir", True))
@@ -468,6 +438,7 @@ class StraightXf(PDELoss):
 
         a = (Xf1 - v0) / h                                 # [B,K,D]
         return a.pow(2).sum(-1, keepdim=True)
+
 class ShiftMMD(PDELoss):
     r"""
     Two-sample match between f(next)-dt (A) and f(now) (B) via unbiased MMD^2
@@ -480,6 +451,7 @@ class ShiftMMD(PDELoss):
       - eps: float (default 1e-8)
     """
     name = "shiftmmd"
+    needs_next = True
 
     def _loss(self, st: PDEState) -> torch.Tensor:
         eps = float(self.ctx.get("eps", 1e-8))
@@ -504,44 +476,43 @@ class ShiftMMD(PDELoss):
         # Helpers: within-set and cross-set squared distances -> [B,B,K]
         def pdist2(Y):               # Y: [B,K,C] -> [B,B,K]
             d = Y.unsqueeze(1) - Y.unsqueeze(0)
-            return (d*d).sum(dim=-1)
+            return (d * d).sum(dim=-1)
 
         def cdist2(Y1, Y2):          # Y1,Y2: [B,K,C] -> [B,B,K]
             d = Y1.unsqueeze(1) - Y2.unsqueeze(0)
-            return (d*d).sum(dim=-1)
+            return (d * d).sum(dim=-1)
 
         AA = pdist2(A)               # [B,B,K]
         BB = pdist2(B)               # [B,B,K]
-        AB = cdist2(A, B)            # [B,B,K]  <-- cross distances (fixed)
+        AB = cdist2(A, B)            # [B,B,K]
 
         # Bandwidth per k (median heuristic over off-diags of AA,BB and all of AB)
         if bw is None:
             eye_mask = ~torch.eye(Bsz, dtype=torch.bool, device=A.device)
-            AA_off = AA[eye_mask].view(Bsz*(Bsz-1), K)   # [(B^2-B),K]
-            BB_off = BB[eye_mask].view(Bsz*(Bsz-1), K)   # [(B^2-B),K]
-            AB_all = AB.view(Bsz*Bsz, K)                 # [B^2,K]
-            pool = torch.cat([AA_off, BB_off, AB_all], dim=0)  # [(3B^2-2B),K]
+            AA_off = AA[eye_mask].view(Bsz * (Bsz - 1), K)   # [(B^2-B),K]
+            BB_off = BB[eye_mask].view(Bsz * (Bsz - 1), K)   # [(B^2-B),K]
+            AB_all = AB.view(Bsz * Bsz, K)                   # [B^2,K]
+            pool = torch.cat([AA_off, BB_off, AB_all], dim=0) # [(3B^2-2B),K]
             h2 = 0.5 * pool.median(dim=0).values.clamp_min(eps)  # [K]
         else:
-            h2 = torch.full((K,), float(bw), device=A.device, dtype=A.dtype)**2
+            h2 = torch.full((K,), float(bw), device=A.device, dtype=A.dtype) ** 2
 
         # RBF kernels
-        def krbf(d2): return torch.exp(-d2 / (2.0 * h2.view(1,1,K)))
+        def krbf(d2):
+            return torch.exp(-d2 / (2.0 * h2.view(1, 1, K)))
 
         eye_mask = ~torch.eye(Bsz, dtype=torch.bool, device=A.device)
-        KA = krbf(AA)[eye_mask].view(Bsz*(Bsz-1), K).mean(dim=0)  # E_{i!=j} k( Ai, Aj )
-        KB = krbf(BB)[eye_mask].view(Bsz*(Bsz-1), K).mean(dim=0)  # E_{i!=j} k( Bi, Bj )
-        KAB = krbf(AB).mean(dim=(0,1))                            # E_{i,j}   k( Ai, Bj )
+        KA = krbf(AA)[eye_mask].view(Bsz * (Bsz - 1), K).mean(dim=0)  # E_{i!=j} k(Ai, Aj)
+        KB = krbf(BB)[eye_mask].view(Bsz * (Bsz - 1), K).mean(dim=0)  # E_{i!=j} k(Bi, Bj)
+        KAB = krbf(AB).mean(dim=(0, 1))                               # E_{i,j}   k(Ai, Bj)
 
-        mmd2_k = KA + KB - 2.0 * KAB                              # [K]
+        mmd2_k = KA + KB - 2.0 * KAB                                  # [K]
         return mmd2_k.view(1, K, 1).expand(Bsz, K, 1)
-        
-        
-        
+
 class LevelSetSpread(PDELoss):
     r"""
-    Level-set spread: for pairs with small |Δy|, penalize being close in x.
-      L_k = mean_{i≠j} w_y(i,j) * exp(-||x_i-x_j||^2 / (2 τ^2)) / sum w_y
+    Level-set spread: for pairs with small |delta y|, penalize being close in x.
+      L_k = mean_{i!=j} w_y(i,j) * exp(-||x_i-x_j||^2 / (2 tau^2)) / sum w_y
     Minimizing pushes equal-attribute level sets to have larger spatial support.
 
     Ctx:
@@ -551,6 +522,7 @@ class LevelSetSpread(PDELoss):
       - eps: float (default 1e-8)
     """
     name = "levelspread"
+
     def _loss(self, st: PDEState) -> torch.Tensor:
         eps = float(self.ctx.get("eps", 1e-8))
         delta = float(self.ctx.get("delta", 0.25))
@@ -573,22 +545,17 @@ class LevelSetSpread(PDELoss):
         dy2 = (y.unsqueeze(1) - y.unsqueeze(0)).pow(2).sum(-1)      # [B,B,K]
         dx2 = (x.unsqueeze(1) - x.unsqueeze(0)).pow(2).sum(-1)      # [B,B,K]
 
-        wy = torch.exp(-dy2 / (2.0 * (delta**2)))                    # [B,B,K]
-        kx = torch.exp(-dx2 / (2.0 * (tau**2)))                      # [B,B,K]
+        wy = torch.exp(-dy2 / (2.0 * (delta**2)))                  # [B,B,K]
+        kx = torch.exp(-dx2 / (2.0 * (tau**2)))                    # [B,B,K]
 
         mask = ~torch.eye(Bsz, dtype=torch.bool, device=y.device)
-        wy_m = wy[mask].view(Bsz*(Bsz-1), K)
-        kx_m = kx[mask].view(Bsz*(Bsz-1), K)
+        wy_m = wy[mask].view(Bsz * (Bsz - 1), K)
+        kx_m = kx[mask].view(Bsz * (Bsz - 1), K)
 
-        num = (wy_m * kx_m).sum(0)                                   # [K]
-        den = wy_m.sum(0).clamp_min(eps)                             # [K]
-        val = (num / den)                                            # [K]
+        num = (wy_m * kx_m).sum(0)                                 # [K]
+        den = wy_m.sum(0).clamp_min(eps)                           # [K]
+        val = num / den                                            # [K]
         return val.view(1, K, 1).expand(Bsz, K, 1)
-
-
-
-
-
 
 
 # ---------------- Public registry API ----------------
@@ -613,12 +580,15 @@ def build_losses(lambda_dict: Dict[str, float], **ctx) -> Tuple[List[PDELoss], b
         cls = reg.get(_normalize(raw_name), None)
         if cls is None:
             continue
-        if isinstance(lam,dict):
-            l = lam.pop("lam")
-            ctx.update(lam)
+
+        loss_ctx = dict(ctx)
+        if isinstance(lam, dict):
+            lam_cfg = dict(lam)
+            l = lam_cfg.pop("lam")
+            loss_ctx.update(lam_cfg)
             lam = l
 
-        inst = cls(lam, **ctx)
+        inst = cls(lam, **loss_ctx)
         losses.append(inst)
         if getattr(cls, "needs_next", False):
             needs_next_any = True

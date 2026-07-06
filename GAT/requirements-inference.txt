@@ -1,0 +1,9 @@
+# torch/torchvision are intentionally omitted; use the preinstalled CUDA build.
+# diffusers and timm are installed with `pip install --no-deps` by
+# scripts/setup_gat_inference.sh so pip does not pull torch from PyPI.
+numpy
+pillow
+tqdm
+einops
+safetensors
+huggingface_hub

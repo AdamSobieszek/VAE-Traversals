@@ -48,6 +48,20 @@ def array2grid(x):
     return x
 
 
+def save_sample_sheet(out_samples, save_dir, epoch, global_step, suffix=""):
+    from PIL import Image
+
+    sheet_dir = os.path.join(save_dir, "sample_sheets")
+    os.makedirs(sheet_dir, exist_ok=True)
+    tag = f"_{suffix}" if suffix else ""
+    path = os.path.join(
+        sheet_dir,
+        f"epoch_{epoch:04d}_step_{global_step:07d}{tag}_sheet.png",
+    )
+    Image.fromarray(array2grid(out_samples)).save(path)
+    return path
+
+
 @torch.no_grad()
 def sample_posterior(moments, latents_scale=1.0, latents_bias=0.0):
     mean, std = torch.chunk(moments, 2, dim=1)
@@ -413,7 +427,7 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
-            if (global_step % args.eval_steps == 0) or (args.resume_step == global_step - 1):
+            if args.eval_steps > 0 and global_step > 0 and global_step % args.eval_steps == 0:
                 from metrics import metric_main
 
                 if accelerator.is_main_process:
@@ -473,9 +487,17 @@ def main(args):
                         logger.info(f"Update best FID-5K checkpoint to {checkpoint_path}")
                         fid_best = fid_cur
 
-            if global_step == 1 or (
-                global_step % args.sampling_steps == 0 and global_step > 0
-            ):
+            sheet_due = (
+                args.sheet_steps > 0
+                and global_step > 0
+                and global_step % args.sheet_steps == 0
+            )
+            wandb_sample_due = (
+                global_step > 0
+                and args.sampling_steps > 0
+                and global_step % args.sampling_steps == 0
+            )
+            if sheet_due or wandb_sample_due:
                 with torch.no_grad():
                     samples = ema(x=xs_vis, z=zs_vis, y=ys_vis, truncation_psi=0.5)
                     samples = vae.decode((samples - latents_bias) / latents_scale).sample
@@ -486,16 +508,26 @@ def main(args):
                     samples_notruc = (samples_notruc + 1) / 2.0
 
                 out_samples = accelerator.gather(samples.to(torch.float32))
-                if use_wandb:
-                    accelerator.log({"samples": wandb.Image(array2grid(out_samples))})
-
                 out_samples_notruc = accelerator.gather(samples_notruc.to(torch.float32))
-                if use_wandb:
+
+                if sheet_due and accelerator.is_main_process:
+                    sheet_path = save_sample_sheet(
+                        out_samples, save_dir, epoch + 1, global_step
+                    )
+                    save_sample_sheet(
+                        out_samples_notruc,
+                        save_dir,
+                        epoch + 1,
+                        global_step,
+                        suffix="no_trunc",
+                    )
+                    logger.info(f"Saved sample sheets to {sheet_path}")
+
+                if wandb_sample_due and use_wandb:
+                    accelerator.log({"samples": wandb.Image(array2grid(out_samples))})
                     accelerator.log(
                         {"samples w/o trunc": wandb.Image(array2grid(out_samples_notruc))}
                     )
-
-                logging.info("Generating EMA samples done.")
 
             logs = {}
             for loss_dict in (disc_loss_dict, gen_loss_dict):
@@ -535,6 +567,7 @@ def parse_args(input_args=None):
     parser.add_argument("--logging-dir", type=str, default="logs")
     parser.add_argument("--report-to", type=str, default="wandb")
     parser.add_argument("--sampling-steps", type=int, default=1250)
+    parser.add_argument("--sheet-steps", type=int, default=0, help="Save local sample-sheet PNGs every N optimizer steps. Set 0 to disable.")
     parser.add_argument("--eval-steps", type=int, default=2500)
     parser.add_argument("--resume-step", type=int, default=0)
     parser.add_argument("--wandb-name", type=str, default="CAT")

@@ -117,7 +117,7 @@ class TrainerPotential(object):
         print("   \\__ETA            : {}".format(sec2dhms(eta)[:-6]))
         print("      ==============================================================")
 
-    def _maybe_init_image_logger(self, reconstructor):
+    def _maybe_init_image_logger(self, recognizer):
         if not self.tensorboard:
             self.img_logger = None
             return  
@@ -129,7 +129,7 @@ class TrainerPotential(object):
         self.img_logger = ImageLogger(
             writer=self.tb_writer,
             keep_last_images=img_keep_last,
-            downscale=1 / reconstructor.max_pool_size if hasattr(reconstructor, "max_pool_size") else 1,
+            downscale=1 / recognizer.max_pool_size if hasattr(recognizer, "max_pool_size") else 1,
         )
 
     def _maybe_save_initial(self, support_sets):
@@ -145,13 +145,13 @@ class TrainerPotential(object):
 
     @torch.no_grad()
     def sample_t_idx(self, B: int, target_step: int) -> torch.Tensor:
-        randomize = bool(getattr(self.params, "randomize_target_step", False))
-        if randomize and target_step > 1:
-            return torch.randint(1, target_step, (B, 1), device=self.device, dtype=torch.long)
+        randomize = bool(getattr(self.params, "randomize_target_step", True))
+        if randomize and target_step > 2:
+            return torch.randint(2, target_step, (B, 1), device=self.device, dtype=torch.long)
         return torch.full((B, 1), int(target_step), device=self.device, dtype=torch.long)
 
     # ------------------------ forward+loss (all K) ------------------------
-    def loss_allK(self, support_sets, generator, reconstructor,
+    def loss_allK(self, support_sets, generator, recognizer,
                   z, t_index, dt, acc_denominator: int,
                   *, need_images: bool = False):
         """
@@ -169,7 +169,7 @@ class TrainerPotential(object):
         z0 = z.clone().unsqueeze(1).expand(B, K, D)
         lat0_flat, _, _, _ = _pack_BK(z0)
 
-        DO_VAE_RESHAPE = True # TODO: Remove
+        DO_VAE_RESHAPE = getattr(generator, "uses_vae_latent_shape", False)
         if DO_VAE_RESHAPE:
             reshape_z = lambda z: z.reshape(z.shape[0], generator.latent_channels, generator.latent_size, generator.latent_size).contiguous() if z.ndim == 2 else z
             lat0_flat = reshape_z(lat0_flat)
@@ -185,25 +185,24 @@ class TrainerPotential(object):
         img2 = generator(lat2_flat)
 
 
-
-        DO_ANTISYMMETRIC_LOSS = False # TODO: Remove
-        if DO_ANTISYMMETRIC_LOSS:
+        DO_ANTISYMMETRIC_LOSS = True # TODO: Remove
+        if DO_ANTISYMMETRIC_LOSS and t_index[0].item() > 1:
             def uv(a,b,with_g=False, sign=1):
                 "Whitened coordinates (u,v*):=(z^*-v, z+v)"
                 with torch.no_grad() if not with_g else torch.enable_grad():
                     return (2*a-b, b) if sign>0 else (b, 2*a-b)
 
-            logits0, magnitudes0 = reconstructor(*uv(img0, img1, with_g=False, sign=1))   # [B*K, K]
-            _logits0, _magnitudes0 = reconstructor(*uv(img0, img1, with_g=False, sign=-1))
+            logits0, magnitudes0 = recognizer(*uv(img0, img1, with_g=False, sign=1))   # [B*K, K]
+            _logits0, _magnitudes0 = recognizer(*uv(img0, img1, with_g=False, sign=-1))
 
 
-            logits, magnitudes = reconstructor(*uv(img1, img2, with_g=True, sign=1))   # [B*K, K]
-            _logits, _magnitudes = reconstructor(*uv(img1, img2, with_g=True, sign=-1))
+            logits, magnitudes = recognizer(*uv(img1, img2, with_g=True, sign=1))   # [B*K, K]
+            _logits, _magnitudes = recognizer(*uv(img1, img2, with_g=True, sign=-1))
 
             cls_loss = self.cross_entropy((logits-_logits)/2, targets) + self.cross_entropy((logits0-_logits0)/2, targets)
         else:
             logits0= torch.zeros(B*K, K, device=self.device)
-            logits, magnitudes = reconstructor(img1, img2)   # [B*K, K]
+            logits, magnitudes = recognizer(img1, img2)   # [B*K, K]
             cls_loss = self.cross_entropy(logits, targets)
 
 
@@ -244,9 +243,9 @@ class TrainerPotential(object):
         return loss_dict, logits.detach(), logits0.detach(), targets, potential_preds.detach(), img1_bk, img2_bk, latents_out
 
     # ------------------------ checkpoint utils ------------------------
-    def get_starting_iteration(self, support_sets, reconstructor,
-                              support_opt=None, recon_opt=None,
-                              support_sched=None, recon_sched=None):
+    def get_starting_iteration(self, support_sets, recognizer,
+                              support_opt=None, recognizer_opt=None,
+                              support_sched=None, recognizer_sched=None):
         def safe_load_state_dict(obj, ckpt, name, strict=True):
             if obj is not None and name in ckpt:
                 try:
@@ -260,7 +259,7 @@ class TrainerPotential(object):
             start_iter = int(ckpt.get("iter", 1))
 
             safe_load_state_dict(support_sets, ckpt, "support_sets", strict=False)
-            safe_load_state_dict(reconstructor, ckpt, "reconstructor", strict=False)
+            safe_load_state_dict(recognizer, ckpt, "recognizer", strict=False)
 
             # Add noise after loading (kept as-is)
             def add_noise_to_params(module, std=1e-3):
@@ -270,22 +269,22 @@ class TrainerPotential(object):
 
             if support_sets is not None:
                 add_noise_to_params(support_sets)
-            if reconstructor is not None:
-                add_noise_to_params(reconstructor)
+            if recognizer is not None:
+                add_noise_to_params(recognizer)
 
             safe_load_state_dict(support_opt, ckpt, "support_opt")
-            safe_load_state_dict(recon_opt, ckpt, "recon_opt")
+            safe_load_state_dict(recognizer_opt, ckpt, "recognizer_opt")
             safe_load_state_dict(support_sched, ckpt, "support_sched")
-            safe_load_state_dict(recon_sched, ckpt, "recon_sched")
+            safe_load_state_dict(recognizer_sched, ckpt, "recognizer_sched")
 
             self.stat_tracker.set_opt_step(start_iter)
 
         return start_iter
 
     # ------------------------ optim/sched ------------------------
-    def init_optimizers(self, support_sets, reconstructor, acc_steps: int):
+    def init_optimizers(self, support_sets, recognizer, acc_steps: int):
         support_set_wd = float(getattr(self.params, "support_set_wd", 0.1))
-        reconstructor_wd = float(getattr(self.params, "reconstructor_wd", 0.01))
+        recognizer_wd = float(getattr(self.params, "recognizer_wd", 0.01))
         betas = tuple(getattr(self.params, "adam_betas", (0.9, 0.999)))
         eps = float(getattr(self.params, "adam_eps", 1e-8))
 
@@ -307,10 +306,10 @@ class TrainerPotential(object):
             eps=eps,
         )
 
-        reconstructor_optim = build_adamw(
-            reconstructor,
-            lr=self.params.reconstructor_lr,
-            weight_decay=reconstructor_wd,
+        recognizer_optim = build_adamw(
+            recognizer,
+            lr=self.params.recognizer_lr,
+            weight_decay=recognizer_wd,
             extra_no_decay_names=(),
             betas=betas,
             eps=eps,
@@ -323,31 +322,31 @@ class TrainerPotential(object):
             support_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
         )
         sched_recon = CosineScheduleWithWarmup(
-            reconstructor_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
+            recognizer_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
         )
 
         starting_opt_step = self.get_starting_iteration(
-            support_sets, reconstructor,
-            support_opt=support_sets_optim, recon_opt=reconstructor_optim,
-            support_sched=sched_support, recon_sched=sched_recon,
+            support_sets, recognizer,
+            support_opt=support_sets_optim, recognizer_opt=recognizer_optim,
+            support_sched=sched_support, recognizer_sched=sched_recon,
         )
 
         if reset_lr:
             for g in support_sets_optim.param_groups:
                 g["lr"] = float(self.params.support_set_lr)
-            for g in reconstructor_optim.param_groups:
-                g["lr"] = float(self.params.reconstructor_lr)
+            for g in recognizer_optim.param_groups:
+                g["lr"] = float(self.params.recognizer_lr)
             if hasattr(sched_support, "base_lrs"):
                 sched_support.base_lrs = [g["lr"] for g in support_sets_optim.param_groups]
             if hasattr(sched_recon, "base_lrs"):
-                sched_recon.base_lrs = [g["lr"] for g in reconstructor_optim.param_groups]
+                sched_recon.base_lrs = [g["lr"] for g in recognizer_optim.param_groups]
 
         if reset_schedulers:
             sched_support = CosineScheduleWithWarmup(
                 support_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
             )
             sched_recon = CosineScheduleWithWarmup(
-                reconstructor_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
+                recognizer_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
             )
             if reset_weight_decay and not reset_start_iter:
                 starting_opt_step = 0
@@ -361,11 +360,11 @@ class TrainerPotential(object):
             opt_step_idx = starting_opt_step
 
         support_sets_optim.zero_grad(set_to_none=True)
-        reconstructor_optim.zero_grad(set_to_none=True)
-        return starting_micro, opt_step_idx, support_sets_optim, reconstructor_optim, sched_support, sched_recon
+        recognizer_optim.zero_grad(set_to_none=True)
+        return starting_micro, opt_step_idx, support_sets_optim, recognizer_optim, sched_support, sched_recon
 
     # ------------------------ train ------------------------
-    def train(self, generator, support_sets, reconstructor):
+    def train(self, generator, support_sets, recognizer):
         # runtime toggles (defaults match your current script)
         enable_analytics = bool(getattr(self.params, "enable_analytics", True))
         enable_histograms = bool(getattr(self.params, "enable_histograms", True))
@@ -379,12 +378,12 @@ class TrainerPotential(object):
         generator = generator.to(self.device).eval()
         generator.requires_grad_(False)
         support_sets = support_sets.to(self.device).train()
-        reconstructor = reconstructor.to(self.device).train()
+        recognizer = recognizer.to(self.device).train()
 
         if self.multi_gpu:
             print(f"#. Parallelize G, R over {torch.cuda.device_count()} GPUs...")
             generator = DataParallelPassthrough(generator)
-            reconstructor = DataParallelPassthrough(reconstructor)
+            recognizer = DataParallelPassthrough(recognizer)
             cudnn.benchmark = True
 
         # Bookkeeping
@@ -402,10 +401,10 @@ class TrainerPotential(object):
         total_opt_steps = max(1, math.ceil(int(self.params.max_iter) / max(1, acc_steps)))
 
         (starting_micro, _opt_step_idx,
-         support_sets_optim, reconstructor_optim,
-         sched_support, sched_recon) = self.init_optimizers(support_sets, reconstructor, acc_steps)
+         support_sets_optim, recognizer_optim,
+         sched_support, sched_recon) = self.init_optimizers(support_sets, recognizer, acc_steps)
 
-        self._maybe_init_image_logger(reconstructor)
+        self._maybe_init_image_logger(recognizer)
 
         t0 = time.time()
 
@@ -440,7 +439,7 @@ class TrainerPotential(object):
             t_idx = self.sample_t_idx(B, target_step)
 
             loss_dict, logits_det, logits0_det, targets, potential_preds_det, img1_bk, img2_bk, latent2_bk_det = self.loss_allK(
-                support_sets, generator, reconstructor,
+                support_sets, generator, recognizer,
                 z, t_idx, dt,
                 acc_denominator=acc_steps,
                 need_images=do_imgs,
@@ -476,7 +475,7 @@ class TrainerPotential(object):
             # ===== recognizer optimizer step @ each micro-step =====
 
             if do_gradnorm:
-                tb_grad_norms(self.tb_writer, step_idx, support_sets=support_sets, reconstructor=reconstructor)
+                tb_grad_norms(self.tb_writer, step_idx, support_sets=support_sets, recognizer=recognizer)
 
 
             clip_accum_grads_(support_sets, micro_idx=micro_idx,acc_steps=acc_steps,
@@ -487,10 +486,10 @@ class TrainerPotential(object):
                 alpha=float(getattr(self.params, "support_clip_alpha", 3.0)),       # delta_prophet cap = alpha * ||delta_1||
                 clip_final=getattr(self.params, "support_clip_final", None),        # defaults to clip_end inside util
             )
-            torch.nn.utils.clip_grad_norm_(reconstructor.parameters(), max_norm=2.0)
+            torch.nn.utils.clip_grad_norm_(recognizer.parameters(), max_norm=2.0)
 
-            reconstructor_optim.step()
-            reconstructor_optim.zero_grad(set_to_none=True)
+            recognizer_optim.step()
+            recognizer_optim.zero_grad(set_to_none=True)
             # ===== support sets optimizer step @ boundary =====
             if is_boundary:
                 torch.nn.utils.clip_grad_norm_(support_sets.parameters(), max_norm=2.0)
@@ -549,7 +548,7 @@ class TrainerPotential(object):
                         #     step_idx,
                         #     stat_tracker=self.stat_tracker,
                         #     support_sets=support_sets,
-                        #     reconstructor=reconstructor,
+                        #     recognizer=recognizer,
                         #     z_bd=z_info,
                         #     dt=dt_info,
                         #     save_dir=frames_dir,
@@ -596,11 +595,11 @@ class TrainerPotential(object):
                     checkpoint_dict = {
                         "iter": cur_step,
                         "support_sets": support_sets.state_dict(),
-                        "reconstructor": reconstructor.state_dict(),
+                        "recognizer": recognizer.state_dict(),
                         "support_opt": support_sets_optim.state_dict(),
-                        "recon_opt": reconstructor_optim.state_dict(),
+                        "recognizer_opt": recognizer_optim.state_dict(),
                         "support_sched": sched_support.state_dict(),
-                        "recon_sched": sched_recon.state_dict(),
+                        "recognizer_sched": sched_recon.state_dict(),
                     }
                     torch.save(checkpoint_dict, self.checkpoint)
                     last_ckp_step = cur_step
@@ -608,8 +607,8 @@ class TrainerPotential(object):
         # === end loop ===
         torch.save(support_sets.state_dict(), osp.join(self.models_dir, "support_sets.pt"))
         torch.save(
-            reconstructor.module.state_dict() if self.multi_gpu else reconstructor.state_dict(),
-            osp.join(self.models_dir, "reconstructor.pt"),
+            recognizer.module.state_dict() if self.multi_gpu else recognizer.state_dict(),
+            osp.join(self.models_dir, "recognizer.pt"),
         )
 
         if self.img_logger is not None:

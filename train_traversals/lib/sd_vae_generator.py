@@ -30,6 +30,7 @@ class SDVAEGenerator(nn.Module):
         self.dim_z = self.latent_channels * self.latent_size * self.latent_size
         self.latent_size_flat = self.dim_z
         self.shift_in_w_space = False
+        self.uses_vae_latent_shape = True
 
         config = OmegaConf.load(str(config_path))
         model_params = OmegaConf.to_container(config.model.params, resolve=True)

@@ -21,7 +21,6 @@ from losses.diffaug import DiffAugment
 from models.discriminator import CATD_models
 from models.discriminator import CATDiscriminator
 from models.generator import CAT_models
-from models.custom_layers import Attention
 from models.pos_embed import MultiScaleVisionRotaryEmbeddingFast
 
 BLOCK_KWARGS = {"fused_attn": True, "qk_norm": True}
@@ -147,25 +146,6 @@ def test_attention_mask(device):
     print("attention mask: ok")
 
 
-def test_grouped_attention_matches_mask(device):
-    torch.manual_seed(0)
-    group_lengths = (4, 3, 3)
-    attn = Attention(
-        dim=16,
-        num_heads=4,
-        qkv_bias=True,
-        qk_norm=False,
-        fused_attn=False,
-    ).to(device)
-    attn.eval()
-    x = torch.randn(2, sum(group_lengths), 16, device=device)
-    mask = build_block_diag_attention_mask(group_lengths, device, x.dtype)
-    dense_out = attn(x, attn_mask=mask)
-    grouped_out = attn(x, group_lengths=group_lengths)
-    assert torch.allclose(grouped_out, dense_out, atol=1e-5, rtol=1e-5)
-    print("grouped attention: ok")
-
-
 def test_multiscale_rope(device):
     rope = MultiScaleVisionRotaryEmbeddingFast(dim=4, grid_sizes=(16, 8, 4, 2)).to(device)
     x = torch.randn(2, 4, 344, 8, device=device)
@@ -175,19 +155,6 @@ def test_multiscale_rope(device):
     assert torch.allclose(y[:, :, cls_indices], x[:, :, cls_indices])
     assert not torch.allclose(y[:, :, 1:], x[:, :, 1:])
     print("multiscale RoPE: ok")
-
-
-def test_discriminator_param_accounting(block_kwargs):
-    D_backbone = CATD_models["CAT-D-B/2"](num_classes=1000, z_dims=[0], **block_kwargs)
-    backbone_params = sum(p.numel() for p in D_backbone.parameters())
-    assert 96_000_000 <= backbone_params <= 98_000_000
-
-    D_aux = CATD_models["CAT-D-B/2"](num_classes=1000, z_dims=[768], **block_kwargs)
-    total_params = sum(p.numel() for p in D_aux.parameters())
-    aux_params = sum(p.numel() for p in D_aux.proj.parameters())
-    assert total_params - aux_params == backbone_params
-    assert aux_params > 0
-    print("discriminator param accounting: ok")
 
 
 def test_consistency_loss(device):
@@ -433,9 +400,7 @@ def main():
         lambda: test_pyramid_and_discriminator(device, block_kwargs),
         lambda: test_discriminator_variants(device, block_kwargs),
         lambda: test_attention_mask(device),
-        lambda: test_grouped_attention_matches_mask(device),
         lambda: test_multiscale_rope(device),
-        lambda: test_discriminator_param_accounting(block_kwargs),
         lambda: test_consistency_loss(device),
         lambda: test_alignment_metrics(device),
         lambda: test_diffaugment_replay_scaling(device),

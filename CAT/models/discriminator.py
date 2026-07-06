@@ -7,7 +7,7 @@ import numpy as np
 
 from timm.models.vision_transformer import Mlp
 from models.custom_layers import Attention, EqualLinear
-from models.pos_embed import MultiScaleVisionRotaryEmbeddingFast
+from models.pos_embed import VisionRotaryEmbeddingFast
 from models.swiglu_ffn import SwiGLUFFN
 
 
@@ -66,13 +66,8 @@ class TransformerBlock(nn.Module):
         self.ls_attn = nn.Parameter(torch.ones(hidden_size) * layerscale)
         self.ls_mlp = nn.Parameter(torch.ones(hidden_size) * layerscale)
 
-    def forward(self, x, c=None, feat_rope=None, attn_mask=None, group_lengths=None):
-        x = x + self.attn(
-            self.norm1(x),
-            rope=feat_rope,
-            attn_mask=attn_mask,
-            group_lengths=group_lengths,
-        ) * self.ls_attn
+    def forward(self, x, c=None, feat_rope=None, attn_mask=None):
+        x = x + self.attn(self.norm1(x), rope=feat_rope, attn_mask=attn_mask) * self.ls_attn
         x = x + self.mlp(self.norm2(x)) * self.ls_mlp
         return x
 
@@ -141,9 +136,11 @@ class CATDiscriminator(nn.Module):
         self.cls_tokens = nn.Parameter(torch.randn(4, 1, hidden_size) * 0.02)
 
         half_head_dim = hidden_size // num_heads // 2
-        self.feat_rope = MultiScaleVisionRotaryEmbeddingFast(
-            dim=half_head_dim,
-            grid_sizes=self.SCALE_TOKEN_GRIDS,
+        self.feat_rope = nn.ModuleList(
+            [
+                VisionRotaryEmbeddingFast(dim=half_head_dim, pt_seq_len=grid)
+                for grid in self.SCALE_TOKEN_GRIDS
+            ]
         )
 
         layer_gain = 1e-1
@@ -211,18 +208,21 @@ class CATDiscriminator(nn.Module):
 
         y_emb = self.y_embedder(y, self.training).squeeze(dim=1)
 
-        seq = torch.cat([self.encode_scale(x, idx) for idx, x in enumerate(xs)], dim=1)
+        seq_parts = [self.encode_scale(x, idx) for idx, x in enumerate(xs)]
         for block in self.blocks:
-            seq = torch.utils.checkpoint.checkpoint(
-                self.ckpt_wrapper(block),
-                seq,
-                None,
-                self.feat_rope,
-                None,
-                self.GROUP_LENGTHS,
-                use_reentrant=False,
-            )
+            seq_parts = [
+                torch.utils.checkpoint.checkpoint(
+                    self.ckpt_wrapper(block),
+                    seq_part,
+                    None,
+                    rope,
+                    None,
+                    use_reentrant=False,
+                )
+                for seq_part, rope in zip(seq_parts, self.feat_rope)
+            ]
 
+        seq = torch.cat(seq_parts, dim=1)
         self.recent_x_std = seq.std()
 
         cls_feats = torch.stack([seq[:, idx] for idx in self.CLS_INDICES], dim=1)

@@ -2365,6 +2365,20 @@ def batch_acc_from_logits(logits: torch.Tensor, B: int, K: int, device) -> tuple
 
 
 @torch.no_grad()
+def dual_batch_acc_from_logits(
+    logits0: torch.Tensor,
+    logits: torch.Tensor,
+    B: int,
+    K: int,
+    device,
+) -> tuple[float, float, float, torch.Tensor]:
+    step1_acc, _ = batch_acc_from_logits(logits0, B, K, device)
+    step2_acc, preds = batch_acc_from_logits(logits, B, K, device)
+    acc = 0.5 * (step1_acc + step2_acc)
+    return acc, step1_acc, step2_acc, preds
+
+
+@torch.no_grad()
 def entropy_from_logits(logits: torch.Tensor) -> float:
     probs = torch.softmax(logits, dim=1)
     ent = -(probs * probs.clamp_min(1e-8).log()).sum(dim=1).mean()

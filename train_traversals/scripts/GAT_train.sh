@@ -4,11 +4,11 @@ num_support_timesteps=20
 warmup_fraction=0.001
 accumulate_grad_steps=2
 recognizer_type="ResNet"
-z_truncation=0.75
+z_truncation=1.0
 batch_size=5
-max_iter=3000
+max_iter=100
 tensorboard=true
-new_experiment=true
+new_experiment=false
 
 # ================================
 

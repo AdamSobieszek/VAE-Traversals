@@ -20,8 +20,8 @@ from .aux import (
     CosineScheduleWithWarmup, build_adamw, ImageLogger, ImageViz,
     _pack_BK, _per_k_grad_norms, module_grad_norm,
     # new aux funcs
-    tb_start,
-    batch_acc_from_logits, entropy_from_logits, collect_wave_stats,
+    tb_start, dual_batch_acc_from_logits,
+    entropy_from_logits, collect_wave_stats,
     tb_scalars, tb_grad_norms, tb_hists, tb_figs, tb_images,clip_accum_grads_, update_dual_confusion_,
     tb_path_figs, tb_information_matrix_figs, tb_pairwise_distance_figs,
 )
@@ -104,7 +104,7 @@ class TrainerPotential(object):
 
     def log_progress(self, step_idx, mean_step_time, elapsed_time, eta):
         if step_idx > 1:
-            update_stdout(10)
+            update_stdout(12)
         stats = self.stat_tracker.stats_by_step.get(int(step_idx), {})
         total_opt_steps = math.ceil(self.params.max_iter / max(1, int(getattr(self.params, "accumulate_grad_steps", 1))))
         update_progress(
@@ -114,6 +114,8 @@ class TrainerPotential(object):
         )
         print()
         print("   \\__Batch accuracy Index      : {:.03f}".format(stats.get("accuracy_index", 0.0)))
+        print("   \\__Step 1 accuracy           : {:.03f}".format(stats.get("step1_accuracy", 0.0)))
+        print("   \\__Step 2 accuracy           : {:.03f}".format(stats.get("step2_accuracy", 0.0)))
         print("   \\__Classification loss       : {:.08f}".format(stats.get("classification_loss", 0.0)))
         print("   \\__Wave loss (PDE-JVP combo) : {:.08f}".format(stats.get("wave_loss", 0.0)))
         print("   \\__Total loss                : {:.08f}".format(stats.get("total_loss", 0.0)))
@@ -187,6 +189,7 @@ class TrainerPotential(object):
         lat0_for_gen = lat0_flat
         lat1_for_gen = lat1_flat
         lat2_for_gen = lat2_flat
+        
         DO_VAE_RESHAPE = getattr(generator, "uses_vae_latent_shape", False)
         if DO_VAE_RESHAPE:
             reshape_z = lambda z: z.reshape(z.shape[0], generator.latent_channels, generator.latent_size, generator.latent_size).contiguous() if z.ndim == 2 else z
@@ -214,20 +217,18 @@ class TrainerPotential(object):
                     return (2*a-b, b) if sign>0 else (b, 2*a-b)
 
             with self.gan_recognizer_context():
-                logits0, magnitudes0 = recognizer(*uv(img0, img1, with_g=False, sign=1))   # [B*K, K]
-                _logits0, _magnitudes0 = recognizer(*uv(img0, img1, with_g=False, sign=-1))
+                logits0 = recognizer(*uv(img0, img1, with_g=False, sign=1))[0] - recognizer(*uv(img0, img1, with_g=False, sign=-1))[0]
 
-
-                logits, magnitudes = recognizer(*uv(img1, img2, with_g=True, sign=1))   # [B*K, K]
-                _logits, _magnitudes = recognizer(*uv(img1, img2, with_g=True, sign=-1))
+                logits = recognizer(*uv(img1, img2, with_g=True, sign=1))[0] - recognizer(*uv(img1, img2, with_g=True, sign=-1))[0]   # [B*K, K]
+                
 
             with self.fp32_context():
                 cls_loss = (
-                    self.cross_entropy((logits.float() - _logits.float()) / 2, targets)
-                    + self.cross_entropy((logits0.float() - _logits0.float()) / 2, targets)
+                    self.cross_entropy(logits.float(), targets)
+                    + self.cross_entropy(logits0.float(), targets)
                 )
         else:
-            logits0= torch.zeros(B*K, K, device=self.device, dtype=torch.float32)
+            logits0 = torch.zeros(B*K, K, device=self.device, dtype=torch.float32)
             with self.gan_recognizer_context():
                 logits, magnitudes = recognizer(img1, img2)   # [B*K, K]
             with self.fp32_context():
@@ -343,6 +344,19 @@ class TrainerPotential(object):
         reset_schedulers = bool(getattr(self.params, "reset_schedulers", False))
         reset_start_iter = bool(getattr(self.params, "reset_start_iter", False))
 
+        def force_optimizer_lr(optimizer, lr: float):
+            lr = float(lr)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+                group["initial_lr"] = lr
+
+        def sync_scheduler_lrs(scheduler, optimizer):
+            lrs = [float(group["lr"]) for group in optimizer.param_groups]
+            if hasattr(scheduler, "base_lrs"):
+                scheduler.base_lrs = list(lrs)
+            if hasattr(scheduler, "_last_lr"):
+                scheduler._last_lr = list(lrs)
+
         support_sets_optim = build_adamw(
             [
                 {"params": support_sets.F.parameters(), "weight_decay": support_set_wd, "lr": self.params.support_set_lr},
@@ -380,16 +394,6 @@ class TrainerPotential(object):
             support_sched=sched_support, recognizer_sched=sched_recon,
         )
 
-        if reset_lr:
-            for g in support_sets_optim.param_groups:
-                g["lr"] = float(self.params.support_set_lr)
-            for g in recognizer_optim.param_groups:
-                g["lr"] = float(self.params.recognizer_lr)
-            if hasattr(sched_support, "base_lrs"):
-                sched_support.base_lrs = [g["lr"] for g in support_sets_optim.param_groups]
-            if hasattr(sched_recon, "base_lrs"):
-                sched_recon.base_lrs = [g["lr"] for g in recognizer_optim.param_groups]
-
         if reset_schedulers:
             sched_support = CosineScheduleWithWarmup(
                 support_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
@@ -399,6 +403,12 @@ class TrainerPotential(object):
             )
             if reset_weight_decay and not reset_start_iter:
                 starting_opt_step = 0
+
+        if reset_lr:
+            force_optimizer_lr(support_sets_optim, self.params.support_set_lr)
+            force_optimizer_lr(recognizer_optim, self.params.recognizer_lr)
+            sync_scheduler_lrs(sched_support, support_sets_optim)
+            sync_scheduler_lrs(sched_recon, recognizer_optim)
 
         if reset_start_iter:
             starting_micro = 1
@@ -501,7 +511,9 @@ class TrainerPotential(object):
 
             # ===== analytics & stats (micro) =====
             with torch.no_grad():
-                batch_acc, preds_2d = batch_acc_from_logits(logits_det, B, self.K, self.device)
+                batch_acc, step1_acc, step2_acc, preds_2d = dual_batch_acc_from_logits(
+                    logits0_det, logits_det, B, self.K, self.device
+                )
 
                 wave_stats = {}
                 if enable_analytics:
@@ -512,6 +524,8 @@ class TrainerPotential(object):
 
                 self.stat_tracker.add_micro(
                     acc=batch_acc,
+                    step1_accuracy=step1_acc,
+                    step2_accuracy=step2_acc,
                     **loss_dict,
                     **{k: float(v) for k, v in wave_stats.items() if isinstance(v, (int, float))},
                 )

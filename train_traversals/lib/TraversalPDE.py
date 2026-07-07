@@ -158,7 +158,6 @@ class TraversalPDE(nn.Module):
         seed: Optional[int] = None,
         # optional: prior score function for DivPrior/Poisson (defaults to Gaussian score -x)
         prior_score: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        only_potential: bool = False,
     ):
         super().__init__()
         if lambdas is None:
@@ -167,7 +166,6 @@ class TraversalPDE(nn.Module):
         self.num_support_sets = int(num_support_sets)
         self.num_support_timesteps = int(num_support_timesteps)
         self.support_vectors_dim = int(support_vectors_dim)
-        self.only_potential = bool(only_potential)
 
         # Learnable per-k scale (kept for parity; not wired to dt by default)
         self.c = nn.Parameter(torch.full((self.num_support_sets, 1), 1.0))
@@ -231,12 +229,15 @@ class TraversalPDE(nn.Module):
         # optional small step noise
         if self.training:
             with torch.no_grad():
-                step_delta_norms = (x_next - st.x()).norm(dim=-1, keepdim=True)
+                step_delta = x_next - st.x()
+                step_delta_sq_norms = step_delta.pow(2).sum(dim=-1, keepdim=True)
+                step_delta_norms = step_delta_sq_norms.sqrt()
                 latent_noise = torch.randn_like(x_next)
-                latent_noise = latent_noise / latent_noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12)
-                latent_noise = latent_noise * (
-                    step_delta_norms.clamp_min(step_delta_norms.mean().item() / 3.0) / 5.0
+                latent_noise = latent_noise - step_delta * (
+                    (latent_noise * step_delta).sum(dim=-1, keepdim=True) / step_delta_sq_norms.clamp_min(1e-12)
                 )
+                latent_noise = latent_noise / latent_noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12)
+                latent_noise = latent_noise * (step_delta_norms.clamp_min(step_delta_norms.mean().item()/3) / 5.0)
             x_next_noisy = x_next + latent_noise
         else:
             x_next_noisy = x_next

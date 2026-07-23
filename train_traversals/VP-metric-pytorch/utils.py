@@ -18,7 +18,6 @@ Utils for VP metrics
 import os
 import torch
 import numpy as np
-import shutil
 import torchvision
 from PIL import Image
 
@@ -42,32 +41,55 @@ class AverageMeter(object):
 
 
 def worker_init_fn(worker_id):
-    np.random.seed(np.random.get_state()[1][0] + worker_id)
+    np.random.seed(torch.initial_seed() % (2 ** 32))
 
 
-def split_indices(data_dir, test_ratio):
-    label_file = os.path.join(data_dir, 'labels.npy')
-    labels = np.load(label_file)
-    n_data = labels.shape[0]
-    shuffled = np.arange(n_data)
-    np.random.shuffle(shuffled)
-    test_list = shuffled[:int(n_data * test_ratio)]
-    train_list = shuffled[int(n_data * test_ratio):]
-    return train_list, test_list
+def fraction_count(total, fraction):
+    """Floor a fractional count without binary floating-point underflow."""
+    return int(total * fraction + 1e-9)
 
 
-def save_checkpoint(state, is_best, result_dir, filename='tmp.pth.tar'):
-    if is_best:
-        print('Saving best checkpoint...')
-        filename = 'model_best.pth.tar'
-        torch.save(state, os.path.join(result_dir, filename))
-        # Write a single, parseable value (overwrite). Older code appended without newlines,
-        # which could corrupt the file across multiple "best" saves.
-        with open(os.path.join(result_dir, 'best_epoch.txt'), 'w') as f:
-            f.write(f"best epoch: {state['epoch']}\n")
-    else:
-        print('Saving checkpoint...')
-        torch.save(state, os.path.join(result_dir, filename))
+def make_fold_split(n_data, train_fraction, fold, n_folds, seed):
+    """Create cyclic folds whose validation sets overlap as little as possible."""
+    if not 0 < train_fraction < 1:
+        raise ValueError("train_fraction must be between 0 and 1")
+    if not 0 <= fold < n_folds:
+        raise ValueError("fold must be in [0, n_folds)")
+
+    permutation = np.random.RandomState(seed).permutation(n_data)
+    validation_size = fraction_count(n_data, 1.0 - train_fraction)
+    start = (fold * n_data) // n_folds
+    validation_positions = (start + np.arange(validation_size)) % n_data
+    train_size = n_data - validation_size
+    train_positions = (start + validation_size + np.arange(train_size)) % n_data
+    return permutation[train_positions], permutation[validation_positions]
+
+
+class EpochSubsetSampler(torch.utils.data.Sampler):
+    """Rotate a fixed-size epoch budget through a larger training pool."""
+
+    def __init__(self, indices, samples_per_epoch, seed):
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.samples_per_epoch = int(samples_per_epoch)
+        if not 0 < self.samples_per_epoch <= len(self.indices):
+            raise ValueError("samples_per_epoch must be in [1, len(indices)]")
+        self.seed = seed
+        self.epoch = 0
+        self._cycle = np.random.RandomState(seed).permutation(self.indices)
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        count = len(self._cycle)
+        start = (self.epoch * self.samples_per_epoch) % count
+        positions = (start + np.arange(self.samples_per_epoch)) % count
+        selected = self._cycle[positions].copy()
+        np.random.RandomState(self.seed + self.epoch + 1).shuffle(selected)
+        return iter(selected.tolist())
+
+    def __len__(self):
+        return self.samples_per_epoch
 
 
 def accuracy(output, target, topk=(1, )):

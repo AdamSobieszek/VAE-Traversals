@@ -1,60 +1,45 @@
-#!/usr/bin/python
-#-*- coding: utf-8 -*-
+#!/usr/bin/env python
+"""Read VP score summaries from the structured stats file."""
 
-# >.>.>.>.>.>.>.>.>.>.>.>.>.>.>.>.
-# Licensed under the Apache License, Version 2.0 (the "License")
-# You may obtain a copy of the License at
-# http://www.apache.org/licenses/LICENSE-2.0
-
-# --- File Name: get_best_score.py
-# --- Creation Date: 29-02-2020
-# --- Last Modified: Sat 29 Feb 2020 14:20:36 AEDT
-# --- Author: Xinqi Zhu
-# .<.<.<.<.<.<.<.<.<.<.<.<.<.<.<.<
-"""
-Get the highest score from training results
-"""
-import os
 import argparse
-import re
-from collect_vp_fac_disscores import readlines_of, get_val_line
+import json
+from pathlib import Path
+
+
+def get_score_summary(target_dir):
+    stats_path = Path(target_dir) / "stats.json"
+    if not stats_path.is_file():
+        return []
+    with stats_path.open("r", encoding="utf-8") as handle:
+        stats = json.load(handle)
+    return (stats.get("summary") or {}).get("by_train_fraction", [])
 
 
 def get_dis_score(args):
-    vp_acc_txt = os.path.join(args.target_dir, 'val.log')
-    if not os.path.isfile(vp_acc_txt):
-        return 0
-    vp_acc_bestepoch_txt = os.path.join(args.target_dir, 'best_epoch.txt')
-    if not os.path.isfile(vp_acc_bestepoch_txt):
-        return 0
-    # Robust parsing: older checkpoints appended without newlines, producing
-    # strings like "... 5best epoch: 6". Extract the last integer anywhere.
-    raw = "".join(readlines_of(vp_acc_bestepoch_txt)).strip()
-    m = re.findall(r"\d+", raw)
-    if not m:
-        return 0
-    target_epoch = int(m[-1]) - 1
-    data = readlines_of(vp_acc_txt)
-    val_line = get_val_line(data, target_epoch)
-    vp_acc = float(val_line.strip().split()[3])
-    return vp_acc
+    """Return the fixed-mode score, retaining the historical public helper."""
+    rows = get_score_summary(args.target_dir)
+    if not rows:
+        return 0.0
+    return float(rows[-1]["mean_best_accuracy"])
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Collect best score.')
-    parser.add_argument('--target_dir',
-                        help='Target directory.',
-                        type=str,
-                        default='/mnt/hdd/Datasets/test_data/pair_train')
-    parser.add_argument('--vp_dis_type',
-                        help='VP disentangle metrics txt type.',
-                        type=str,
-                        default='best')
-
+    parser = argparse.ArgumentParser(description="Read VP metric results.")
+    parser.add_argument("--target-dir", "--target_dir", required=True)
     args = parser.parse_args()
-
-    vp_acc = get_dis_score(args)
-    print(vp_acc)
+    rows = get_score_summary(args.target_dir)
+    if not rows:
+        print("No completed validation results found.")
+        return
+    for row in rows:
+        print(
+            "train_fraction={:.6g} mean_best_accuracy={:.3f} std={:.3f} folds={}".format(
+                row["train_fraction"],
+                row["mean_best_accuracy"],
+                row["std_best_accuracy"],
+                len(row["fold_best_accuracies"]),
+            )
+        )
 
 
 if __name__ == "__main__":

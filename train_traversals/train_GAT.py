@@ -97,7 +97,7 @@ def main():
     parser.add_argument(
         "--truncation-psi",
         type=float,
-        default=0.8,
+        default=0.2,
         help="GAT style-vector truncation strength",
     )
     parser.add_argument(
@@ -112,11 +112,10 @@ def main():
                         help="number of support sets (potential functions)")
     parser.add_argument("-D", "--num-support-timesteps", type=int, default=4,
                         help="number of timesteps per potential")
-    parser.add_argument("--support-set-lr", type=float, default=3e-4, help="support-set learning rate")
-    parser.add_argument("--only-potential", type=bool, default=True, help="only train potential")
+    parser.add_argument("--support-set-lr", type=float, default=2e-4, help="support-set learning rate")
 
     # === Reconstructor (R) ====================================================================== #
-    parser.add_argument("--recognizer-lr", type=float, default=3e-4,
+    parser.add_argument("--recognizer-lr", type=float, default=2e-4,
                         help="learning rate for recognizer optimization")
     parser.add_argument("--recognizer-type", type=str, default="ResNet",
                         help="recognizer network type")
@@ -128,7 +127,6 @@ def main():
                         help="gradient accumulation steps")
     parser.add_argument("--warmup-fraction", type=float, default=0.05, help="warmup fraction")
     parser.add_argument("--lambda-cls", type=float, default=1.00, help="classification loss weight")
-    parser.add_argument("--lambda-reg", type=float, default=0.0, help="regression loss weight")
     parser.add_argument("--lambda-pde", type=float, default=1.00, help="PDE loss weight")
     parser.add_argument("--log-freq", default=10, type=int, help="logging frequency")
     parser.add_argument("--ckp-freq", default=1000, type=int, help="checkpoint frequency")
@@ -172,7 +170,6 @@ def main():
         num_support_sets=args.num_support_sets,
         num_support_timesteps=args.num_support_timesteps,
         support_vectors_dim=G.dim_z,
-        only_potential=args.only_potential,
         lambdas={"BB": 0.2, "signed_g2orth": 1.0},
     )
 
@@ -193,7 +190,6 @@ def main():
     ))
 
     print("#. Experiment: {}".format(exp_dir))
-    print("  \\__Only train potential: {}".format(args.only_potential))
     trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
     trn.train(generator=G, support_sets=S, recognizer=R)
 

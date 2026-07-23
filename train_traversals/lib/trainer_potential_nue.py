@@ -168,131 +168,6 @@ class TrainerPotential(object):
             return nullcontext()
         return torch.amp.autocast(device_type=self.device.type, enabled=False)
 
-    # ------------------------ forward+loss (all K) ------------------------
-    def loss_allK(self, support_sets, generator, recognizer,
-                  z, t_index, dt, acc_denominator: int,
-                  *, need_images: bool = False):
-        """
-        One forward for all K in parallel.
-        Optional: only materialize img*_bk if need_images=True (for TB logging).
-        """
-        with self.fp32_context():
-            potential_preds, latent1_bk, latent2_bk, pde_loss, dt = support_sets(z, t_index, dt=dt, direction=dt)
-        B, K, D = latent1_bk.shape
-
-        lat1_flat, targets, _, (B, K) = _pack_BK(latent1_bk)
-        lat2_flat, _, _, _ = _pack_BK(latent2_bk)
-
-        z0 = z.clone().unsqueeze(1).expand(B, K, D)
-        lat0_flat, _, _, _ = _pack_BK(z0)
-
-        lat0_for_gen = lat0_flat
-        lat1_for_gen = lat1_flat
-        lat2_for_gen = lat2_flat
-        
-        DO_VAE_RESHAPE = getattr(generator, "uses_vae_latent_shape", False)
-        if DO_VAE_RESHAPE:
-            reshape_z = lambda z: z.reshape(z.shape[0], generator.latent_channels, generator.latent_size, generator.latent_size).contiguous() if z.ndim == 2 else z
-            lat0_for_gen = reshape_z(lat0_for_gen)
-            lat1_for_gen = reshape_z(lat1_for_gen)
-            lat2_for_gen = reshape_z(lat2_for_gen)
-
-        lat2_bridge = lat2_for_gen.detach().requires_grad_(True)
-
-        with torch.no_grad(), self.gan_recognizer_context():
-            img0 = generator(lat0_for_gen)
-            img1 = generator(lat1_for_gen)
-            detach_img1 = bool(getattr(self.params, "detach_img1_for_cls", False))
-            img1 = img1.detach() if detach_img1 else img1
-       
-        with self.gan_recognizer_context():
-            img2 = generator(lat2_bridge)
-
-
-        DO_ANTISYMMETRIC_LOSS = True # TODO: Remove
-        if DO_ANTISYMMETRIC_LOSS and t_index[0].item() > 1:
-            def uv(a,b,with_g=False, sign=1):
-                "Whitened coordinates (u,v*):=(z^*-v, z+v)"
-                with torch.no_grad() if not with_g else torch.enable_grad():
-                    return (2*a-b, b) if sign>0 else (b, 2*a-b)
-
-            with self.gan_recognizer_context():
-                logits0 = recognizer(*uv(img0, img1, with_g=False, sign=1))[0] - recognizer(*uv(img0, img1, with_g=False, sign=-1))[0]
-
-                logits = recognizer(*uv(img1, img2, with_g=True, sign=1))[0] - recognizer(*uv(img1, img2, with_g=True, sign=-1))[0]   # [B*K, K]
-                
-
-            with self.fp32_context():
-                cls_loss = (
-                    self.cross_entropy(logits.float(), targets)
-                    + self.cross_entropy(logits0.float(), targets)
-                )
-        else:
-            logits0 = torch.zeros(B*K, K, device=self.device, dtype=torch.float32)
-            with self.gan_recognizer_context():
-                logits, magnitudes = recognizer(img1, img2)   # [B*K, K]
-            with self.fp32_context():
-                cls_loss = self.cross_entropy(logits.float(), targets)
-
-
-        mse_loss = torch.zeros(1, device=self.device, dtype=torch.float32)
-
-        acc_denominator = max(1, int(acc_denominator))
-        with self.fp32_context():
-            total_loss = (
-                self.params.lambda_cls * cls_loss.float()
-                + self.params.lambda_reg * mse_loss
-                + self.params.lambda_pde * pde_loss.float()
-            )
-            loss = total_loss / acc_denominator
-            cls_backward_loss = self.params.lambda_cls * cls_loss.float() / acc_denominator
-            support_backward_loss = self.params.lambda_pde * pde_loss.float() / acc_denominator
-
-        if float(self.params.lambda_cls) != 0.0:
-            cls_backward_loss.backward()
-            if lat2_bridge.grad is None:
-                raise RuntimeError("GAT+Recognizer loss did not produce a gradient for lat2_bridge.")
-            bridge_grad = lat2_bridge.grad.detach().to(dtype=lat2_for_gen.dtype)
-        else:
-            bridge_grad = torch.zeros_like(lat2_for_gen)
-
-        support_outputs = []
-        support_grads = []
-        if lat2_for_gen.requires_grad:
-            support_outputs.append(lat2_for_gen)
-            support_grads.append(bridge_grad)
-        if support_backward_loss.requires_grad:
-            support_outputs.append(support_backward_loss)
-            support_grads.append(torch.ones_like(support_backward_loss))
-        if support_outputs:
-            torch.autograd.backward(support_outputs, grad_tensors=support_grads)
-
-        # Cheap metrics needed every step
-        with torch.no_grad():
-            ent = entropy_from_logits(logits.float())
-            z_bk = z.unsqueeze(1).expand(B, K, D)
-            d2 = (latent2_bk - latent1_bk).norm(dim=-1).min()
-            d1 = (latent1_bk - z_bk).norm(dim=-1).min()
-
-        img1_bk = img2_bk = None
-        if need_images:
-            with torch.no_grad():
-                img1_bk = img1.detach().contiguous().view(B, K, *img1.shape[1:])
-                img2_bk = img2.detach().contiguous().view(B, K, *img2.shape[1:])
-
-        loss_dict = {
-            "total_loss": float(loss.detach()),
-            "classification_loss": float(cls_loss.detach()),
-            "pde_loss": float(pde_loss.detach()),
-            "entropy": float(ent),
-            "step1_norm": float(d1.item()),
-            "step2_norm": float(d2.item()),
-            "mse_loss": float(mse_loss.detach()),
-        }
-        
-        latents_out = latent2_bk.detach()
-        return loss_dict, logits.detach(), logits0.detach(), targets, potential_preds.detach(), img1_bk, img2_bk, latents_out
-
     # ------------------------ checkpoint utils ------------------------
     def get_starting_iteration(self, support_sets, recognizer,
                               support_opt=None, recognizer_opt=None,
@@ -422,11 +297,133 @@ class TrainerPotential(object):
         recognizer_optim.zero_grad(set_to_none=True)
         return starting_micro, opt_step_idx, support_sets_optim, recognizer_optim, sched_support, sched_recon
 
+    # ------------------------ forward+loss (all K) ------------------------
+    def loss_allK(self, support_sets, generator, recognizer,
+                  z, t_index, dt, acc_denominator: int,
+                  *, need_images: bool = False):
+        """
+        One forward for all K in parallel.
+        Optional: only materialize img*_bk if need_images=True (for TB logging).
+        """
+        with self.fp32_context():
+            potential_preds, latent1_bk, latent2_bk, pde_loss, dt = support_sets(z, t_index, dt=dt, direction=dt)
+        B, K, D = latent1_bk.shape
+
+        lat1_flat, targets, _, (B, K) = _pack_BK(latent1_bk)
+        lat2_flat, _, _, _ = _pack_BK(latent2_bk)
+
+        z0 = z.clone().unsqueeze(1).expand(B, K, D)
+        lat0_flat, _, _, _ = _pack_BK(z0)
+
+        lat0_for_gen = lat0_flat
+        lat1_for_gen = lat1_flat
+        lat2_for_gen = lat2_flat
+        
+        DO_VAE_RESHAPE = getattr(generator, "uses_vae_latent_shape", False)
+        if DO_VAE_RESHAPE:
+            reshape_z = lambda z: z.reshape(z.shape[0], generator.latent_channels, generator.latent_size, generator.latent_size).contiguous() if z.ndim == 2 else z
+            lat0_for_gen = reshape_z(lat0_for_gen)
+            lat1_for_gen = reshape_z(lat1_for_gen)
+            lat2_for_gen = reshape_z(lat2_for_gen)
+
+        lat2_bridge = lat2_for_gen.detach().requires_grad_(True)
+
+        with torch.no_grad(), self.gan_recognizer_context():
+            img0 = generator(lat0_for_gen)
+            img1 = generator(lat1_for_gen)
+            detach_img1 = bool(getattr(self.params, "detach_img1_for_cls", False))
+            img1 = img1.detach() if detach_img1 else img1
+       
+        with self.gan_recognizer_context():
+            img2 = generator(lat2_bridge)
+
+
+        DO_ANTISYMMETRIC_LOSS = True # TODO: Remove
+        if DO_ANTISYMMETRIC_LOSS and t_index[0].item() > 1:
+            def uv(a,b,with_g=False, sign=1):
+                "Whitened coordinates (u,v*):=(z^*-v, z+v)"
+                with torch.no_grad() if not with_g else torch.enable_grad():
+                    return (2*a-b, b) if sign>0 else (b, 2*a-b)
+
+            with self.gan_recognizer_context():
+                logits0 = recognizer(*uv(img0, img1, with_g=False, sign=1))[0] - recognizer(*uv(img0, img1, with_g=False, sign=-1))[0]
+
+                logits = recognizer(*uv(img1, img2, with_g=True, sign=1))[0] - recognizer(*uv(img1, img2, with_g=True, sign=-1))[0]   # [B*K, K]
+                
+
+            with self.fp32_context():
+                cls_loss = (
+                    self.cross_entropy(logits.float(), targets)
+                    + self.cross_entropy(logits0.float(), targets)
+                )
+        else:
+            logits0 = torch.zeros(B*K, K, device=self.device, dtype=torch.float32)
+            with self.gan_recognizer_context():
+                logits, magnitudes = recognizer(img1, img2)   # [B*K, K]
+            with self.fp32_context():
+                cls_loss = self.cross_entropy(logits.float(), targets)
+
+
+
+        acc_denominator = max(1, int(acc_denominator))
+        with self.fp32_context():
+            total_loss = (
+                self.params.lambda_cls * cls_loss.float()
+                + self.params.lambda_pde * pde_loss.float()
+            )
+            loss = total_loss / acc_denominator
+            cls_backward_loss = self.params.lambda_cls * cls_loss.float() / acc_denominator
+            support_backward_loss = self.params.lambda_pde * pde_loss.float() / acc_denominator
+
+        if float(self.params.lambda_cls) != 0.0:
+            cls_backward_loss.backward()
+            if lat2_bridge.grad is None:
+                raise RuntimeError("GAT+Recognizer loss did not produce a gradient for lat2_bridge.")
+            bridge_grad = lat2_bridge.grad.detach().to(dtype=lat2_for_gen.dtype)
+        else:
+            bridge_grad = torch.zeros_like(lat2_for_gen)
+
+        support_outputs = []
+        support_grads = []
+        if lat2_for_gen.requires_grad:
+            support_outputs.append(lat2_for_gen)
+            support_grads.append(bridge_grad)
+        if support_backward_loss.requires_grad:
+            support_outputs.append(support_backward_loss)
+            support_grads.append(torch.ones_like(support_backward_loss))
+        if support_outputs:
+            torch.autograd.backward(support_outputs, grad_tensors=support_grads)
+
+        # Cheap metrics needed every step
+        with torch.no_grad():
+            ent = entropy_from_logits(logits.float())
+            z_bk = z.unsqueeze(1).expand(B, K, D)
+            d2 = (latent2_bk - latent1_bk).norm(dim=-1).min()
+            d1 = (latent1_bk - z_bk).norm(dim=-1).min()
+
+        img1_bk = img2_bk = None
+        if need_images:
+            with torch.no_grad():
+                img1_bk = img1.detach().contiguous().view(B, K, *img1.shape[1:])
+                img2_bk = img2.detach().contiguous().view(B, K, *img2.shape[1:])
+
+        loss_dict = {
+            "total_loss": float(loss.detach()),
+            "classification_loss": float(cls_loss.detach()),
+            "pde_loss": float(pde_loss.detach()),
+            "entropy": float(ent),
+            "step1_norm": float(d1.item()),
+            "step2_norm": float(d2.item()),
+        }
+        
+        latents_out = latent2_bk.detach()
+        return loss_dict, logits.detach(), logits0.detach(), targets, potential_preds.detach(), img1_bk, img2_bk, latents_out
+
     # ------------------------ train ------------------------
     def train(self, generator, support_sets, recognizer):
         # runtime toggles (defaults match your current script)
         enable_analytics = bool(getattr(self.params, "enable_analytics", True))
-        enable_histograms = bool(getattr(self.params, "enable_histograms", True))
+        enable_histograms = False #bool(getattr(self.params, "enable_histograms", True))
         enable_figures = bool(getattr(self.params, "enable_figures", True))
         enable_images = bool(getattr(self.params, "enable_images", True))
         save_checkpoints = bool(getattr(self.params, "save_checkpoints", True))

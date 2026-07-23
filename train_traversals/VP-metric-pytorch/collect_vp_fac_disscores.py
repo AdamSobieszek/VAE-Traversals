@@ -2,6 +2,7 @@ import os
 import numpy as np
 import argparse
 import glob
+import json
 import matplotlib.pyplot as plt
 
 
@@ -34,29 +35,6 @@ def readlines_of(filename):
     return data
 
 
-def get_val_line(data, target_epoch):
-    j = 0
-    for i, line in enumerate(data):
-        if line == '\n':
-            if j == target_epoch:
-                output = data[i - 1]
-                break
-            j += 1
-    return output
-
-
-def get_all_val_line(data, target_epoch):
-    j = 0
-    val_lines = []
-    for i, line in enumerate(data):
-        if line == '\n':
-            val_lines.append(data[i - 1])
-            if j >= target_epoch:
-                break
-            j += 1
-    return val_lines
-
-
 def get_dis_scores(data_dir, args):
     fac_acc_txt = os.path.join(data_dir, 'acc.txt')
     config_name = os.path.basename(data_dir)
@@ -77,27 +55,37 @@ def get_dis_scores(data_dir, args):
     else:
         raise ValueError('Not supported fac_dis_type: ' + args.fac_dis_type)
 
-    vp_acc_txt = os.path.join(data_dir, 'pairs_train', 'val.log')
-    if not os.path.isfile(vp_acc_txt):
+    vp_stats_json = os.path.join(data_dir, 'pairs_train', 'stats.json')
+    if not os.path.isfile(vp_stats_json):
         return None, None, None
+    with open(vp_stats_json, 'r', encoding='utf-8') as f:
+        vp_stats = json.load(f)
+    runs = vp_stats.get('runs', [])
     if args.vp_dis_type == 'best':
-        vp_acc_bestepoch_txt = os.path.join(data_dir, 'pairs_train',
-                                            'best_epoch.txt')
-        data = readlines_of(vp_acc_bestepoch_txt)
-        line = data[0]
-        target_epoch = int(line.strip().split()[-1]) - 1
-        data = readlines_of(vp_acc_txt)
-        val_line = get_val_line(data, target_epoch)
-        vp_acc = float(val_line.strip().split()[3])
+        rows = (vp_stats.get('summary') or {}).get('by_train_fraction', [])
+        if not rows:
+            return None, None, None
+        vp_acc = float(rows[-1]['mean_best_accuracy'])
     elif args.vp_dis_type == 'other':
-        data = readlines_of(vp_acc_txt)
-        val_line = get_val_line(data, args.target_epoch)
-        vp_acc = float(val_line.strip().split()[3])
+        target_epoch = args.target_epoch + 1
+        values = [
+            validation['accuracy_top1']
+            for run in runs for validation in run.get('validations', [])
+            if validation['epoch'] == target_epoch
+        ]
+        if not values:
+            return None, None, None
+        vp_acc = float(np.mean(values))
     elif args.vp_dis_type == 'avg':
-        data = readlines_of(vp_acc_txt)
-        val_lines = get_all_val_line(data, args.target_epoch)
-        vp_accs = [float(val_line.strip().split()[3]) for val_line in val_lines]
-        vp_acc = sum(vp_accs) / len(vp_accs)
+        target_epoch = args.target_epoch + 1
+        values = [
+            validation['accuracy_top1']
+            for run in runs for validation in run.get('validations', [])
+            if validation['epoch'] <= target_epoch
+        ]
+        if not values:
+            return None, None, None
+        vp_acc = float(np.mean(values))
     return fac_acc, vp_acc, config_name
 
 

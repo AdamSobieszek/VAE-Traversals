@@ -15,6 +15,12 @@ def init_parser():
     parser.add_argument("--out_dim", type=int, required=True)
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument(
+        "--val_batch_size",
+        type=int,
+        default=None,
+        help="Validation batch size; defaults to --batch_size.",
+    )
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument(
         "--input_mode", choices=("concat", "diff"), default="concat"
@@ -26,6 +32,22 @@ def init_parser():
         help="Test fraction in fixed mode and baseline test fraction in curve mode.",
     )
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=2,
+        help="Batches prefetched by each persistent data-loader worker.",
+    )
+    parser.add_argument(
+        "--no_persistent_workers",
+        action="store_true",
+        help="Restart data-loader workers every epoch (normally slower).",
+    )
+    parser.add_argument(
+        "--no_cuda_prefetch",
+        action="store_true",
+        help="Disable asynchronous CUDA batch transfer/normalization.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--mode", choices=("fixed", "learning_curve"), default="fixed"
@@ -47,5 +69,64 @@ def init_parser():
         "--save_all_checkpoints",
         action="store_true",
         help="Save a checkpoint at every validation for each fold/fraction run.",
+    )
+    parser.add_argument(
+        "--image_cache",
+        choices=("auto", "off"),
+        default="auto",
+        help=(
+            "Cache Pillow-decoded uint8 images in a memory-mapped .npy file. "
+            "'auto' falls back to JPEGs when there is insufficient disk space."
+        ),
+    )
+    parser.add_argument(
+        "--image_cache_path",
+        default=None,
+        help="Decoded cache path (default: RESULT_DIR/images.uint8.npy).",
+    )
+    parser.add_argument(
+        "--rebuild_image_cache",
+        action="store_true",
+        help="Rebuild the decoded cache after source images have changed.",
+    )
+    parser.add_argument(
+        "--stats_write_interval",
+        type=int,
+        default=10,
+        help="Persist in-progress epoch records at least this often.",
+    )
+
+    # These options can alter floating-point behavior, so all are off by
+    # default even when they are faster on the available hardware.
+    parser.add_argument(
+        "--amp",
+        choices=("off", "float16", "bfloat16"),
+        default="off",
+        help="Opt-in automatic mixed precision.",
+    )
+    parser.add_argument(
+        "--tf32",
+        action="store_true",
+        help="Opt in to CUDA TensorFloat-32 convolution/matmul kernels.",
+    )
+    parser.add_argument(
+        "--channels_last",
+        action="store_true",
+        help="Opt in to NHWC/channels-last convolution storage.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Opt in to torch.compile for the classifier.",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="default",
+    )
+    parser.add_argument(
+        "--fused_adam",
+        action="store_true",
+        help="Opt in to the CUDA fused Adam implementation.",
     )
     return parser

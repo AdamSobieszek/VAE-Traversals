@@ -85,7 +85,8 @@ class VarPred(nn.Module):
         x = self.relu3(x)
 
         x = self.global_avgpool(x)
-        x = x.view(-1, x.size(1))
+        # ``flatten`` supports both contiguous NCHW and channels-last tensors.
+        x = torch.flatten(x, 1)
         x = self.output(x)
 
         return x

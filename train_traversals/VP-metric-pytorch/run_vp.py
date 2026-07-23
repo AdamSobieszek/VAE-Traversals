@@ -46,6 +46,12 @@ def build_parser():
         "--batch-size", type=int, default=32, help="Training batch size."
     )
     parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        default=None,
+        help="Validation batch size; defaults to the training batch size.",
+    )
+    parser.add_argument(
         "--epochs", type=int, default=300, help="Number of training epochs."
     )
     parser.add_argument(
@@ -54,6 +60,22 @@ def build_parser():
     )
     parser.add_argument(
         "--workers", type=int, default=4, help="Data-loader worker processes."
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="Batches prefetched by every data-loader worker.",
+    )
+    parser.add_argument(
+        "--no-persistent-workers",
+        action="store_true",
+        help="Restart worker processes each epoch.",
+    )
+    parser.add_argument(
+        "--no-cuda-prefetch",
+        action="store_true",
+        help="Disable overlapping CUDA transfers with model execution.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Split and model seed.")
     parser.add_argument(
@@ -94,6 +116,59 @@ def build_parser():
         action="store_true",
         help="Print the main_vp.py command without running it.",
     )
+    parser.add_argument(
+        "--image-cache",
+        choices=("auto", "off"),
+        default="auto",
+        help="Use an exact decoded-uint8 memory-mapped image cache.",
+    )
+    parser.add_argument(
+        "--image-cache-path",
+        default=None,
+        help="Decoded cache path (default: RESULT_DIR/images.uint8.npy).",
+    )
+    parser.add_argument(
+        "--rebuild-image-cache",
+        action="store_true",
+        help="Rebuild the cache if pair images changed in place.",
+    )
+    parser.add_argument(
+        "--stats-write-interval",
+        type=int,
+        default=10,
+        help="Persist in-progress epoch records at least this often.",
+    )
+    parser.add_argument(
+        "--amp",
+        choices=("off", "float16", "bfloat16"),
+        default="off",
+        help="Opt-in mixed precision (can change results).",
+    )
+    parser.add_argument(
+        "--tf32",
+        action="store_true",
+        help="Opt in to CUDA TF32 kernels (can change results).",
+    )
+    parser.add_argument(
+        "--channels-last",
+        action="store_true",
+        help="Opt in to channels-last convolutions (can change rounding).",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Opt in to torch.compile.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="default",
+    )
+    parser.add_argument(
+        "--fused-adam",
+        action="store_true",
+        help="Opt in to CUDA fused Adam (can change rounding).",
+    )
     return parser
 
 
@@ -106,12 +181,18 @@ def validate_args(parser, args):
         parser.error("--lr must be positive")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.val_batch_size is not None and args.val_batch_size <= 0:
+        parser.error("--val-batch-size must be positive")
     if args.epochs <= 0:
         parser.error("--epochs must be positive")
     if not 0 < args.test_ratio < 1:
         parser.error("--test-ratio must be between 0 and 1")
     if args.workers < 0:
         parser.error("--workers cannot be negative")
+    if args.prefetch_factor <= 0:
+        parser.error("--prefetch-factor must be positive")
+    if args.stats_write_interval <= 0:
+        parser.error("--stats-write-interval must be positive")
     if args.n_folds <= 0:
         parser.error("--n-fold must be positive")
     if any(not 0 < fraction < 1 for fraction in args.train_fractions):
@@ -144,11 +225,34 @@ def training_command(args):
         "--input_mode", args.input_mode,
         "--test_ratio", str(args.test_ratio),
         "--workers", str(args.workers),
+        "--prefetch_factor", str(args.prefetch_factor),
         "--seed", str(args.seed),
         "--mode", args.mode.replace("-", "_"),
         "--n_folds", str(args.n_folds),
         "--train_fractions", *[str(value) for value in args.train_fractions],
+        "--image_cache", args.image_cache,
+        "--stats_write_interval", str(args.stats_write_interval),
+        "--amp", args.amp,
+        "--compile_mode", args.compile_mode,
     ]
+    if args.val_batch_size is not None:
+        command.extend(["--val_batch_size", str(args.val_batch_size)])
+    if args.image_cache_path is not None:
+        command.extend(["--image_cache_path", args.image_cache_path])
+    if args.no_persistent_workers:
+        command.append("--no_persistent_workers")
+    if args.no_cuda_prefetch:
+        command.append("--no_cuda_prefetch")
+    if args.rebuild_image_cache:
+        command.append("--rebuild_image_cache")
+    if args.tf32:
+        command.append("--tf32")
+    if args.channels_last:
+        command.append("--channels_last")
+    if args.compile:
+        command.append("--compile")
+    if args.fused_adam:
+        command.append("--fused_adam")
     if args.save_best:
         command.append("--save_best")
     if args.save_all_checkpoints:

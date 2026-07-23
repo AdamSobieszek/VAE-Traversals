@@ -15,11 +15,8 @@
 Utils for VP metrics
 """
 
-import os
 import torch
 import numpy as np
-import torchvision
-from PIL import Image
 
 
 class AverageMeter(object):
@@ -109,6 +106,12 @@ def accuracy(output, target, topk=(1, )):
 
 
 def show_inputs_target(inputs, target, result_dir):
+    # Debug-only dependencies stay lazy so normal training does not pay the
+    # sizeable torchvision/Pillow import cost.
+    import os
+    import torchvision
+    from PIL import Image
+
     img = torchvision.utils.make_grid(inputs)
     img = img / 2 + 0.5  # unnormalize
     img_np = img.numpy()

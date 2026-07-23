@@ -5,7 +5,7 @@ This repository contains the independent code for VP-metric in [Learning Disenta
 ## Requirements
 
 * Numpy.
-* PyTorch >= 1.3.1
+* PyTorch >= 2.0
 
 ## Training
 
@@ -70,6 +70,55 @@ point. The historical scripts intentionally enable neither option.
 The runner automatically selects CUDA, then Apple MPS, then CPU. Validation
 uses the configured training batch size rather than the original unsafe
 `batch_size * 50` behavior.
+
+### Training performance
+
+The default path preserves the model, Adam optimizer, sampling order, image
+decoder, float32 arithmetic, and validation schedule. It accelerates the
+surrounding pipeline in several ways:
+
+* The first run decodes every JPEG once with the historical Pillow decoder and
+  writes the exact uint8 pixels to `RESULT_DIR/images.uint8.npy`. Later epochs,
+  folds, fractions, and reruns memory-map that array instead of decoding JPEGs
+  again. The cache is automatically invalidated when source file metadata
+  changes. Cache creation falls back to direct JPEG loading when there is not
+  enough free disk space. Use `--image-cache off` to disable it,
+  `--image-cache-path PATH` to place it on faster/larger storage, or
+  `--rebuild-image-cache` after an unusual in-place dataset modification.
+* Images remain uint8 through loading and host-to-device transfer. The original
+  `ToTensor` and normalization operations are applied to the complete batch on
+  the target device, reducing transfer volume by 4x without changing input
+  values.
+* Data-loader workers persist across epochs and prefetch batches. CUDA runs
+  additionally overlap transfer and normalization of the next batch with the
+  current model step. Use `--no-persistent-workers` or `--no-cuda-prefetch`
+  for troubleshooting.
+* Training and validation metrics accumulate on the device, avoiding three
+  device synchronizations per batch. `stats.json` is persisted at validation
+  points and every 10 epochs rather than rewriting the growing history after
+  every epoch; change this with `--stats-write-interval`.
+
+`--val-batch-size` can be increased independently when validation has memory
+headroom. The default remains the training batch size.
+
+The following optional accelerators can change floating-point rounding and are
+therefore **off by default**:
+
+```bash
+scripts/run_vp_biggan.sh \
+    --amp bfloat16 \
+    --tf32 \
+    --channels-last \
+    --compile \
+    --fused-adam \
+    --val-batch-size 128
+```
+
+Hardware support varies. `--amp float16` uses gradient scaling;
+`--amp bfloat16` is generally preferable on recent CUDA hardware.
+MPS supports `float16` rather than `bfloat16`, while CPU autocast supports
+`bfloat16` rather than `float16`.
+`--compile-mode` accepts `default`, `reduce-overhead`, or `max-autotune`.
 
 The `scripts/` directory contains the exact settings used for each recorded
 model dataset. For example, run `scripts/run_vp_biggan.sh`. These scripts may be

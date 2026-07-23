@@ -11,10 +11,9 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
-import torchvision.transforms as transforms
 
 from model import VarPred
-from pair_dataset import PairDataset
+from pair_dataset import PairDataset, prepare_image_cache
 from parser_config import init_parser
 from train_val import train, validate
 from utils import (
@@ -47,10 +46,24 @@ def fraction_label(value):
     return ("{:g}".format(value)).replace(".", "p")
 
 
+def _checkpoint_state_dict(model):
+    """Keep historical DataParallel keys while hiding torch.compile internals."""
+    if isinstance(model, nn.DataParallel):
+        if hasattr(model.module, "_orig_mod"):
+            return {
+                "module." + key: value
+                for key, value in model.module._orig_mod.state_dict().items()
+            }
+        return model.state_dict()
+    if hasattr(model, "_orig_mod"):
+        return model._orig_mod.state_dict()
+    return model.state_dict()
+
+
 def checkpoint_state(model, epoch, metrics):
     return {
         "epoch": epoch + 1,
-        "state_dict": model.state_dict(),
+        "state_dict": _checkpoint_state_dict(model),
         "validation": metrics,
     }
 
@@ -79,43 +92,83 @@ def summarize(stats):
     }
 
 
-def build_loaders(args, n_data, train_indices, validation_indices,
-                  samples_per_epoch, run_seed, device):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
+def build_loaders(
+    args,
+    n_data,
+    targets,
+    image_cache,
+    train_indices,
+    validation_indices,
+    samples_per_epoch,
+    run_seed,
+    device,
+):
     full_dataset = PairDataset(
-        args.data_dir, np.arange(n_data),
-        image_tmpl="pair_{:06d}.jpg", transform=transform,
+        args.data_dir,
+        np.arange(n_data),
+        image_tmpl="pair_{:06d}.jpg",
+        targets=targets,
+        image_cache=image_cache,
     )
     validation_dataset = PairDataset(
-        args.data_dir, validation_indices,
-        image_tmpl="pair_{:06d}.jpg", transform=transform,
+        args.data_dir,
+        validation_indices,
+        image_tmpl="pair_{:06d}.jpg",
+        targets=targets,
+        image_cache=image_cache,
     )
     sampler = EpochSubsetSampler(train_indices, samples_per_epoch, run_seed)
     pin_memory = device.type == "cuda"
+    common = {
+        "num_workers": args.workers,
+        "pin_memory": pin_memory,
+        "worker_init_fn": worker_init_fn,
+    }
+    if args.workers:
+        common.update({
+            "persistent_workers": not args.no_persistent_workers,
+            "prefetch_factor": args.prefetch_factor,
+        })
     train_loader = torch.utils.data.DataLoader(
         full_dataset,
         batch_size=args.batch_size,
         sampler=sampler,
-        num_workers=args.workers,
-        pin_memory=pin_memory,
-        worker_init_fn=worker_init_fn,
+        **common,
     )
     validation_loader = torch.utils.data.DataLoader(
         validation_dataset,
-        batch_size=args.batch_size,
+        batch_size=args.val_batch_size or args.batch_size,
         shuffle=False,
-        num_workers=args.workers,
-        pin_memory=pin_memory,
-        worker_init_fn=worker_init_fn,
+        **common,
     )
     return train_loader, validation_loader, sampler
 
 
-def run_one(args, stats, stats_path, n_data, train_fraction, fold,
-            samples_per_epoch, device):
+def _amp_settings(args, device):
+    if args.amp == "off":
+        return None, None
+    amp_dtype = (
+        torch.float16 if args.amp == "float16" else torch.bfloat16
+    )
+    scaler = (
+        torch.amp.GradScaler(device.type)
+        if amp_dtype == torch.float16 else None
+    )
+    return amp_dtype, scaler
+
+
+def run_one(
+    args,
+    stats,
+    stats_path,
+    n_data,
+    targets,
+    image_cache,
+    train_fraction,
+    fold,
+    samples_per_epoch,
+    device,
+):
     run_seed = args.seed + fold
     torch.manual_seed(run_seed)
     if device.type == "cuda":
@@ -156,14 +209,29 @@ def run_one(args, stats, stats_path, n_data, train_fraction, fold,
         out_dim=args.out_dim,
         input_mode=args.input_mode,
     ).to(device)
-    if device.type == "cuda":
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    if args.compile:
+        model = torch.compile(model, mode=args.compile_mode)
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer_kwargs = {"lr": args.lr}
+    if args.fused_adam:
+        optimizer_kwargs["fused"] = True
+    optimizer = torch.optim.Adam(model.parameters(), **optimizer_kwargs)
     criterion = nn.CrossEntropyLoss().to(device)
     train_loader, validation_loader, sampler = build_loaders(
-        args, n_data, train_indices, validation_indices,
-        samples_per_epoch, run_seed, device,
+        args,
+        n_data,
+        targets,
+        image_cache,
+        train_indices,
+        validation_indices,
+        samples_per_epoch,
+        run_seed,
+        device,
     )
+    amp_dtype, scaler = _amp_settings(args, device)
 
     checkpoint_dir = (
         Path(args.result_dir)
@@ -177,13 +245,30 @@ def run_one(args, stats, stats_path, n_data, train_fraction, fold,
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         train_metrics = train(
-            train_loader, model, criterion, optimizer, epoch, device
+            train_loader,
+            model,
+            criterion,
+            optimizer,
+            epoch,
+            device,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
+            channels_last=args.channels_last,
+            cuda_prefetch=not args.no_cuda_prefetch,
         )
         run_record["epochs"].append({"epoch": epoch + 1, "train": train_metrics})
 
-        if should_validate(epoch, args.epochs):
+        validated = should_validate(epoch, args.epochs)
+        if validated:
             validation_metrics = validate(
-                validation_loader, model, criterion, epoch, device
+                validation_loader,
+                model,
+                criterion,
+                epoch,
+                device,
+                amp_dtype=amp_dtype,
+                channels_last=args.channels_last,
+                cuda_prefetch=not args.no_cuda_prefetch,
             )
             validation_record = {"epoch": epoch + 1, **validation_metrics}
             run_record["validations"].append(validation_record)
@@ -195,16 +280,22 @@ def run_one(args, stats, stats_path, n_data, train_fraction, fold,
             if is_best:
                 run_record["best_validation"] = validation_record.copy()
 
-            state = checkpoint_state(model, epoch, validation_record)
-            if args.save_all_checkpoints:
-                torch.save(
-                    state,
-                    checkpoint_dir / "epoch_{:04d}.pth.tar".format(epoch + 1),
-                )
-            if args.save_best and is_best:
-                torch.save(state, checkpoint_dir / "model_best.pth.tar")
+            if args.save_all_checkpoints or (args.save_best and is_best):
+                state = checkpoint_state(model, epoch, validation_record)
+                if args.save_all_checkpoints:
+                    torch.save(
+                        state,
+                        checkpoint_dir / "epoch_{:04d}.pth.tar".format(epoch + 1),
+                    )
+                if args.save_best and is_best:
+                    torch.save(state, checkpoint_dir / "model_best.pth.tar")
 
-        write_json(stats_path, stats)
+        if (
+            validated
+            or (epoch + 1) % args.stats_write_interval == 0
+            or epoch == args.epochs - 1
+        ):
+            write_json(stats_path, stats)
 
     run_record["status"] = "completed"
     run_record["completed_at"] = utc_now()
@@ -221,8 +312,14 @@ def validate_configuration(parser, args, n_data):
         parser.error("model dimensions must be positive")
     if args.lr <= 0 or args.batch_size < 1 or args.epochs < 1:
         parser.error("learning rate, batch size, and epochs must be positive")
+    if args.val_batch_size is not None and args.val_batch_size < 1:
+        parser.error("--val_batch_size must be positive")
     if args.workers < 0:
         parser.error("--workers cannot be negative")
+    if args.prefetch_factor < 1:
+        parser.error("--prefetch_factor must be positive")
+    if args.stats_write_interval < 1:
+        parser.error("--stats_write_interval must be positive")
     if not 0 < args.test_ratio < 1:
         parser.error("--test_ratio must be between 0 and 1")
     if n_data < 2:
@@ -265,10 +362,48 @@ def main():
 
     labels = np.load(Path(args.data_dir) / "labels.npy", mmap_mode="r")
     n_data = labels.shape[0]
+    targets = np.argmax(np.abs(labels), axis=1).astype(np.int64)
+    del labels
     fractions, baseline_size = validate_configuration(parser, args, n_data)
     device = select_device()
+    if args.fused_adam and device.type != "cuda":
+        parser.error("--fused_adam requires CUDA")
+    if args.amp == "float16" and device.type == "cpu":
+        parser.error("--amp float16 is not supported for CPU training")
+    if args.amp == "bfloat16" and device.type == "mps":
+        parser.error("--amp bfloat16 is not supported for MPS training")
+    if args.compile and not hasattr(torch, "compile"):
+        parser.error("--compile requires PyTorch 2.0 or newer")
+
     cudnn.benchmark = device.type == "cuda"
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = args.tf32
+        cudnn.allow_tf32 = args.tf32
     print("Using device: {}".format(device))
+
+    cache_info = {
+        "path": None,
+        "enabled": False,
+        "mode": args.image_cache,
+    }
+    if args.image_cache == "auto":
+        cache_path = (
+            Path(args.image_cache_path)
+            if args.image_cache_path
+            else result_dir / "images.uint8.npy"
+        )
+        cache_info.update(
+            prepare_image_cache(
+                args.data_dir,
+                cache_path,
+                n_data,
+                workers=args.workers,
+                batch_size=min(64, args.val_batch_size or args.batch_size),
+                rebuild=args.rebuild_image_cache,
+            )
+        )
+        cache_info["enabled"] = cache_info["path"] is not None
+    image_cache = cache_info["path"]
 
     stats_path = result_dir / "stats.json"
     stats = {
@@ -277,15 +412,27 @@ def main():
         "mode": args.mode,
         "started_at": utc_now(),
         "status": "running",
-        "dataset": {"path": os.fspath(Path(args.data_dir)), "samples": n_data},
+        "dataset": {
+            "path": os.fspath(Path(args.data_dir)),
+            "samples": n_data,
+            "image_cache": cache_info,
+        },
         "config": {
             "in_channels": args.in_channels,
             "input_mode": args.input_mode,
             "out_dim": args.out_dim,
             "learning_rate": args.lr,
             "batch_size": args.batch_size,
+            "validation_batch_size": args.val_batch_size or args.batch_size,
             "epochs": args.epochs,
             "workers": args.workers,
+            "prefetch_factor": args.prefetch_factor,
+            "persistent_workers": (
+                args.workers > 0 and not args.no_persistent_workers
+            ),
+            "cuda_prefetch": (
+                device.type == "cuda" and not args.no_cuda_prefetch
+            ),
             "seed": args.seed,
             "device": str(device),
             "n_folds": args.n_folds,
@@ -294,6 +441,13 @@ def main():
             "train_fractions": fractions,
             "save_best": args.save_best,
             "save_all_checkpoints": args.save_all_checkpoints,
+            "stats_write_interval": args.stats_write_interval,
+            "amp": args.amp,
+            "tf32": args.tf32,
+            "channels_last": args.channels_last,
+            "compile": args.compile,
+            "compile_mode": args.compile_mode if args.compile else None,
+            "fused_adam": args.fused_adam,
         },
         "runs": [],
         "summary": None,
@@ -307,8 +461,16 @@ def main():
         )
         for fold in range(args.n_folds):
             run_one(
-                args, stats, stats_path, n_data, fraction, fold,
-                samples_per_epoch, device,
+                args,
+                stats,
+                stats_path,
+                n_data,
+                targets,
+                image_cache,
+                fraction,
+                fold,
+                samples_per_epoch,
+                device,
             )
 
     stats["status"] = "completed"

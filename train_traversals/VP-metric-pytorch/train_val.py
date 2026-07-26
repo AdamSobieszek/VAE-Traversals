@@ -7,13 +7,15 @@ import torch
 
 
 def prepare_batch(inputs, target, device, channels_last=False):
-    """Transfer and normalize a uint8 batch using the historical operations."""
+    """Transfer a batch, normalizing only opt-in uint8 device inputs."""
+    normalize_on_device = not inputs.is_floating_point()
     inputs = inputs.to(
-        device=device, dtype=torch.float32, non_blocking=True
+        device=device,
+        dtype=torch.float32 if normalize_on_device else None,
+        non_blocking=True,
     )
-    # This deliberately mirrors ToTensor + Normalize rather than replacing it
-    # with a fused affine expression that can round differently.
-    inputs.div_(255.0).sub_(0.5).div_(0.5)
+    if normalize_on_device:
+        inputs.div_(255.0).sub_(0.5).div_(0.5)
     if channels_last:
         inputs = inputs.contiguous(memory_format=torch.channels_last)
     target = target.to(device=device, non_blocking=True)

@@ -46,7 +46,15 @@ def init_parser():
     parser.add_argument(
         "--no_cuda_prefetch",
         action="store_true",
-        help="Disable asynchronous CUDA batch transfer/normalization.",
+        help="Disable asynchronous CUDA batch transfer.",
+    )
+    parser.add_argument(
+        "--device_preprocessing",
+        action="store_true",
+        help=(
+            "Opt in to uint8 transfer and accelerator-side normalization. "
+            "The default preserves historical worker-side CPU preprocessing."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -71,18 +79,31 @@ def init_parser():
         help="Save a checkpoint at every validation for each fold/fraction run.",
     )
     parser.add_argument(
+        "--downsample",
+        type=int,
+        default=1,
+        help=(
+            "Spatial downsample factor applied with non-overlapping max-pooling "
+            "before caching/training (e.g. 2 means 2x2 max-pool). 1 disables it."
+        ),
+    )
+    parser.add_argument(
         "--image_cache",
         choices=("auto", "off"),
         default="auto",
         help=(
             "Cache Pillow-decoded uint8 images in a memory-mapped .npy file. "
-            "'auto' falls back to JPEGs when there is insufficient disk space."
+            "'auto' falls back to JPEGs when there is insufficient disk space. "
+            "Downsampling is applied before the cache is written."
         ),
     )
     parser.add_argument(
         "--image_cache_path",
         default=None,
-        help="Decoded cache path (default: RESULT_DIR/images.uint8.npy).",
+        help=(
+            "Decoded cache path (default: RESULT_DIR/images.uint8.npy, or "
+            "RESULT_DIR/images.uint8.dsN.npy when --downsample N>1)."
+        ),
     )
     parser.add_argument(
         "--rebuild_image_cache",

@@ -109,6 +109,8 @@ def build_loaders(
         image_tmpl="pair_{:06d}.jpg",
         targets=targets,
         image_cache=image_cache,
+        normalize_on_cpu=not args.device_preprocessing,
+        downsample=args.downsample,
     )
     validation_dataset = PairDataset(
         args.data_dir,
@@ -116,6 +118,8 @@ def build_loaders(
         image_tmpl="pair_{:06d}.jpg",
         targets=targets,
         image_cache=image_cache,
+        normalize_on_cpu=not args.device_preprocessing,
+        downsample=args.downsample,
     )
     sampler = EpochSubsetSampler(train_indices, samples_per_epoch, run_seed)
     pin_memory = device.type == "cuda"
@@ -320,6 +324,8 @@ def validate_configuration(parser, args, n_data):
         parser.error("--prefetch_factor must be positive")
     if args.stats_write_interval < 1:
         parser.error("--stats_write_interval must be positive")
+    if args.downsample < 1:
+        parser.error("--downsample must be >= 1")
     if not 0 < args.test_ratio < 1:
         parser.error("--test_ratio must be between 0 and 1")
     if n_data < 2:
@@ -385,13 +391,17 @@ def main():
         "path": None,
         "enabled": False,
         "mode": args.image_cache,
+        "downsample": args.downsample,
     }
     if args.image_cache == "auto":
-        cache_path = (
-            Path(args.image_cache_path)
-            if args.image_cache_path
-            else result_dir / "images.uint8.npy"
-        )
+        if args.image_cache_path:
+            cache_path = Path(args.image_cache_path)
+        elif args.downsample > 1:
+            cache_path = result_dir / "images.uint8.ds{}.npy".format(
+                args.downsample
+            )
+        else:
+            cache_path = result_dir / "images.uint8.npy"
         cache_info.update(
             prepare_image_cache(
                 args.data_dir,
@@ -400,6 +410,7 @@ def main():
                 workers=args.workers,
                 batch_size=min(64, args.val_batch_size or args.batch_size),
                 rebuild=args.rebuild_image_cache,
+                downsample=args.downsample,
             )
         )
         cache_info["enabled"] = cache_info["path"] is not None
@@ -433,6 +444,7 @@ def main():
             "cuda_prefetch": (
                 device.type == "cuda" and not args.no_cuda_prefetch
             ),
+            "device_preprocessing": args.device_preprocessing,
             "seed": args.seed,
             "device": str(device),
             "n_folds": args.n_folds,

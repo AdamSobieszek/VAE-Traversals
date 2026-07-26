@@ -85,14 +85,11 @@ surrounding pipeline in several ways:
   enough free disk space. Use `--image-cache off` to disable it,
   `--image-cache-path PATH` to place it on faster/larger storage, or
   `--rebuild-image-cache` after an unusual in-place dataset modification.
-* Images remain uint8 through loading and host-to-device transfer. The original
-  `ToTensor` and normalization operations are applied to the complete batch on
-  the target device, reducing transfer volume by 4x without changing input
-  values.
+* Cached pixels are passed through the historical worker-side CPU `ToTensor`
+  and normalization path by default.
 * Data-loader workers persist across epochs and prefetch batches. CUDA runs
-  additionally overlap transfer and normalization of the next batch with the
-  current model step. Use `--no-persistent-workers` or `--no-cuda-prefetch`
-  for troubleshooting.
+  additionally overlap transfer of the next batch with the current model step.
+  Use `--no-persistent-workers` or `--no-cuda-prefetch` for troubleshooting.
 * Training and validation metrics accumulate on the device, avoiding three
   device synchronizations per batch. `stats.json` is persisted at validation
   points and every 10 epochs rather than rewriting the growing history after
@@ -106,6 +103,7 @@ therefore **off by default**:
 
 ```bash
 scripts/run_vp_biggan.sh \
+    --device-preprocessing \
     --amp bfloat16 \
     --tf32 \
     --channels-last \
@@ -119,6 +117,9 @@ Hardware support varies. `--amp float16` uses gradient scaling;
 MPS supports `float16` rather than `bfloat16`, while CPU autocast supports
 `bfloat16` rather than `float16`.
 `--compile-mode` accepts `default`, `reduce-overhead`, or `max-autotune`.
+`--device-preprocessing` keeps images uint8 through host-to-device transfer
+(4x less transfer data) and normalizes them on the accelerator. It is opt-in
+because the historical benchmark normalized inside CPU loader workers.
 
 The `scripts/` directory contains the exact settings used for each recorded
 model dataset. For example, run `scripts/run_vp_biggan.sh`. These scripts may be

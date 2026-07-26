@@ -25,30 +25,66 @@ def _image_tensor(image):
     return torch.from_numpy(image).permute(2, 0, 1)
 
 
+def downsample_chw_uint8(image, factor):
+    """Max-pool a CHW uint8 image with non-overlapping ``factor`` x ``factor`` windows.
+
+    Odd trailing rows/columns that do not fill a full window are dropped, matching
+    ``torch.nn.functional.max_pool2d`` with ``kernel_size=stride=factor``.
+    """
+    factor = int(factor)
+    if factor < 1:
+        raise ValueError("downsample factor must be >= 1")
+    if factor == 1:
+        return image
+    channels, height, width = image.shape
+    out_h = height // factor
+    out_w = width // factor
+    if out_h < 1 or out_w < 1:
+        raise ValueError(
+            "downsample factor {} leaves an empty spatial size for shape {}".format(
+                factor, tuple(image.shape)
+            )
+        )
+    cropped = np.asarray(image)[:, : out_h * factor, : out_w * factor]
+    blocked = cropped.reshape(channels, out_h, factor, out_w, factor)
+    return blocked.max(axis=(2, 4))
+
+
+def _to_training_tensor(image_hwc, downsample=1):
+    """Decode path: HWC uint8 -> optional max-pool -> CHW uint8 tensor."""
+    image_tensor = _image_tensor(image_hwc)
+    if downsample > 1:
+        image_tensor = torch.from_numpy(
+            downsample_chw_uint8(image_tensor.numpy(), downsample)
+        )
+    return image_tensor
+
+
 class PairImageDataset(data.Dataset):
     """Load pair images without labels, primarily for cache construction."""
 
-    def __init__(self, data_dir, length, image_tmpl="pair_{:06d}.jpg"):
+    def __init__(
+        self,
+        data_dir,
+        length,
+        image_tmpl="pair_{:06d}.jpg",
+        downsample=1,
+    ):
         self.data_dir = os.fspath(data_dir)
         self.length = int(length)
         self.image_tmpl = image_tmpl
+        self.downsample = int(downsample)
 
     def __getitem__(self, idx):
         path = os.path.join(self.data_dir, self.image_tmpl.format(idx))
-        return _image_tensor(load_image(path))
+        return _to_training_tensor(load_image(path), self.downsample)
 
     def __len__(self):
         return self.length
 
 
 class PairDataset(data.Dataset):
-    """Return CHW uint8 pair images and precomputed integer class targets.
-
-    Keeping images as bytes until a complete batch reaches the target device
-    removes per-sample transform overhead and reduces host-to-device traffic by
-    4x. Normalization is applied in ``train_val.prepare_batch`` using the exact
-    historical sequence of float32 operations.
-    """
+    """Return pair images and precomputed integer class targets."""
 
     def __init__(
         self,
@@ -58,12 +94,16 @@ class PairDataset(data.Dataset):
         transform=None,
         targets=None,
         image_cache=None,
+        normalize_on_cpu=False,
+        downsample=1,
     ):
         self.data_dir = os.fspath(data_dir)
         self.idx_list = np.asarray(idx_list, dtype=np.int64)
         self.image_tmpl = image_tmpl
         self.transform = transform
+        self.normalize_on_cpu = normalize_on_cpu
         self.image_cache = os.fspath(image_cache) if image_cache else None
+        self.downsample = int(downsample)
         self._cached_images = None
 
         if targets is None:
@@ -81,18 +121,23 @@ class PairDataset(data.Dataset):
     def __getitem__(self, hyper_idx):
         idx = int(self.idx_list[hyper_idx])
         if self.image_cache:
+            # Cache already stores downsampled uint8 CHW pixels.
             image = self._cache()[idx]
             image_tensor = torch.from_numpy(image)
         else:
             path = os.path.join(self.data_dir, self.image_tmpl.format(idx))
-            image = load_image(path)
-            image_tensor = _image_tensor(image)
+            image_tensor = _to_training_tensor(load_image(path), self.downsample)
+            image = image_tensor.numpy()
 
         if self.transform is not None:
             # Retain compatibility with callers of the original dataset class.
-            if self.image_cache:
-                image = np.transpose(image, (1, 2, 0))
+            image = np.transpose(image, (1, 2, 0))
             image_tensor = self.transform(image)
+        elif self.normalize_on_cpu:
+            # Preserve the historical ToTensor + Normalize path inside loader
+            # workers, independent of the selected accelerator backend.
+            image_tensor = image_tensor.float()
+            image_tensor.div_(255.0).sub_(0.5).div_(0.5)
         return image_tensor, int(self.targets[idx])
 
     def __len__(self):
@@ -112,7 +157,7 @@ def _metadata_path(cache_path):
     return cache_path.with_suffix(cache_path.suffix + ".json")
 
 
-def _cache_is_valid(cache_path, n_data, image_shape, source_signature):
+def _cache_is_valid(cache_path, n_data, image_shape, source_signature, downsample):
     try:
         cached = np.load(cache_path, mmap_mode="r")
         metadata = json.loads(
@@ -126,6 +171,7 @@ def _cache_is_valid(cache_path, n_data, image_shape, source_signature):
             array_valid
             and metadata.get("schema_version") == 1
             and metadata.get("source_signature") == source_signature
+            and int(metadata.get("downsample", 1)) == int(downsample)
         )
     except (OSError, ValueError, json.JSONDecodeError):
         return False
@@ -139,26 +185,32 @@ def prepare_image_cache(
     batch_size,
     rebuild=False,
     image_tmpl="pair_{:06d}.jpg",
+    downsample=1,
 ):
     """Build or reuse a memory-mapped array of Pillow-decoded uint8 pixels.
+
+    When ``downsample`` is greater than 1, non-overlapping max-pooling is applied
+    before writing the cache so later epochs load the reduced resolution directly.
 
     Returns a metadata dictionary. If there is not enough free disk space, the
     returned ``path`` is ``None`` and callers can transparently use JPEG files.
     """
     cache_path = Path(cache_path)
+    downsample = int(downsample)
     first_path = Path(data_dir) / image_tmpl.format(0)
-    first = _image_tensor(load_image(first_path))
+    first = _to_training_tensor(load_image(first_path), downsample)
     image_shape = tuple(first.shape)
     required_bytes = int(n_data * first.numel())
     source_signature = _source_signature(data_dir, n_data, image_tmpl)
 
     if not rebuild and _cache_is_valid(
-        cache_path, n_data, image_shape, source_signature
+        cache_path, n_data, image_shape, source_signature, downsample
     ):
         return {
             "path": os.fspath(cache_path),
             "bytes": required_bytes,
             "image_shape": list(image_shape),
+            "downsample": downsample,
             "built": False,
             "elapsed_seconds": 0.0,
         }
@@ -177,6 +229,7 @@ def prepare_image_cache(
             "path": None,
             "bytes": required_bytes,
             "image_shape": list(image_shape),
+            "downsample": downsample,
             "built": False,
             "elapsed_seconds": 0.0,
             "reason": "insufficient_disk_space",
@@ -191,8 +244,8 @@ def prepare_image_cache(
         metadata_temporary.unlink()
 
     print(
-        "Building decoded image cache ({:.2f} GiB) at {}".format(
-            required_bytes / 1024**3, cache_path
+        "Building decoded image cache ({:.2f} GiB, downsample={}) at {}".format(
+            required_bytes / 1024**3, downsample, cache_path
         )
     )
     started = time.perf_counter()
@@ -202,7 +255,9 @@ def prepare_image_cache(
         dtype=np.uint8,
         shape=(n_data,) + image_shape,
     )
-    source = PairImageDataset(data_dir, n_data, image_tmpl=image_tmpl)
+    source = PairImageDataset(
+        data_dir, n_data, image_tmpl=image_tmpl, downsample=downsample
+    )
     loader_kwargs = {
         "batch_size": max(1, int(batch_size)),
         "shuffle": False,
@@ -240,6 +295,7 @@ def prepare_image_cache(
                     "source_signature": source_signature,
                     "samples": n_data,
                     "image_shape": list(image_shape),
+                    "downsample": downsample,
                 },
                 handle,
                 indent=2,
@@ -262,6 +318,7 @@ def prepare_image_cache(
         "path": os.fspath(cache_path),
         "bytes": required_bytes,
         "image_shape": list(image_shape),
+        "downsample": downsample,
         "built": True,
         "elapsed_seconds": elapsed,
     }

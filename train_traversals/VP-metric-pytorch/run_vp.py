@@ -77,6 +77,14 @@ def build_parser():
         action="store_true",
         help="Disable overlapping CUDA transfers with model execution.",
     )
+    parser.add_argument(
+        "--device-preprocessing",
+        action="store_true",
+        help=(
+            "Opt in to accelerator-side normalization; the default uses the "
+            "historical CPU preprocessing path."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0, help="Split and model seed.")
     parser.add_argument(
         "--mode",
@@ -117,15 +125,30 @@ def build_parser():
         help="Print the main_vp.py command without running it.",
     )
     parser.add_argument(
+        "--downsample",
+        type=int,
+        default=1,
+        help=(
+            "Spatial downsample factor via non-overlapping max-pooling before "
+            "caching/training (e.g. 2 means 2x2 max-pool). 1 disables it."
+        ),
+    )
+    parser.add_argument(
         "--image-cache",
         choices=("auto", "off"),
         default="auto",
-        help="Use an exact decoded-uint8 memory-mapped image cache.",
+        help=(
+            "Use an exact decoded-uint8 memory-mapped image cache. "
+            "Downsampling is applied before the cache is written."
+        ),
     )
     parser.add_argument(
         "--image-cache-path",
         default=None,
-        help="Decoded cache path (default: RESULT_DIR/images.uint8.npy).",
+        help=(
+            "Decoded cache path (default: RESULT_DIR/images.uint8.npy, or "
+            "RESULT_DIR/images.uint8.dsN.npy when --downsample N>1)."
+        ),
     )
     parser.add_argument(
         "--rebuild-image-cache",
@@ -193,6 +216,8 @@ def validate_args(parser, args):
         parser.error("--prefetch-factor must be positive")
     if args.stats_write_interval <= 0:
         parser.error("--stats-write-interval must be positive")
+    if args.downsample < 1:
+        parser.error("--downsample must be >= 1")
     if args.n_folds <= 0:
         parser.error("--n-fold must be positive")
     if any(not 0 < fraction < 1 for fraction in args.train_fractions):
@@ -230,6 +255,7 @@ def training_command(args):
         "--mode", args.mode.replace("-", "_"),
         "--n_folds", str(args.n_folds),
         "--train_fractions", *[str(value) for value in args.train_fractions],
+        "--downsample", str(args.downsample),
         "--image_cache", args.image_cache,
         "--stats_write_interval", str(args.stats_write_interval),
         "--amp", args.amp,
@@ -243,6 +269,8 @@ def training_command(args):
         command.append("--no_persistent_workers")
     if args.no_cuda_prefetch:
         command.append("--no_cuda_prefetch")
+    if args.device_preprocessing:
+        command.append("--device_preprocessing")
     if args.rebuild_image_cache:
         command.append("--rebuild_image_cache")
     if args.tf32:

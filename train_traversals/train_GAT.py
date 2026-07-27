@@ -108,11 +108,11 @@ def main():
     )
 
     # === Support Sets (S) ======================================================================= #
-    parser.add_argument("-K", "--num-support-sets", type=int, default=8,
+    parser.add_argument("-K", "--num-traversal-sets", type=int, default=8,
                         help="number of support sets (potential functions)")
-    parser.add_argument("-D", "--num-support-timesteps", type=int, default=4,
+    parser.add_argument("-D", "--num-traversal-timesteps", type=int, default=4,
                         help="number of timesteps per potential")
-    parser.add_argument("--support-set-lr", type=float, default=2e-4, help="support-set learning rate")
+    parser.add_argument("--traversal-set-lr", type=float, default=2e-4, help="traversal-set learning rate")
 
     # === Reconstructor (R) ====================================================================== #
     parser.add_argument("--recognizer-lr", type=float, default=2e-4,
@@ -162,14 +162,14 @@ def main():
     G = load_gat_generator(args, script_dir, device)
 
     print("#. Build Support Sets S...")
-    print("  \\__Number of Potentials : {}".format(args.num_support_sets))
-    print("  \\__Number of Timesteps  : {}".format(args.num_support_timesteps))
+    print("  \\__Number of Potentials : {}".format(args.num_traversal_sets))
+    print("  \\__Number of Timesteps  : {}".format(args.num_traversal_timesteps))
     print("  \\__Support Vectors dim  : {}".format(G.dim_z))
 
     S = TraversalPDE(
-        num_support_sets=args.num_support_sets,
-        num_support_timesteps=args.num_support_timesteps,
-        support_vectors_dim=G.dim_z,
+        num_traversal_sets=args.num_traversal_sets,
+        num_traversal_timesteps=args.num_traversal_timesteps,
+        traversal_vectors_dim=G.dim_z,
         lambdas={"BB": 0.2, "signed_g2orth": 1.0},
     )
 
@@ -180,7 +180,7 @@ def main():
     print("#. Build recognizer model R...")
     R = Recognizer(
         recognizer_type=args.recognizer_type,
-        dim_index=S.num_support_sets,
+        dim_index=S.num_traversal_sets,
         channels=4 if args.gan_type == "GAT" else 3,
         pool_size=1,
     )
@@ -191,7 +191,7 @@ def main():
 
     print("#. Experiment: {}".format(exp_dir))
     trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
-    trn.train(generator=G, support_sets=S, recognizer=R)
+    trn.train(generator=G, traversal_sets=S, recognizer=R)
 
 
 if __name__ == "__main__":

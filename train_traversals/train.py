@@ -20,11 +20,11 @@ def main():
         --shift-in-w-space         : search latent paths in StyleGAN2's W-space (otherwise, look in Z-space)
 
         ===[ Support Sets (S) ]=========================================================================================
-        -K, --num-support-sets     : set number of support sets; i.e., number of warping functions -- number of
+        -K, --num-traversal-sets     : set number of support sets; i.e., number of warping functions -- number of
                                      interpretable paths
-        -D, --num-support-timesteps  : set number of support dipoles per support set
+        -D, --num-traversal-timesteps  : set number of support dipoles per support set
 
-        --support-set-lr           : set learning rate for learning support sets
+        --traversal-set-lr           : set learning rate for learning support sets
 
         ===[ Reconstructor (R) ]========================================================================================
         --reconstructor-type       : set reconstructor network type
@@ -51,9 +51,9 @@ def main():
     parser.add_argument('--shift-in-w-space', action='store_true', help="search latent paths in StyleGAN2's W-space")
 
     # === Support Sets (S) ======================================================================== #
-    parser.add_argument('-K', '--num-support-sets', type=int, help="set number of support sets (potential functions)")
-    parser.add_argument('-D', '--num-support-timesteps', type=int, help="set number of timesteps per potential")
-    parser.add_argument('--support-set-lr', type=float, default=3e-4, help="set learning rate")
+    parser.add_argument('-K', '--num-traversal-sets', type=int, help="set number of support sets (potential functions)")
+    parser.add_argument('-D', '--num-traversal-timesteps', type=int, help="set number of timesteps per potential")
+    parser.add_argument('--traversal-set-lr', type=float, default=3e-4, help="set learning rate")
 
     # === Reconstructor (R) ========================================================================================== #
     parser.add_argument('--reconstructor-lr', type=float, default=3e-4,
@@ -139,20 +139,15 @@ def main():
 
     # Build Potentials model (legacy: Support Sets) S
     print("#. Build Potentials (Support Sets) S...")
-    print("  \\__Number of Potentials    : {}".format(args.num_support_sets))
-    print("  \\__Number of Timesteps : {}".format(args.num_support_timesteps))
+    print("  \\__Number of Potentials    : {}".format(args.num_traversal_sets))
+    print("  \\__Number of Timesteps : {}".format(args.num_traversal_timesteps))
     print("  \\__Support Vectors dim       : {}".format(G.dim_z))
 
-    S = TraversalPDE(num_support_sets=args.num_support_sets,
-                    num_support_timesteps=args.num_support_timesteps,
-                    support_vectors_dim=G.dim_z,
+    S = TraversalPDE(num_traversal_sets=args.num_traversal_sets,
+                    num_traversal_timesteps=args.num_traversal_timesteps,
+                    traversal_vectors_dim=G.dim_z,
                     lambdas={'BB': 0.25, 'signed_g2orth': 1.0},
                     ) 
-    # S =             KanPDE(num_support_sets=args.num_support_sets,
-    #                 num_support_timesteps=args.num_support_timesteps,
-    #                 support_vectors_dim=G.dim_z,
-    #                 lambdas={'fconvex': 1.0,'BB':3.33, 'g2orth': 1.0},
-    #                 )
 
     # Count number of trainable parameters
     print("  \\__Trainable parameters: {:,}".format(sum(p.numel() for p in S.parameters() if p.requires_grad)))
@@ -160,8 +155,8 @@ def main():
     # Build recognizer model (legacy: reconstructor) R
     print("#. Build recognizer (reconstructor) model R...")
     R = Recognizer(reconstructor_type=args.reconstructor_type,
-                      dim_index=S.num_support_sets,
-                      dim_time=S.num_support_timesteps,
+                      dim_index=S.num_traversal_sets,
+                      dim_time=S.num_traversal_timesteps,
                       channels=1 if args.gan_type == 'SNGAN_MNIST' else 3,
                       pool_size=reconstructor_pool_size)
 
@@ -173,7 +168,7 @@ def main():
     trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
 
     # Train
-    trn.train(generator=G, support_sets=S, reconstructor=R)
+    trn.train(generator=G, traversal_sets=S, reconstructor=R)
 
 
 if __name__ == '__main__':

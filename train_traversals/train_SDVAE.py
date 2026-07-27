@@ -22,11 +22,11 @@ def main():
                                      +args.z_truncation]
 
         ===[ Support Sets (S) ]=========================================================================================
-        -K, --num-support-sets     : set number of support sets; i.e., number of warping functions -- number of
+        -K, --num-traversal-sets     : set number of support sets; i.e., number of warping functions -- number of
                                      interpretable paths
-        -D, --num-support-timesteps  : set number of support dipoles per support set
+        -D, --num-traversal-timesteps  : set number of support dipoles per support set
 
-        --support-set-lr           : set learning rate for learning support sets
+        --traversal-set-lr           : set learning rate for learning support sets
 
         ===[ Reconstructor (R) ]========================================================================================
         --recognizer-type       : set recognizer network type
@@ -66,9 +66,9 @@ def main():
                         help='latent scaling factor to invert before VAE decode')
 
     # === Support Sets (S) ======================================================================== #
-    parser.add_argument('-K', '--num-support-sets', type=int, help="set number of support sets (potential functions)")
-    parser.add_argument('-D', '--num-support-timesteps', type=int, help="set number of timesteps per potential")
-    parser.add_argument('--support-set-lr', type=float, default=3e-4, help="set learning rate")
+    parser.add_argument('-K', '--num-traversal-sets', type=int, help="set number of support sets (potential functions)")
+    parser.add_argument('-D', '--num-traversal-timesteps', type=int, help="set number of timesteps per potential")
+    parser.add_argument('--traversal-set-lr', type=float, default=3e-4, help="set learning rate")
     parser.add_argument('--only-potential', type=bool, default=True, help="only train potential")
 
     # === Reconstructor (R) ========================================================================================== #
@@ -134,13 +134,13 @@ def main():
 
     # Build Support Sets model S
     print("#. Build Support Sets S...")
-    print("  \\__Number of Potentials    : {}".format(args.num_support_sets))
-    print("  \\__Number of Timesteps : {}".format(args.num_support_timesteps))
+    print("  \\__Number of Potentials    : {}".format(args.num_traversal_sets))
+    print("  \\__Number of Timesteps : {}".format(args.num_traversal_timesteps))
     print("  \\__Support Vectors dim       : {}".format(G.dim_z))
 
-    S = TraversalPDE(num_support_sets=args.num_support_sets,
-                    num_support_timesteps=args.num_support_timesteps,
-                    support_vectors_dim=G.dim_z,
+    S = TraversalPDE(num_traversal_sets=args.num_traversal_sets,
+                    num_traversal_timesteps=args.num_traversal_timesteps,
+                    traversal_vectors_dim=G.dim_z,
                     only_potential = args.only_potential,
                     lambdas={'BB':.5, 'g2orth': 1.0},
                     ) 
@@ -152,8 +152,8 @@ def main():
     print("#. Build recognizer model R...")
 
     R = Reconstructor(recognizer_type=args.recognizer_type,
-                      dim_index=S.num_support_sets,
-                      dim_time=S.num_support_timesteps,
+                      dim_index=S.num_traversal_sets,
+                      dim_time=S.num_traversal_timesteps,
                       channels=3,
                       pool_size=1)
 
@@ -166,7 +166,7 @@ def main():
     trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
 
     # Train
-    trn.train(generator=G, support_sets=S, recognizer=R)
+    trn.train(generator=G, traversal_sets=S, recognizer=R)
 
 
 if __name__ == '__main__':

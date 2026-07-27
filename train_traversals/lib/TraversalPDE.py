@@ -9,7 +9,7 @@ from lib.pde_losses import build_losses
 
 
 # ================================================================
-# Core stacked layers (vectorized over support-set axis K)
+# Core stacked layers (vectorized over traversal-set axis K)
 # ================================================================
 class StackedLinear(nn.Module):
     """
@@ -140,13 +140,13 @@ class StackedSemanticPotential(nn.Module):
 
 class TraversalPDE(nn.Module):
     """
-    K-parallel TraversalPDE powered by PDEState and modular PDE losses.
+    K-parallel Traversals powered by PDEState and modular PDE losses.
     """
     def __init__(
         self,
-        num_support_sets: int,
-        num_support_timesteps: int,
-        support_vectors_dim: int,
+        num_traversal_sets: int,
+        num_traversal_timesteps: int,
+        traversal_vectors_dim: int,
         lambdas: Optional[Dict[str, float]] = None,          # ONLY what you want active
         n_laplace_probes: int = 1,
         # PDEState config
@@ -163,17 +163,17 @@ class TraversalPDE(nn.Module):
         if lambdas is None:
             lambdas = {}
 
-        self.num_support_sets = int(num_support_sets)
-        self.num_support_timesteps = int(num_support_timesteps)
-        self.support_vectors_dim = int(support_vectors_dim)
+        self.num_traversal_sets = int(num_traversal_sets)
+        self.num_traversal_timesteps = int(num_traversal_timesteps)
+        self.traversal_vectors_dim = int(traversal_vectors_dim)
 
         # Learnable per-k scale (kept for parity; not wired to dt by default)
-        self.c = nn.Parameter(torch.full((self.num_support_sets, 1), 1.0))
+        self.c = nn.Parameter(torch.full((self.num_traversal_sets, 1), 1.0))
 
         # Stacked semantic potential
         self.F = StackedSemanticPotential(
-            K=self.num_support_sets,
-            n_in=self.support_vectors_dim,
+            K=self.num_traversal_sets,
+            n_in=self.traversal_vectors_dim,
             n_out=1,
             final_activation=nn.Identity(),
         )
@@ -197,7 +197,7 @@ class TraversalPDE(nn.Module):
             F=self.F,
             epsilon=epsilon,
             prior_score=prior_score,
-            dim_correction=1/(self.support_vectors_dim**0.5),
+            dim_correction=1/(self.traversal_vectors_dim**0.5),
         )
 
         # for telemetry
@@ -262,8 +262,8 @@ class TraversalPDE(nn.Module):
           delta_y: [B,K,1] detached final f(next)-f(now).detach()
         """
         B, D = z.shape
-        K = self.num_support_sets
-        T = max(1, int(self.num_support_timesteps) - 1)
+        K = self.num_traversal_sets
+        T = max(1, int(self.num_traversal_timesteps) - 1)
 
         if t_index.ndim == 1:
             t_index = t_index.unsqueeze(-1)
@@ -350,7 +350,7 @@ class TraversalPDE(nn.Module):
             z_curr = z
         else:
             B, D = z.shape
-            K = self.num_support_sets
+            K = self.num_traversal_sets
             z_curr = z.unsqueeze(1).expand(B, K, D).contiguous()
 
         st, x_next, L_step, dt = self._per_step(

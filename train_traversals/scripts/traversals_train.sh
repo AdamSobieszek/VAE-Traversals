@@ -1,6 +1,6 @@
 gan_type="SD-VAE"
-num_support_sets=4
-num_support_timesteps=4
+num_traversal_sets=4
+num_traversal_timesteps=4
 warmup_fraction=0.001
 accumulate_grad_steps=1
 recognizer_type="LeNet"
@@ -24,8 +24,8 @@ fi
 python train.py $tb \
                 --gan-type=${gan_type} \
                 --recognizer-type=${recognizer_type} \
-                --num-support-sets=${num_support_sets} \
-                --num-support-timesteps=${num_support_timesteps} \
+                --num-traversal-sets=${num_traversal_sets} \
+                --num-traversal-timesteps=${num_traversal_timesteps} \
                 --batch-size=${batch_size} \
                 --max-iter=${max_iter} \
                 --warmup-fraction=${warmup_fraction} \

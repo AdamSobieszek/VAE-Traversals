@@ -175,8 +175,8 @@ def create_exp_dir(args, new_experiment=False):
 
     Experiment's directory name format:
 
-        <gan_type>(-<stylegan2_resolution>)(-{Z,W})-<recognizer_type>-K<num_support_sets>-
-            D<num_support_dipoles>(-LearnAlphas)(-LearnGammas)-eps<min_shift_magnitude>_<max_shift_magnitude>
+        <gan_type>(-<stylegan2_resolution>)(-{Z,W})-<recognizer_type>-K<num_traversal_sets>-
+            D<num_traversal_dipoles>(-LearnAlphas)(-LearnGammas)-eps<min_shift_magnitude>_<max_shift_magnitude>
     E.g.:
 
         experiments/wip/ProgGAN-ResNet-K200-N32-LearnGammas-eps0.35_0.5
@@ -200,7 +200,7 @@ def create_exp_dir(args, new_experiment=False):
             biggan_classes += '{}'.format(c)
         exp_dir += '{}'.format(biggan_classes)
     exp_dir += "-{}".format(args.recognizer_type)
-    exp_dir += "-K{}-D{}".format(args.num_support_sets, args.num_support_timesteps)
+    exp_dir += "-K{}-D{}".format(args.num_traversal_sets, args.num_traversal_timesteps)
     if new_experiment:
         exp_dir += f"__{time.strftime('%Y%m%d_%H%M%S')}"
     else:
@@ -384,16 +384,16 @@ def module_grad_norm(mod):
 
 # ------------------------ per-k grad norms (stacked) ------------------------
 @torch.no_grad()
-def _per_k_grad_norms(support_sets) -> np.ndarray:
-    K = support_sets.num_support_sets
+def _per_k_grad_norms(traversal_sets) -> np.ndarray:
+    K = traversal_sets.num_traversal_sets
     # Keep accumulation on the same device as gradients (prevents device sync/copies)
     try:
-        dev = next(support_sets.parameters()).device
+        dev = next(traversal_sets.parameters()).device
     except StopIteration:
         dev = torch.device("cpu")
     g2 = torch.zeros(K, dtype=torch.float32, device=dev)
 
-    for p in support_sets.parameters():
+    for p in traversal_sets.parameters():
         g = p.grad
         if g is None:
             continue
@@ -462,7 +462,7 @@ class TrainingStatTracker(object):
         self.global_opt_step: int = 0
 
         # LRs (latest seen per optimizer-step)
-        self.last_support_lr = 0.0
+        self.last_traversal_lr = 0.0
         self.last_recognizer_lr = 0.0
 
         # Timing
@@ -718,8 +718,8 @@ class TrainingStatTracker(object):
             self.iter_history = self.iter_history[-self.ema_max_history:]
 
     # ---------- LRs ----------
-    def set_lrs(self, support_lr: float, recognizer_lr: float):
-        self.last_support_lr = float(support_lr)
+    def set_lrs(self, traversal_lr: float, recognizer_lr: float):
+        self.last_traversal_lr = float(traversal_lr)
         self.last_recognizer_lr = float(recognizer_lr)
 
     # Allow trainer to sync starting index (resume)
@@ -751,7 +751,7 @@ class TrainingStatTracker(object):
             rec['kl_loss'] = rec['L_kl']
 
         rec.update({
-            'support_sets_lr': self.last_support_lr,
+            'traversal_sets_lr': self.last_traversal_lr,
             'recognizer_lr': self.last_recognizer_lr,
             'mean_step_time_sec': float(mean_step_time),
             'elapsed_sec': float(elapsed_from_start),
@@ -1521,7 +1521,7 @@ class ImageViz:
     @torch.no_grad()
     def compute_lambda_and_confusion(
         *,
-        support_sets,
+        traversal_sets,
         recognizer,
         z_bd: torch.Tensor,   # [B,D]
         dt: torch.Tensor,     # [B,1] or [B,K]
@@ -1534,10 +1534,10 @@ class ImageViz:
         if z_bd.dim() != 2:
             raise ValueError(f"Expected z_bd [B,D], got {tuple(z_bd.shape)}")
         B, D = z_bd.shape
-        K = int(getattr(support_sets, "num_support_sets", 1))
+        K = int(getattr(traversal_sets, "num_traversal_sets", 1))
 
         # One-step per-k displacement field
-        z_bkd, delta_bkd = support_sets.inference(z_bd, dt=dt, return_all=False)  # [B,K,D], [B,K,D]
+        z_bkd, delta_bkd = traversal_sets.inference(z_bd, dt=dt, return_all=False)  # [B,K,D], [B,K,D]
 
         # ---- Lambda: average squared dot products between normalized deltas ----
         u = delta_bkd / delta_bkd.norm(dim=-1, keepdim=True).clamp_min_(1e-12)  # [B,K,D]
@@ -1805,7 +1805,7 @@ class ImageViz:
     # ----------------------------
     @staticmethod
     def rollout_latent_paths(
-        support_sets,
+        traversal_sets,
         z0: torch.Tensor,   # [1,D] or [B,D]
         dt: torch.Tensor,   # [B,1] or [B,K]
         *,
@@ -1821,32 +1821,32 @@ class ImageViz:
         if z0.dim() != 2:
             raise ValueError(f"Expected z0 [B,D], got {tuple(z0.shape)}")
         B, D = z0.shape
-        K = int(getattr(support_sets, "num_support_sets", 1))
-        T = int(steps) if steps is not None else max(1, int(getattr(support_sets, "num_support_timesteps", 2)) - 1)
+        K = int(getattr(traversal_sets, "num_traversal_sets", 1))
+        T = int(steps) if steps is not None else max(1, int(getattr(traversal_sets, "num_traversal_timesteps", 2)) - 1)
 
         # Expand to [B,K,D]
         z_curr = z0.unsqueeze(1).expand(B, K, D).contiguous()
         out = [z_curr]
 
         # Make viz deterministic: temporarily eval() to disable training-time latent noise.
-        was_training = bool(getattr(support_sets, "training", False))
-        support_sets.eval()
+        was_training = bool(getattr(traversal_sets, "training", False))
+        traversal_sets.eval()
 
         # Preserve BN update flag if present.
-        had_bn_flag = hasattr(getattr(support_sets, "F", None), "update_batchnorm")
+        had_bn_flag = hasattr(getattr(traversal_sets, "F", None), "update_batchnorm")
         if had_bn_flag:
-            prev_bn = bool(support_sets.F.update_batchnorm)
-            support_sets.F.update_batchnorm = False
+            prev_bn = bool(traversal_sets.F.update_batchnorm)
+            traversal_sets.F.update_batchnorm = False
         try:
             for i in range(T):
                 # ModelPDE implements _per_step(z_bkd, dt=..., direction=...)
-                st, x_next, L_step, dt_used = support_sets._per_step(z_curr, dt=dt, direction=direction)  # noqa: SLF001
+                st, x_next, L_step, dt_used = traversal_sets._per_step(z_curr, dt=dt, direction=direction)  # noqa: SLF001
                 z_curr = x_next
                 out.append(z_curr)
         finally:
             if had_bn_flag:
-                support_sets.F.update_batchnorm = prev_bn
-            support_sets.train(was_training)
+                traversal_sets.F.update_batchnorm = prev_bn
+            traversal_sets.train(was_training)
 
         traj = torch.stack(out, dim=1)  # [B, T+1, K, D]
         return traj
@@ -2268,7 +2268,7 @@ def sample_dt(trainer, B: int, half_range: int, total_opt_steps: int, *, dtype=t
     #     p.dt_beta_power = 1.0             # <1 softens, >1 sharpens    
     device = trainer.device
 
-    K = int(getattr(trainer, "K", getattr(p, "num_support_sets", 1)))
+    K = int(getattr(trainer, "K", getattr(p, "num_traversal_sets", 1)))
     step = int(getattr(getattr(trainer, "stat_tracker", None), "global_opt_step", 0))
 
     # ---- base dt sampler ----
@@ -2386,8 +2386,8 @@ def entropy_from_logits(logits: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def collect_wave_stats(support_sets, potential_preds: torch.Tensor) -> dict:
-    wave_dict = support_sets.get_losses()
+def collect_wave_stats(traversal_sets, potential_preds: torch.Tensor) -> dict:
+    wave_dict = traversal_sets.get_losses()
     wave_dict["potential_std"] = float(potential_preds.std().item())
     if "xf_now" in wave_dict and torch.is_tensor(wave_dict["xf_now"]):
         wave_dict["xf_now"] = float(wave_dict["xf_now"].norm(dim=-1).mean().item())
@@ -2431,22 +2431,22 @@ def tb_scalars(writer, step: int, win_means: dict, stat_tracker):
         v = _tb_finite_float(v)
         if v is not None:
             writer.add_scalar(f"train/{k}", v, step)
-    support_lr = _tb_finite_float(stat_tracker.last_support_lr)
+    traversal_lr = _tb_finite_float(stat_tracker.last_traversal_lr)
     recognizer_lr = _tb_finite_float(stat_tracker.last_recognizer_lr)
-    if support_lr is not None:
-        writer.add_scalar("train/support_sets_lr", support_lr, step)
+    if traversal_lr is not None:
+        writer.add_scalar("train/traversal_sets_lr", traversal_lr, step)
     if recognizer_lr is not None:
         writer.add_scalar("train/recognizer_lr", recognizer_lr, step)
 
 
-def tb_grad_norms(writer, step: int, support_sets=None, recognizer=None, freq: int = 1):
+def tb_grad_norms(writer, step: int, traversal_sets=None, recognizer=None, freq: int = 1):
     if step % freq != 0:
         return
-    if support_sets is not None:
-        gn_support = module_grad_norm(support_sets.F)
+    if traversal_sets is not None:
+        gn_support = module_grad_norm(traversal_sets.F)
         gn_support = _tb_finite_float(gn_support)
         if gn_support is not None:
-            writer.add_scalar("train/grad_norm/support_sets", gn_support, step)
+            writer.add_scalar("train/grad_norm/traversal_sets", gn_support, step)
     if recognizer is not None:
         gn_recon = module_grad_norm(recognizer)
         gn_recon = _tb_finite_float(gn_recon)
@@ -2518,7 +2518,7 @@ def tb_path_figs(
     writer,
     step: int,
     *,
-    support_sets,
+    traversal_sets,
     z_first: torch.Tensor,
     dt_first: torch.Tensor,
     save_dir: str | Path | None = None,
@@ -2527,7 +2527,7 @@ def tb_path_figs(
     Log latent-path projection figures for a single starting point z_first.
     """
     return
-    traj_tkd = ImageViz.rollout_latent_paths(support_sets, z_first, dt_first)  # [T+1,K,D]
+    traj_tkd = ImageViz.rollout_latent_paths(traversal_sets, z_first, dt_first)  # [T+1,K,D]
 
     fig1 = ImageViz.plot_spectral_projection_paths(traj_tkd)
     writer.add_figure("paths/spectral_projection", fig1, global_step=step)
@@ -2589,7 +2589,7 @@ def tb_information_matrix_figs(
     step: int,
     *,
     stat_tracker,
-    support_sets,
+    traversal_sets,
     recognizer,
     z_bd: torch.Tensor,
     dt: torch.Tensor,
@@ -2603,7 +2603,7 @@ def tb_information_matrix_figs(
       - d_eff(Σ) history
     """
     lam, conf = ImageViz.compute_lambda_and_confusion(
-        support_sets=support_sets,
+        traversal_sets=traversal_sets,
         recognizer=recognizer,
         z_bd=z_bd,
         dt=dt,
@@ -2826,7 +2826,7 @@ class DualConfusionThermalizer:
     """
     Tracks two confusions:
       - step0: logits0 from (img0,img1)
-      - step2: logits  from (img1,img2)  (the one that gives support_sets gradients)
+      - step2: logits  from (img1,img2)  (the one that gives traversal_sets gradients)
 
     Maintains EMA confusion *probabilities* (row-stochastic), and produces beta_k.
 

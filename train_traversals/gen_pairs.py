@@ -105,7 +105,7 @@ def generate_rgb(generator, z):
         output = decode(output)
     return output
 
-def load_support_sets(exp_models_dir, device):
+def load_traversal_sets(exp_models_dir, device):
     """
     Load TraversalPDE from checkpoint. We’ll:
       1) Read args.json to get K, T.
@@ -121,11 +121,11 @@ def load_support_sets(exp_models_dir, device):
     # Choose checkpoint
     ckpt_path = osp.join(exp_models_dir, 'checkpoint.pt')
     if not osp.isfile(ckpt_path):
-        # fall back to final support_sets.pt, then last support_sets-*.pt
+        # fall back to final traversal_sets.pt, then last traversal_sets-*.pt
         cands = []
-        if osp.isfile(osp.join(exp_models_dir, 'support_sets.pt')):
-            cands.append('support_sets.pt')
-        cands.extend(sorted([f for f in os.listdir(exp_models_dir) if f.startswith('support_sets-')]))
+        if osp.isfile(osp.join(exp_models_dir, 'traversal_sets.pt')):
+            cands.append('traversal_sets.pt')
+        cands.extend(sorted([f for f in os.listdir(exp_models_dir) if f.startswith('traversal_sets-')]))
         if not cands:
             raise FileNotFoundError(f"No checkpoint found in {exp_models_dir}")
         ckpt_path = osp.join(exp_models_dir, cands[-1])
@@ -138,7 +138,7 @@ def robust_load_waves(S: nn.Module, ckpt):
     """
     Try a few common layouts to load TraversalPDE weights from checkpoint.
     """
-    def looks_like_support_state(state_dict):
+    def looks_like_traversal_state(state_dict):
         return any(
             k == 'c'
             or k.startswith('F.')
@@ -149,18 +149,20 @@ def robust_load_waves(S: nn.Module, ckpt):
 
     sd = None
     if isinstance(ckpt, dict):
-        if 'support_sets' in ckpt and isinstance(ckpt['support_sets'], dict):
+        if 'traversal_sets' in ckpt and isinstance(ckpt['traversal_sets'], dict):
+            sd = ckpt['traversal_sets']
+        elif 'support_sets' in ckpt and isinstance(ckpt['support_sets'], dict):
             sd = ckpt['support_sets']
         elif 'state_dict' in ckpt and isinstance(ckpt['state_dict'], dict):
             # if state_dict looks like TraversalPDE already
-            if looks_like_support_state(ckpt['state_dict']):
+            if looks_like_traversal_state(ckpt['state_dict']):
                 sd = ckpt['state_dict']
         elif all(isinstance(k, str) for k in ckpt.keys()):
             # checkpoint is the state_dict itself
-            if looks_like_support_state(ckpt):
+            if looks_like_traversal_state(ckpt):
                 sd = ckpt
     if sd is None:
-        raise RuntimeError("Could not find TraversalPDE weights in checkpoint. Expected keys like 'support_sets', 'F.*', or 'c'.")
+        raise RuntimeError("Could not find TraversalPDE weights in checkpoint. Expected keys like 'traversal_sets', 'F.*', or 'c'.")
     S.load_state_dict(sd, strict=True)
 
 # ------------------
@@ -193,7 +195,7 @@ if __name__ == '__main__':
         raise NotADirectoryError(f"Invalid models directory: {models_dir}")
 
     # Load args + checkpoint metadata
-    a, ckpt, ckpt_path = load_support_sets(models_dir, device)
+    a, ckpt, ckpt_path = load_traversal_sets(models_dir, device)
 
     # Build generator (aligned with train.py)
     script_dir = Path(__file__).resolve().parent
@@ -201,9 +203,9 @@ if __name__ == '__main__':
 
     # Instantiate TraversalPDE with D = G.dim_z (same as train.py), then load weights
     S = TraversalPDE(
-        num_support_sets=a.__dict__['num_support_sets'],
-        num_support_timesteps=a.__dict__['num_support_timesteps'],
-        support_vectors_dim=G.dim_z,
+        num_traversal_sets=a.__dict__['num_traversal_sets'],
+        num_traversal_timesteps=a.__dict__['num_traversal_timesteps'],
+        traversal_vectors_dim=G.dim_z,
         only_potential=a.__dict__.get('only_potential', True)
     ).to(device).eval()
     robust_load_waves(S, ckpt)
@@ -215,10 +217,10 @@ if __name__ == '__main__':
     # Pair generation config
     n_samples = args.n_samples
     B = int(args.batch_size)
-    K = int(S.num_support_sets)
+    K = int(S.num_traversal_sets)
 
     # PDE rollout length: match training (half_range = T // 2)
-    half_range = S.num_support_timesteps // 2
+    half_range = S.num_traversal_timesteps // 2
 
     # Truncation (if present in args.json)
     z_trunc = a.__dict__.get('z_truncation', None)

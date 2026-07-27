@@ -140,9 +140,9 @@ class TrainerPotential(object):
             downscale=1 / recognizer.max_pool_size if hasattr(recognizer, "max_pool_size") else 1,
         )
 
-    def _maybe_save_initial(self, support_sets):
+    def _maybe_save_initial(self, traversal_sets):
         if not osp.isfile(self.checkpoint):
-            torch.save(support_sets.state_dict(), osp.join(self.models_dir, "support_sets_init.pt"))
+            torch.save(traversal_sets.state_dict(), osp.join(self.models_dir, "traversal_sets_init.pt"))
         else:
             print("#. checkpoint found, skipping contrastive pretraining.")
 
@@ -169,9 +169,9 @@ class TrainerPotential(object):
         return torch.amp.autocast(device_type=self.device.type, enabled=False)
 
     # ------------------------ checkpoint utils ------------------------
-    def get_starting_iteration(self, support_sets, recognizer,
-                              support_opt=None, recognizer_opt=None,
-                              support_sched=None, recognizer_sched=None):
+    def get_starting_iteration(self, traversal_sets, recognizer,
+                              traversal_opt=None, recognizer_opt=None,
+                              traversal_sched=None, recognizer_sched=None):
         def safe_load_state_dict(obj, ckpt, name, strict=True):
             if obj is not None and name in ckpt:
                 try:
@@ -184,7 +184,7 @@ class TrainerPotential(object):
             ckpt = torch.load(self.checkpoint, map_location=self.device)
             start_iter = int(ckpt.get("iter", 1))
 
-            safe_load_state_dict(support_sets, ckpt, "support_sets", strict=False)
+            safe_load_state_dict(traversal_sets, ckpt, "traversal_sets", strict=False)
             safe_load_state_dict(recognizer, ckpt, "recognizer", strict=False)
 
             # Add noise after loading (kept as-is)
@@ -193,14 +193,14 @@ class TrainerPotential(object):
                     if p.requires_grad:
                         p.data.add_(torch.randn_like(p) * std)
 
-            if support_sets is not None:
-                add_noise_to_params(support_sets)
+            if traversal_sets is not None:
+                add_noise_to_params(traversal_sets)
             if recognizer is not None:
                 add_noise_to_params(recognizer)
 
-            safe_load_state_dict(support_opt, ckpt, "support_opt")
+            safe_load_state_dict(traversal_opt, ckpt, "traversal_opt")
             safe_load_state_dict(recognizer_opt, ckpt, "recognizer_opt")
-            safe_load_state_dict(support_sched, ckpt, "support_sched")
+            safe_load_state_dict(traversal_sched, ckpt, "traversal_sched")
             safe_load_state_dict(recognizer_sched, ckpt, "recognizer_sched")
 
             self.stat_tracker.set_opt_step(start_iter)
@@ -208,8 +208,8 @@ class TrainerPotential(object):
         return start_iter
 
     # ------------------------ optim/sched ------------------------
-    def init_optimizers(self, support_sets, recognizer, acc_steps: int):
-        support_set_wd = float(getattr(self.params, "support_set_wd", 0.1))
+    def init_optimizers(self, traversal_sets, recognizer, acc_steps: int):
+        traversal_set_wd = float(getattr(self.params, "traversal_set_wd", 0.1))
         recognizer_wd = float(getattr(self.params, "recognizer_wd", 0.01))
         betas = tuple(getattr(self.params, "adam_betas", (0.9, 0.999)))
         eps = float(getattr(self.params, "adam_eps", 1e-8))
@@ -232,12 +232,12 @@ class TrainerPotential(object):
             if hasattr(scheduler, "_last_lr"):
                 scheduler._last_lr = list(lrs)
 
-        support_sets_optim = build_adamw(
+        traversal_sets_optim = build_adamw(
             [
-                {"params": support_sets.F.parameters(), "weight_decay": support_set_wd, "lr": self.params.support_set_lr},
-                {"params": [support_sets.c], "weight_decay": 0.0, "lr": self.params.support_set_lr},
+                {"params": traversal_sets.F.parameters(), "weight_decay": traversal_set_wd, "lr": self.params.traversal_set_lr},
+                {"params": [traversal_sets.c], "weight_decay": 0.0, "lr": self.params.traversal_set_lr},
             ],
-            lr=self.params.support_set_lr,
+            lr=self.params.traversal_set_lr,
             weight_decay=0.0,
             extra_no_decay_names=(),
             betas=betas,
@@ -257,21 +257,21 @@ class TrainerPotential(object):
         warmup_steps = math.ceil(float(getattr(self.params, "warmup_fraction", 0.0)) * total_opt_steps)
 
         sched_support = CosineScheduleWithWarmup(
-            support_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
+            traversal_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
         )
         sched_recon = CosineScheduleWithWarmup(
             recognizer_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
         )
 
         starting_opt_step = self.get_starting_iteration(
-            support_sets, recognizer,
-            support_opt=support_sets_optim, recognizer_opt=recognizer_optim,
-            support_sched=sched_support, recognizer_sched=sched_recon,
+            traversal_sets, recognizer,
+            traversal_opt=traversal_sets_optim, recognizer_opt=recognizer_optim,
+            traversal_sched=sched_support, recognizer_sched=sched_recon,
         )
 
         if reset_schedulers:
             sched_support = CosineScheduleWithWarmup(
-                support_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
+                traversal_sets_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
             )
             sched_recon = CosineScheduleWithWarmup(
                 recognizer_optim, num_warmup_steps=warmup_steps, num_training_steps=total_opt_steps, last_epoch=-1
@@ -280,9 +280,9 @@ class TrainerPotential(object):
                 starting_opt_step = 0
 
         if reset_lr:
-            force_optimizer_lr(support_sets_optim, self.params.support_set_lr)
+            force_optimizer_lr(traversal_sets_optim, self.params.traversal_set_lr)
             force_optimizer_lr(recognizer_optim, self.params.recognizer_lr)
-            sync_scheduler_lrs(sched_support, support_sets_optim)
+            sync_scheduler_lrs(sched_support, traversal_sets_optim)
             sync_scheduler_lrs(sched_recon, recognizer_optim)
 
         if reset_start_iter:
@@ -293,12 +293,12 @@ class TrainerPotential(object):
             starting_micro = starting_opt_step * acc_steps + 1
             opt_step_idx = starting_opt_step
 
-        support_sets_optim.zero_grad(set_to_none=True)
+        traversal_sets_optim.zero_grad(set_to_none=True)
         recognizer_optim.zero_grad(set_to_none=True)
-        return starting_micro, opt_step_idx, support_sets_optim, recognizer_optim, sched_support, sched_recon
+        return starting_micro, opt_step_idx, traversal_sets_optim, recognizer_optim, sched_support, sched_recon
 
     # ------------------------ forward+loss (all K) ------------------------
-    def loss_allK(self, support_sets, generator, recognizer,
+    def loss_allK(self, traversal_sets, generator, recognizer,
                   z, t_index, dt, acc_denominator: int,
                   *, need_images: bool = False):
         """
@@ -306,7 +306,7 @@ class TrainerPotential(object):
         Optional: only materialize img*_bk if need_images=True (for TB logging).
         """
         with self.fp32_context():
-            potential_preds, latent1_bk, latent2_bk, pde_loss, dt = support_sets(z, t_index, dt=dt, direction=dt)
+            potential_preds, latent1_bk, latent2_bk, pde_loss, dt = traversal_sets(z, t_index, dt=dt, direction=dt)
         B, K, D = latent1_bk.shape
 
         lat1_flat, targets, _, (B, K) = _pack_BK(latent1_bk)
@@ -338,7 +338,7 @@ class TrainerPotential(object):
             img2 = generator(lat2_bridge)
 
 
-        DO_ANTISYMMETRIC_LOSS = True # TODO: Remove
+        DO_ANTISYMMETRIC_LOSS = True # TODO: Replace with global flag
         if DO_ANTISYMMETRIC_LOSS and t_index[0].item() > 1:
             def uv(a,b,with_g=False, sign=1):
                 "Whitened coordinates (u,v*):=(z^*-v, z+v)"
@@ -373,7 +373,7 @@ class TrainerPotential(object):
             )
             loss = total_loss / acc_denominator
             cls_backward_loss = self.params.lambda_cls * cls_loss.float() / acc_denominator
-            support_backward_loss = self.params.lambda_pde * pde_loss.float() / acc_denominator
+            traversal_backward_loss = self.params.lambda_pde * pde_loss.float() / acc_denominator
 
         if float(self.params.lambda_cls) != 0.0:
             cls_backward_loss.backward()
@@ -383,16 +383,16 @@ class TrainerPotential(object):
         else:
             bridge_grad = torch.zeros_like(lat2_for_gen)
 
-        support_outputs = []
-        support_grads = []
+        traversal_outputs = []
+        traversal_grads = []
         if lat2_for_gen.requires_grad:
-            support_outputs.append(lat2_for_gen)
-            support_grads.append(bridge_grad)
-        if support_backward_loss.requires_grad:
-            support_outputs.append(support_backward_loss)
-            support_grads.append(torch.ones_like(support_backward_loss))
-        if support_outputs:
-            torch.autograd.backward(support_outputs, grad_tensors=support_grads)
+            traversal_outputs.append(lat2_for_gen)
+            traversal_grads.append(bridge_grad)
+        if traversal_backward_loss.requires_grad:
+            traversal_outputs.append(traversal_backward_loss)
+            traversal_grads.append(torch.ones_like(traversal_backward_loss))
+        if traversal_outputs:
+            torch.autograd.backward(traversal_outputs, grad_tensors=traversal_grads)
 
         # Cheap metrics needed every step
         with torch.no_grad():
@@ -420,7 +420,7 @@ class TrainerPotential(object):
         return loss_dict, logits.detach(), logits0.detach(), targets, potential_preds.detach(), img1_bk, img2_bk, latents_out
 
     # ------------------------ train ------------------------
-    def train(self, generator, support_sets, recognizer):
+    def train(self, generator, traversal_sets, recognizer):
         # runtime toggles (defaults match your current script)
         enable_analytics = bool(getattr(self.params, "enable_analytics", True))
         enable_histograms = False #bool(getattr(self.params, "enable_histograms", True))
@@ -428,12 +428,12 @@ class TrainerPotential(object):
         enable_images = bool(getattr(self.params, "enable_images", True))
         save_checkpoints = bool(getattr(self.params, "save_checkpoints", True))
 
-        self._maybe_save_initial(support_sets)
+        self._maybe_save_initial(traversal_sets)
 
         # Modes / devices
         generator = generator.to(self.device).eval()
         generator.requires_grad_(False)
-        support_sets = support_sets.to(self.device).train()
+        traversal_sets = traversal_sets.to(self.device).train()
         recognizer = recognizer.to(self.device).train()
         for module in (generator, recognizer):
             if hasattr(module, "set_mixed_precision"):
@@ -446,8 +446,8 @@ class TrainerPotential(object):
             cudnn.benchmark = True
 
         # Bookkeeping
-        self.K = int(self.params.num_support_sets)
-        self.T = int(self.params.num_support_timesteps)
+        self.K = int(self.params.num_traversal_sets)
+        self.T = int(self.params.num_traversal_timesteps)
         self.stat_tracker.init_per_k(self.K)
 
         half_range = int(self.T // 2)
@@ -461,8 +461,8 @@ class TrainerPotential(object):
         total_opt_steps = max(1, math.ceil(int(self.params.max_iter) / max(1, acc_steps)))
 
         (starting_micro, _opt_step_idx,
-         support_sets_optim, recognizer_optim,
-         sched_support, sched_recon) = self.init_optimizers(support_sets, recognizer, acc_steps)
+         traversal_sets_optim, recognizer_optim,
+         sched_support, sched_recon) = self.init_optimizers(traversal_sets, recognizer, acc_steps)
 
         self._maybe_init_image_logger(recognizer)
 
@@ -500,7 +500,7 @@ class TrainerPotential(object):
             t_idx = self.sample_t_idx(B, target_step)
 
             loss_dict, logits_det, logits0_det, targets, potential_preds_det, img1_bk, img2_bk, latent2_bk_det = self.loss_allK(
-                support_sets, generator, recognizer,
+                traversal_sets, generator, recognizer,
                 z, t_idx, dt,
                 acc_denominator=acc_steps,
                 need_images=do_imgs,
@@ -514,10 +514,10 @@ class TrainerPotential(object):
 
                 wave_stats = {}
                 if enable_analytics:
-                    wave_stats = collect_wave_stats(support_sets, potential_preds_det)
+                    wave_stats = collect_wave_stats(traversal_sets, potential_preds_det)
 
                 # per-k grad norms (only meaningful if you want it)
-                per_k_gn = _per_k_grad_norms(support_sets) if enable_analytics else None
+                per_k_gn = _per_k_grad_norms(traversal_sets) if enable_analytics else None
 
                 self.stat_tracker.add_micro(
                     acc=batch_acc,
@@ -540,16 +540,16 @@ class TrainerPotential(object):
             # ===== recognizer optimizer step @ each micro-step =====
 
             if do_gradnorm:
-                tb_grad_norms(self.tb_writer, step_idx, support_sets=support_sets, recognizer=recognizer)
+                tb_grad_norms(self.tb_writer, step_idx, traversal_sets=traversal_sets, recognizer=recognizer)
 
 
-            clip_accum_grads_(support_sets, micro_idx=micro_idx,acc_steps=acc_steps,
+            clip_accum_grads_(traversal_sets, micro_idx=micro_idx,acc_steps=acc_steps,
                 is_boundary=is_boundary,
-                mode=str(getattr(self.params, "support_clip_mode", "delta_prophet")),
-                clip_end=float(getattr(self.params, "support_clip_end", 1.0)),
-                clip_step=getattr(self.params, "support_clip_step", None),          # used by "delta" (ignored by delta_prophet)
-                alpha=float(getattr(self.params, "support_clip_alpha", 3.0)),       # delta_prophet cap = alpha * ||delta_1||
-                clip_final=getattr(self.params, "support_clip_final", None),        # defaults to clip_end inside util
+                mode=str(getattr(self.params, "traversal_clip_mode", "delta_prophet")),
+                clip_end=float(getattr(self.params, "traversal_clip_end", 1.0)),
+                clip_step=getattr(self.params, "traversal_clip_step", None),          # used by "delta" (ignored by delta_prophet)
+                alpha=float(getattr(self.params, "traversal_clip_alpha", 3.0)),       # delta_prophet cap = alpha * ||delta_1||
+                clip_final=getattr(self.params, "traversal_clip_final", None),        # defaults to clip_end inside util
             )
             torch.nn.utils.clip_grad_norm_(recognizer.parameters(), max_norm=2.0)
 
@@ -557,10 +557,10 @@ class TrainerPotential(object):
             recognizer_optim.zero_grad(set_to_none=True)
             # ===== support sets optimizer step @ boundary =====
             if is_boundary:
-                torch.nn.utils.clip_grad_norm_(support_sets.parameters(), max_norm=2.0)
+                torch.nn.utils.clip_grad_norm_(traversal_sets.parameters(), max_norm=2.0)
 
-                support_sets_optim.step()
-                support_sets_optim.zero_grad(set_to_none=True)
+                traversal_sets_optim.step()
+                traversal_sets_optim.zero_grad(set_to_none=True)
 
                 sched_support.step()
                 sched_recon.step()
@@ -600,7 +600,7 @@ class TrainerPotential(object):
                         tb_path_figs(
                             self.tb_writer,
                             step_idx,
-                            support_sets=support_sets,
+                            traversal_sets=traversal_sets,
                             z_first=z[:16],
                             dt_first=dt[:16] / dt[:16],
                             save_dir=frames_dir,
@@ -612,7 +612,7 @@ class TrainerPotential(object):
                         #     self.tb_writer,
                         #     step_idx,
                         #     stat_tracker=self.stat_tracker,
-                        #     support_sets=support_sets,
+                        #     traversal_sets=traversal_sets,
                         #     recognizer=recognizer,
                         #     z_bd=z_info,
                         #     dt=dt_info,
@@ -659,18 +659,18 @@ class TrainerPotential(object):
                 if (cur_step % int(self.params.ckp_freq)) == 0 and cur_step != last_ckp_step:
                     checkpoint_dict = {
                         "iter": cur_step,
-                        "support_sets": support_sets.state_dict(),
+                        "traversal_sets": traversal_sets.state_dict(),
                         "recognizer": recognizer.state_dict(),
-                        "support_opt": support_sets_optim.state_dict(),
+                        "traversal_opt": traversal_sets_optim.state_dict(),
                         "recognizer_opt": recognizer_optim.state_dict(),
-                        "support_sched": sched_support.state_dict(),
+                        "traversal_sched": sched_support.state_dict(),
                         "recognizer_sched": sched_recon.state_dict(),
                     }
                     torch.save(checkpoint_dict, self.checkpoint)
                     last_ckp_step = cur_step
 
         # === end loop ===
-        torch.save(support_sets.state_dict(), osp.join(self.models_dir, "support_sets.pt"))
+        torch.save(traversal_sets.state_dict(), osp.join(self.models_dir, "traversal_sets.pt"))
         torch.save(
             recognizer.module.state_dict() if self.multi_gpu else recognizer.state_dict(),
             osp.join(self.models_dir, "recognizer.pt"),

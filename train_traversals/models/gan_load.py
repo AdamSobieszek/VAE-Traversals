@@ -141,6 +141,73 @@ def build_proggan(pretrained_gan_weights):
 
     return ProgGANWrapper(G)
     
+
+########################################################################################################################
+##                                                                                                                    ##
+##                                                  [ StyleGAN2 MPS ]                                                 ##
+##                                                                                                                    ##
+########################################################################################################################
+class StyleGAN2MPSWrapper(nn.Module):
+    def __init__(self, G, shift_in_w_space):
+        super(StyleGAN2MPSWrapper, self).__init__()
+        self.G = G
+        self.shift_in_w_space = shift_in_w_space
+        self.dim_z = 512
+        self.dim_w = self.dim_z
+
+    def get_w(self, z, truncation_psi=1):
+        """Return batch of w latent codes given a batch of z latent codes.
+
+        Args:
+            z (torch.Tensor) : Z-space latent code of size [batch_size, 512]
+
+        Returns:
+            w (torch.Tensor) : W-space latent code of size [batch_size, 512]
+
+        """
+        return self.G.get_latent(z, truncation_psi=truncation_psi)
+
+    def forward(self, z, shift=None):
+        """StyleGAN2 generator forward function.
+
+        Args:
+            z (torch.Tensor)     : Batch of latent codes in Z-space
+            shift (torch.Tensor) : Batch of shift vectors in Z- or W-space (based on self.shift_in_w_space)
+            latent_is_w (bool)   : Input latent code (denoted by z here) is in W-space
+
+        Returns:
+            I (torch.Tensor)     : Output images of size [batch_size, 3, resolution, resolution]
+        """
+        # The given latent codes lie on Z- or W-space, while the given shifts lie on the W-space
+        if self.shift_in_w_space:
+            #if latent_is_w:
+                # Input latent code is in W-space
+            if not isinstance(z, torch.Tensor):
+                z = torch.cat([z if shift is None else z + shift])
+            if shift is not None and not isinstance(shift, torch.Tensor):
+                shift = torch.cat([shift])
+            z = z if shift is None else z + shift
+            if z.dim() == 2:
+                z = z.unsqueeze(1).repeat(1, self.G.num_ws, 1)
+            return self.G.synthesis(z)
+            #else:
+                # Input latent code is in Z-space -- get w code first
+                #w = self.G.get_latent(z)
+                #return self.G([w if shift is None else w + shift], input_is_latent=True)[0]
+        # The given latent codes and shift vectors lie on the Z-space
+        else:
+            return self.G(torch.cat([z if shift is None else z + shift]), truncation_psi=1)
+
+
+def build_stylegan2mps(pretrained_gan_weights, resolution, shift_in_w_space=False):
+    # Build StyleGAN2 generator model
+    from models.StyleGAN2_mps.model import Generator as StyleGAN2Generator
+    G = StyleGAN2Generator(512, 0, 512, resolution, 3)
+    # Load pre-trained weights
+    G.load_state_dict(torch.load(pretrained_gan_weights, map_location=torch.device('cpu'))['g_ema'],  strict=False)
+
+    return StyleGAN2MPSWrapper(G, shift_in_w_space=shift_in_w_space)
+
 ########################################################################################################################
 ##                                                                                                                    ##
 ##                                                  [ StyleGAN2 ]                                                     ##

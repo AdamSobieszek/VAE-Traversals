@@ -189,11 +189,11 @@ def bias_act_native_homogeneous_inference(
 
     ``gain * act(x + bias) == act(gain * x + gain * bias)``.
 
-    Supplying the pre-scaled frozen bias lets ``torch.add(..., alpha=gain)``
-    combine bias addition and activation gain in one pointwise operation,
-    removing a full activation-sized multiplication. Floating-point operation
-    order differs from the reference, so outputs are numerically equivalent
-    rather than bit-identical.
+    Supplying the pre-scaled frozen bias lets us combine bias addition and
+    activation gain as ``act(x * gain + scaled_bias)``, removing a full
+    activation-sized multiplication versus ``gain * act(x + bias)``. Floating-
+    point operation order differs from the reference, so outputs are
+    numerically equivalent rather than bit-identical.
     """
     if torch.is_grad_enabled() and (
         x.requires_grad
@@ -212,11 +212,9 @@ def bias_act_native_homogeneous_inference(
         raise ValueError(f"Homogeneous path requires positive gain, got {gain}")
 
     if scaled_bias is not None:
-        x = torch.add(
-            _bias_view(x, scaled_bias, dim),
-            x,
-            alpha=gain,
-        )
+        # Prefer mul+add over torch.add(..., alpha=) — Python float alphas
+        # frequently become CPU scalar tensors and skip CUDA Graph capture.
+        x = x * gain + _bias_view(x, scaled_bias, dim)
     elif gain != 1.0:
         x = x * gain
     elif act != "linear" or clamp is not None:
@@ -225,4 +223,38 @@ def bias_act_native_homogeneous_inference(
     x = _activate_inplace(x, act, alpha)
     if clamp is not None:
         x.clamp_(-clamp, clamp)
+    return x
+
+
+def bias_act_native_compile_friendly(
+    x: torch.Tensor,
+    b: Optional[torch.Tensor] = None,
+    dim: int = 1,
+    act: str = "linear",
+    alpha: Optional[float] = None,
+    gain: Optional[float] = None,
+    clamp: Optional[float] = None,
+    *,
+    scaled_bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Out-of-place bias+act intended for Inductor / CUDA Graphs.
+
+    Avoids in-place kernels and ``torch.add(..., alpha=python_float)``. Prefer
+    ``scaled_bias = bias * gain`` for the homogeneous StyleGAN path.
+    """
+    alpha, gain, clamp = _resolve_parameters(act, alpha, gain, clamp)
+    if scaled_bias is not None:
+        x = x * gain + _bias_view(x, scaled_bias, dim)
+        x = _activate(x, act, alpha)
+    elif b is not None:
+        x = x + _bias_view(x, b, dim)
+        x = _activate(x, act, alpha)
+        if gain != 1.0:
+            x = x * gain
+    else:
+        x = _activate(x, act, alpha)
+        if gain != 1.0:
+            x = x * gain
+    if clamp is not None:
+        x = x.clamp(-clamp, clamp)
     return x

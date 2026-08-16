@@ -15,6 +15,7 @@ import torch
 from .. import custom_ops
 from .. import misc
 from . import conv2d_gradfix
+from .native_backend import get_upfirdn_impl
 
 #----------------------------------------------------------------------------
 
@@ -58,9 +59,10 @@ def _get_filter_size(f):
     assert isinstance(f, torch.Tensor) and f.ndim in [1, 2]
     fw = f.shape[-1]
     fh = f.shape[0]
-    with misc.suppress_tracer_warnings():
-        fw = int(fw)
-        fh = int(fh)
+    if not torch.compiler.is_compiling():
+        with misc.suppress_tracer_warnings():
+            fw = int(fw)
+            fh = int(fh)
     misc.assert_shape(f, [fh, fw][:f.ndim])
     assert fw >= 1 and fh >= 1
     return fw, fh
@@ -150,15 +152,25 @@ def upfirdn2d(x, f, up=1, down=1, padding=0, flip_filter=False, gain=1, impl='cu
                      (default: 0).
         flip_filter: False = convolution, True = correlation (default: False).
         gain:        Overall scaling factor for signal magnitude (default: 1).
-        impl:        Implementation to use. Can be `'ref'` or `'cuda'` (default: `'cuda'`).
+        impl:        Implementation to use. Can be `'ref'`, `'cuda'`, `'native'`,
+                     or `'auto'` (default: `'cuda'`).
+                     `'native'` selects the compile-friendly PyTorch path.
+                     `'auto'` currently prefers legacy CUDA on CUDA devices and
+                     native elsewhere; it does not yet perform shape autotuning.
 
     Returns:
         Tensor of the shape `[batch_size, num_channels, out_height, out_width]`.
     """
     assert isinstance(x, torch.Tensor)
-    assert impl in ['ref', 'cuda']
+    assert impl in ['ref', 'cuda', 'native', 'auto']
+    impl = get_upfirdn_impl(impl)
+    if impl == 'auto':
+        impl = 'cuda' if x.device.type == 'cuda' else 'native'
     if impl == 'cuda' and x.device.type == 'cuda' and _init():
         return _upfirdn2d_cuda(up=up, down=down, padding=padding, flip_filter=flip_filter, gain=gain).apply(x, f)
+    if impl == 'native':
+        from .upfirdn2d_native import upfirdn2d_native
+        return upfirdn2d_native(x, f, up=up, down=down, padding=padding, flip_filter=flip_filter, gain=gain)
     return _upfirdn2d_ref(x, f, up=up, down=down, padding=padding, flip_filter=flip_filter, gain=gain)
 
 #----------------------------------------------------------------------------

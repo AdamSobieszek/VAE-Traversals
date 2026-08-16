@@ -13,6 +13,12 @@ import torch
 #----------------------------------------------------------------------------
 
 def fma(a, b, c): # => a * b + c
+    # Prefer plain addcmul under inference / compile (custom autograd Function
+    # is a frequent Dynamo graph break). Keep the Function for training grads.
+    if not torch.is_grad_enabled() or not (
+        a.requires_grad or b.requires_grad or c.requires_grad
+    ):
+        return torch.addcmul(c, a, b)
     return _FusedMultiplyAdd.apply(a, b, c)
 
 #----------------------------------------------------------------------------

@@ -50,8 +50,14 @@ def modulated_conv2d(
 
     # Pre-normalize inputs to avoid FP16 overflow.
     if x.dtype == torch.float16 and demodulate:
-        weight = weight * (1 / np.sqrt(in_channels * kh * kw) / weight.norm(float('inf'), dim=[1,2,3], keepdim=True)) # max_Ikk
-        styles = styles / styles.norm(float('inf'), dim=1, keepdim=True) # max_I
+        weight_scale = weight.detach().abs().amax(
+            dim=[1, 2, 3], keepdim=True
+        ).clamp_min(1e-8).reciprocal()
+        style_scale = styles.detach().abs().amax(
+            dim=1, keepdim=True
+        ).clamp_min(1e-8).reciprocal()
+        weight = weight * (float(1 / np.sqrt(in_channels * kh * kw)) * weight_scale)
+        styles = styles * style_scale
 
     # Calculate per-sample weights and demodulation coefficients.
     w = None
@@ -77,8 +83,9 @@ def modulated_conv2d(
         return x
 
     # Execute as one fused op using grouped convolution.
-    with misc.suppress_tracer_warnings(): # this value will be treated as a constant
-        batch_size = int(batch_size)
+    if not torch.compiler.is_compiling():
+        with misc.suppress_tracer_warnings(): # this value will be treated as a constant
+            batch_size = int(batch_size)
     misc.assert_shape(x, [batch_size, in_channels, None, None])
     x = x.reshape(1, -1, *x.shape[2:])
     w = w.reshape(-1, in_channels, kh, kw)
@@ -503,7 +510,7 @@ class SynthesisNetwork(torch.nn.Module):
 
     def forward(self, ws, **block_kwargs):
         block_ws = []
-        with torch.autograd.profiler.record_function('split_ws'):
+        with misc.record_function('split_ws'):
             misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
             ws = ws.to(torch.float32)
             w_idx = 0

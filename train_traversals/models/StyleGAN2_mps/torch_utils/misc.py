@@ -80,6 +80,9 @@ def suppress_tracer_warnings():
 # Performs symbolic assertion when used in torch.jit.trace().
 
 def assert_shape(tensor, ref_shape):
+    # Skip under torch.compile to avoid symbolic assertion / guard churn.
+    if torch.compiler.is_compiling():
+        return
     if tensor.ndim != len(ref_shape):
         raise AssertionError(f'Wrong number of dimensions: got {tensor.ndim}, expected {len(ref_shape)}')
     for idx, (size, ref_size) in enumerate(zip(tensor.shape, ref_shape)):
@@ -96,13 +99,27 @@ def assert_shape(tensor, ref_shape):
 
 #----------------------------------------------------------------------------
 # Function decorator that calls torch.autograd.profiler.record_function().
+# No-op while torch.compile is tracing to avoid Dynamo graph breaks.
 
 def profiled_function(fn):
     def decorator(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return fn(*args, **kwargs)
         with torch.autograd.profiler.record_function(fn.__name__):
             return fn(*args, **kwargs)
     decorator.__name__ = fn.__name__
+    decorator.__qualname__ = getattr(fn, '__qualname__', fn.__name__)
     return decorator
+
+
+@contextlib.contextmanager
+def record_function(name: str):
+    """Profiler scope that is skipped under torch.compile tracing."""
+    if torch.compiler.is_compiling():
+        yield
+        return
+    with torch.autograd.profiler.record_function(name):
+        yield
 
 #----------------------------------------------------------------------------
 # Sampler for torch.utils.data.DataLoader that loops over the dataset

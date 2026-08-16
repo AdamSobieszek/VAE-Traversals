@@ -15,19 +15,22 @@ import dnnlib
 
 from .. import custom_ops
 from .. import misc
+from .native_backend import get_bias_act_impl
 
 #----------------------------------------------------------------------------
 
+# Python floats (not numpy scalars) keep torch.compile guards stable.
+_SQRT2 = float(np.sqrt(2))
 activation_funcs = {
     'linear':   dnnlib.EasyDict(func=lambda x, **_:         x,                                          def_alpha=0,    def_gain=1,             cuda_idx=1, ref='',  has_2nd_grad=False),
-    'relu':     dnnlib.EasyDict(func=lambda x, **_:         torch.nn.functional.relu(x),                def_alpha=0,    def_gain=np.sqrt(2),    cuda_idx=2, ref='y', has_2nd_grad=False),
-    'lrelu':    dnnlib.EasyDict(func=lambda x, alpha, **_:  torch.nn.functional.leaky_relu(x, alpha),   def_alpha=0.2,  def_gain=np.sqrt(2),    cuda_idx=3, ref='y', has_2nd_grad=False),
+    'relu':     dnnlib.EasyDict(func=lambda x, **_:         torch.nn.functional.relu(x),                def_alpha=0,    def_gain=_SQRT2,        cuda_idx=2, ref='y', has_2nd_grad=False),
+    'lrelu':    dnnlib.EasyDict(func=lambda x, alpha, **_:  torch.nn.functional.leaky_relu(x, alpha),   def_alpha=0.2,  def_gain=_SQRT2,        cuda_idx=3, ref='y', has_2nd_grad=False),
     'tanh':     dnnlib.EasyDict(func=lambda x, **_:         torch.tanh(x),                              def_alpha=0,    def_gain=1,             cuda_idx=4, ref='y', has_2nd_grad=True),
     'sigmoid':  dnnlib.EasyDict(func=lambda x, **_:         torch.sigmoid(x),                           def_alpha=0,    def_gain=1,             cuda_idx=5, ref='y', has_2nd_grad=True),
     'elu':      dnnlib.EasyDict(func=lambda x, **_:         torch.nn.functional.elu(x),                 def_alpha=0,    def_gain=1,             cuda_idx=6, ref='y', has_2nd_grad=True),
     'selu':     dnnlib.EasyDict(func=lambda x, **_:         torch.nn.functional.selu(x),                def_alpha=0,    def_gain=1,             cuda_idx=7, ref='y', has_2nd_grad=True),
     'softplus': dnnlib.EasyDict(func=lambda x, **_:         torch.nn.functional.softplus(x),            def_alpha=0,    def_gain=1,             cuda_idx=8, ref='y', has_2nd_grad=True),
-    'swish':    dnnlib.EasyDict(func=lambda x, **_:         torch.sigmoid(x) * x,                       def_alpha=0,    def_gain=np.sqrt(2),    cuda_idx=9, ref='x', has_2nd_grad=True),
+    'swish':    dnnlib.EasyDict(func=lambda x, **_:         torch.sigmoid(x) * x,                       def_alpha=0,    def_gain=_SQRT2,        cuda_idx=9, ref='x', has_2nd_grad=True),
 }
 
 #----------------------------------------------------------------------------
@@ -74,15 +77,24 @@ def bias_act(x, b=None, dim=1, act='linear', alpha=None, gain=None, clamp=None, 
                 If unsure, consider specifying 1.
         clamp:  Clamp the output values to `[-clamp, +clamp]`, or `None` to disable
                 the clamping (default).
-        impl:   Name of the implementation to use. Can be `"ref"` or `"cuda"` (default).
+        impl:   Name of the implementation to use. Can be `"ref"`, `"cuda"`, `"native"`,
+                or `"auto"` (default: `"cuda"`). `"native"` selects the compile-friendly
+                pure-PyTorch path. `"auto"` currently prefers legacy CUDA on CUDA
+                devices and native elsewhere.
 
     Returns:
         Tensor of the same shape and datatype as `x`.
     """
     assert isinstance(x, torch.Tensor)
-    assert impl in ['ref', 'cuda']
+    assert impl in ['ref', 'cuda', 'native', 'auto']
+    impl = get_bias_act_impl(impl)
+    if impl == 'auto':
+        impl = 'cuda' if x.device.type == 'cuda' else 'native'
     if impl == 'cuda' and x.device.type == 'cuda' and _init():
         return _bias_act_cuda(dim=dim, act=act, alpha=alpha, gain=gain, clamp=clamp).apply(x, b)
+    if impl == 'native':
+        from .bias_act_native import bias_act_native
+        return bias_act_native(x=x, b=b, dim=dim, act=act, alpha=alpha, gain=gain, clamp=clamp)
     return _bias_act_ref(x=x, b=b, dim=dim, act=act, alpha=alpha, gain=gain, clamp=clamp)
 
 #----------------------------------------------------------------------------

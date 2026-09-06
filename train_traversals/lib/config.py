@@ -59,7 +59,9 @@ GAN_WEIGHTS = {
         'sha256sum': '99f345cc67d88cc5292fed0f8b458192d57eccb0ec291145b5123de5015d0608',
         'weights': {
             256: 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-256-550000.pt',
-            1024: 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-config-f.pt'
+            1024: 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-config-f.pt',
+            "early_output": 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-config-f-early-output.pt',
+            "early_output_128": 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-config-f-early-output-128.pt',
         }
     },
     'GAT': {

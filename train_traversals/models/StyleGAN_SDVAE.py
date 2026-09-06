@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import io
 import json
 import math
 import os
@@ -23,7 +24,7 @@ import pickle
 import sys
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -54,20 +55,15 @@ from models.stylegan_feature_codec import (
 # ---------------------------------------------------------------------------
 
 _TRAIN_TRAVERSALS_ROOT = osp.dirname(osp.dirname(osp.abspath(__file__)))
-DEFAULT_GAN_WEIGHTS = osp.join(
-    _TRAIN_TRAVERSALS_ROOT,
-    "models",
-    "pretrained",
-    "generators",
-    "StyleGAN2",
-    "stylegan2-ffhq-config-f.pt",
-)
+DEFAULT_GAN_WEIGHTS = osp.join("/Users/adamsobieszek/PycharmProjects/ManipyCore/artifacts/generative_models/stylegan2-ffhq-1024x1024.pkl")
 STOP_RESOLUTION = 256
 GAN_RESOLUTION = 1024
 Z_DIM = 512
 W_DIM = 512
 PREFIX_NUM_WS = 14
 FULL_NUM_WS = 18
+EQREG_SCALE_STEPS = tuple(range(8, 32))
+EQREG_VAL_SCALES = (0.25, 0.5, 0.75)
 
 
 def _convert_rosinality_stylegan2_state_dict(
@@ -565,6 +561,119 @@ def random_crop_pair(*tensors: torch.Tensor, crop: int) -> Tuple[torch.Tensor, .
     return tuple(t[:, :, top:top + crop, left:left + crop] for t in tensors)
 
 
+def resize_spatial(tensor: torch.Tensor, scale: float) -> torch.Tensor:
+    """Apply the isotropic resize used by the checked-in EQ-VAE trainer."""
+    if not 0.0 < scale <= 1.0:
+        raise ValueError(f"scale must be in (0, 1], got {scale}")
+    height, width = tensor.shape[-2:]
+    size = (max(1, int(height * scale)), max(1, int(width * scale)))
+    return F.interpolate(tensor, size=size, mode="bilinear", align_corners=False)
+
+
+def sample_eqreg_scale() -> float:
+    """Sample one batch-wide scale uniformly from {8/32, ..., 31/32}."""
+    index = int(torch.randint(0, len(EQREG_SCALE_STEPS), (1,)).item())
+    return EQREG_SCALE_STEPS[index] / 32.0
+
+
+def is_eqreg_step(step: int, every: int) -> bool:
+    return every > 0 and step % every == 0
+
+
+def lazy_eqreg_gain(every: int, weight: float) -> float:
+    """Unbiased lazy-regularization multiplier for an every-N-step loss."""
+    return float(every) * float(weight)
+
+
+def eqreg_reconstruction_loss(
+    codec: PCAResidualFeatureCodec,
+    features: torch.Tensor,
+    codec_out: Dict[str, object],
+    scale: float,
+    saliency: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Implicit EQ-VAE loss L(Tx, D(T(E(x)))) without duplicate latent priors."""
+    z = codec_out["z"]
+    z_pca = codec_out["z_pca"]
+    posterior = codec_out["posterior"]
+    assert isinstance(z, torch.Tensor)
+    assert isinstance(z_pca, torch.Tensor)
+
+    target_eq = resize_spatial(features, scale)
+    z_eq = resize_spatial(z, scale)
+    z_pca_eq = resize_spatial(z_pca, scale)
+    saliency_eq = resize_spatial(saliency, scale) if saliency is not None else None
+    recon_eq, _ = codec.decode(z_eq)
+    eq_loss, eq_stats = feature_codec_loss(
+        recon_eq,
+        target_eq,
+        posterior,
+        codec.pca,
+        z=None,
+        z_pca=z_pca_eq,
+        mean_res=None,
+        kl_weight=0.0,
+        deterministic=True,
+        return_stats_tensors=True,
+        saliency=saliency_eq if saliency_eq is not None else False,
+    )
+    tensors = {
+        "target": target_eq,
+        "z": z_eq,
+        "z_pca": z_pca_eq,
+        "recon": recon_eq,
+    }
+    if saliency_eq is not None:
+        tensors["saliency"] = saliency_eq
+    return eq_loss, eq_stats, tensors
+
+
+@torch.no_grad()
+def eqreg_validation_metrics(
+    codec: PCAResidualFeatureCodec,
+    features: torch.Tensor,
+    scales: Sequence[float] = EQREG_VAL_SCALES,
+) -> Dict[str, float]:
+    """Paper-style deterministic scale-equivariance and reconstruction metrics."""
+    if not scales:
+        raise ValueError("At least one validation scale is required")
+    was_training = codec.training
+    codec.eval()
+    try:
+        base = codec(features, sample_posterior=False, deterministic=True)
+        base_z = base["z"]
+        base_z_pca = base["z_pca"]
+        assert isinstance(base_z, torch.Tensor)
+        assert isinstance(base_z_pca, torch.Tensor)
+
+        errors: List[torch.Tensor] = []
+        nmses: List[torch.Tensor] = []
+        for scale in scales:
+            target = resize_spatial(features, float(scale))
+            transformed_z = resize_spatial(base_z, float(scale))
+            transformed_z_pca = resize_spatial(base_z_pca, float(scale))
+            encoded_target, _posterior, _z_pca, _mean_res = codec.encode(
+                target, sample_posterior=False, deterministic=True
+            )
+            dims = tuple(range(1, transformed_z.ndim))
+            numerator = (transformed_z - encoded_target).square().sum(dim=dims)
+            denominator = encoded_target.square().sum(dim=dims).clamp_min(1e-8)
+            errors.append((numerator / denominator).mean())
+
+            recon, _ = codec.decode(transformed_z)
+            mse = F.mse_loss(recon, target)
+            pca_mse = codec.pca.reconstruction_mse(
+                target, z_pca=transformed_z_pca
+            ).clamp_min(1e-8)
+            nmses.append(mse / pca_mse)
+
+        values = torch.stack((torch.stack(errors).mean(), torch.stack(nmses).mean()))
+        eq_error, eq_nmse = values.cpu().tolist()
+        return {"eq_scale_error": eq_error, "eq_scale_nmse": eq_nmse}
+    finally:
+        codec.train(was_training)
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -608,6 +717,9 @@ class TrainConfig:
     max_kl_weight: float = 1e-3
     free_bits: float = 0.0
     ema_decay: float = 0.999
+    # Lazy EQ-VAE scale regularization
+    eqreg_every: int = 0
+    eqreg_weight: float = 1.0
     # Phase 2
     phase: str = "feature"  # feature | finetune
     lpips_weight: float = 0.5
@@ -728,6 +840,11 @@ def try_lpips(device: torch.device, spatial: bool = False):
 # ---------------------------------------------------------------------------
 
 def train(cfg: TrainConfig) -> PCAResidualFeatureCodec:
+    if cfg.eqreg_every < 0:
+        raise ValueError(f"eqreg_every must be >= 0, got {cfg.eqreg_every}")
+    if cfg.eqreg_weight < 0.0 or not math.isfinite(cfg.eqreg_weight):
+        raise ValueError(f"eqreg_weight must be finite and >= 0, got {cfg.eqreg_weight}")
+
     device = select_device()
     set_seed(cfg.seed, device)
     use_amp = bool(cfg.amp and device.type == "cuda")
@@ -742,6 +859,14 @@ def train(cfg: TrainConfig) -> PCAResidualFeatureCodec:
     print(f"#. Device: {device}")
     print(f"#. Output: {cfg.out_dir}")
     print(f"#. Phase: {cfg.phase}")
+    if cfg.eqreg_every > 0:
+        print(
+            f"#. EQ-VAE: every {cfg.eqreg_every} step(s), "
+            f"weight={cfg.eqreg_weight:g}, lazy gain="
+            f"{lazy_eqreg_gain(cfg.eqreg_every, cfg.eqreg_weight):g}"
+        )
+    else:
+        print("#. EQ-VAE: disabled")
 
     print("#. Building StyleGAN feature extractor...")
     keep_tail = phase2 or (cfg.plot_every > 0 and not cfg.skip_gan_load)
@@ -862,6 +987,8 @@ def train(cfg: TrainConfig) -> PCAResidualFeatureCodec:
     last_log_time = time.perf_counter()
     running: Dict[str, torch.Tensor] = {}
     running_updates = 0
+    eq_running: Dict[str, torch.Tensor] = {}
+    eq_running_updates = 0
     best_nmse = float("inf")
     cached_feats: Optional[torch.Tensor] = None
     cached_pack: Dict[str, Optional[torch.Tensor]] = {
@@ -932,6 +1059,7 @@ def train(cfg: TrainConfig) -> PCAResidualFeatureCodec:
         except TypeError:
             amp_ctx = autocast(enabled=use_amp)
 
+        eq_step_stats: Optional[Dict[str, torch.Tensor]] = None
         with amp_ctx:
             out = codec(
                 x_in,
@@ -948,6 +1076,22 @@ def train(cfg: TrainConfig) -> PCAResidualFeatureCodec:
                 return_stats_tensors=True,
                 saliency=saliency_in if saliency_in is not None else False,
             )
+
+            if is_eqreg_step(step, cfg.eqreg_every):
+                eq_scale = sample_eqreg_scale()
+                eq_loss, eq_stats, _eq_tensors = eqreg_reconstruction_loss(
+                    codec, x_in, out, eq_scale, saliency=saliency_in
+                )
+                eq_applied = lazy_eqreg_gain(
+                    cfg.eqreg_every, cfg.eqreg_weight
+                ) * eq_loss
+                loss = loss + eq_applied
+                eq_step_stats = {
+                    "loss_raw": eq_loss.detach(),
+                    "applied": eq_applied.detach(),
+                    "nmse": eq_stats["nmse"],
+                    "scale": loss.new_tensor(eq_scale),
+                }
 
             if (
                 phase2
@@ -993,6 +1137,10 @@ def train(cfg: TrainConfig) -> PCAResidualFeatureCodec:
                     loss = loss + cfg.lpips_weight * perc
                     stats["lpips"] = perc.detach()
 
+            # The compound helper reports its pre-auxiliary value; logs and
+            # checkpoints should reflect the actual optimized objective.
+            stats["loss"] = loss.detach()
+
         if use_amp:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -1009,6 +1157,10 @@ def train(cfg: TrainConfig) -> PCAResidualFeatureCodec:
             assert isinstance(v, torch.Tensor)
             running[k] = running.get(k, torch.zeros_like(v)) + v
         running_updates += 1
+        if eq_step_stats is not None:
+            for k, v in eq_step_stats.items():
+                eq_running[k] = eq_running.get(k, torch.zeros_like(v)) + v
+            eq_running_updates += 1
 
         if step % cfg.log_every == 0 or step == 1:
             keys = ("loss", "mse", "nmse", "rel_improve", "pca_mse", "kl_per_latent")
@@ -1020,6 +1172,20 @@ def train(cfg: TrainConfig) -> PCAResidualFeatureCodec:
             logged_updates = running_updates
             running = {}
             running_updates = 0
+            eq_suffix = ""
+            if eq_running_updates > 0:
+                eq_keys = ("loss_raw", "applied", "nmse", "scale")
+                eq_values = torch.stack([
+                    eq_running[k] / eq_running_updates for k in eq_keys
+                ]).cpu().tolist()
+                eq_avg = dict(zip(eq_keys, eq_values))
+                eq_suffix = (
+                    f"  eq={eq_avg['loss_raw']:.4f}  "
+                    f"eq_applied={eq_avg['applied']:.4f}  "
+                    f"eq_nmse={eq_avg['nmse']:.4f}  eq_s={eq_avg['scale']:.3f}"
+                )
+                eq_running = {}
+                eq_running_updates = 0
             now = time.perf_counter()
             interval = now - last_log_time
             last_log_time = now
@@ -1031,6 +1197,7 @@ def train(cfg: TrainConfig) -> PCAResidualFeatureCodec:
                 f"Δpca={avg['rel_improve']:+.3%}  kl/lat={avg['kl_per_latent']:.5f}  "
                 f"det={int(deterministic)}  lr={lr:.2e}  "
                 f"rate={steps_per_second:.2f} step/s  t={elapsed:.0f}s"
+                f"{eq_suffix}"
             )
 
         if cfg.val_every > 0 and (step % cfg.val_every == 0 or step == 1):
@@ -1039,9 +1206,18 @@ def train(cfg: TrainConfig) -> PCAResidualFeatureCodec:
                 vf = val_feats
                 vout = ema.ema(vf, sample_posterior=False, deterministic=True)
                 vm = eval_metrics(vout["recon"], vf, codec.pca, vout["posterior"])
+                if cfg.eqreg_every > 0:
+                    vm.update(eqreg_validation_metrics(ema.ema, vf))
+            eq_val_suffix = ""
+            if "eq_scale_error" in vm:
+                eq_val_suffix = (
+                    f"  eq_err={vm['eq_scale_error']:.5f}  "
+                    f"eq_nmse={vm['eq_scale_nmse']:.4f}"
+                )
             print(
                 f"  \\__VAL ema  mse={vm['mse']:.5f}  pca_mse={vm['pca_mse']:.5f}  "
-                f"nmse={vm['nmse']:.4f}  Δpca={vm['rel_improve']:+.3%}  cos={vm['cosine']:.4f}"
+                f"nmse={vm['nmse']:.4f}  Δpca={vm['rel_improve']:+.3%}  "
+                f"cos={vm['cosine']:.4f}{eq_val_suffix}"
             )
             with open(osp.join(cfg.out_dir, "val_metrics.jsonl"), "a") as f:
                 f.write(json.dumps({"step": step, **vm}) + "\n")
@@ -1123,18 +1299,91 @@ def smoke_test_pca_and_codec() -> None:
         assert float(diff) < 1e-6, f"Zero-init residual should equal PCA, got {diff}"
     print(f"[smoke] PCA OK  mse={float(mse):.5f}  zero-init Δ={float(diff):.2e}  params={codec.num_parameters():,}")
 
-    # One train step
+    # Short synthetic feature-phase run with lazy EQ regularization.
+    assert not is_eqreg_step(1, 0)
+    assert is_eqreg_step(1, 1)
+    assert not is_eqreg_step(3, 4)
+    assert is_eqreg_step(4, 4)
+    assert lazy_eqreg_gain(4, 0.25) == 1.0
+
     opt = torch.optim.AdamW([p for p in codec.parameters() if p.requires_grad], lr=1e-3)
+    ema = ModelEMA(codec, decay=0.9)
     codec.train()
-    out = codec(x, sample_posterior=False, deterministic=True)
-    loss, stats = feature_codec_loss(
-        out["recon"], x, out["posterior"], pca,
-        z=out["z"], z_pca=out["z_pca"], mean_res=out["mean_res"],
-        kl_weight=0.0, deterministic=True,
+    eq_stats: Dict[str, torch.Tensor] = {}
+    smoke_saliency = torch.ones(1, 1, H, W)
+    for step in range(1, 3):
+        opt.zero_grad(set_to_none=True)
+        out = codec(x, sample_posterior=False, deterministic=True)
+        loss, _stats = feature_codec_loss(
+            out["recon"], x, out["posterior"], pca,
+            z=out["z"], z_pca=out["z_pca"], mean_res=out["mean_res"],
+            kl_weight=0.0, deterministic=True,
+        )
+        if is_eqreg_step(step, 2):
+            eq_loss, eq_stats, eq_tensors = eqreg_reconstruction_loss(
+                codec, x, out, scale=0.5, saliency=smoke_saliency
+            )
+            assert eq_tensors["target"].shape[-2:] == (32, 32)
+            assert eq_tensors["z"].shape[-2:] == (32, 32)
+            assert eq_tensors["z_pca"].shape[-2:] == (32, 32)
+            assert eq_tensors["recon"].shape == eq_tensors["target"].shape
+            assert eq_tensors["saliency"].shape[-2:] == (32, 32)
+            assert torch.isfinite(eq_loss)
+            loss = loss + lazy_eqreg_gain(2, 1.0) * eq_loss
+        loss.backward()
+        if is_eqreg_step(step, 2):
+            encoder_has_grad = any(
+                p.grad is not None and torch.isfinite(p.grad).all() and bool(p.grad.abs().sum() > 0)
+                for p in codec.encoder.parameters()
+            )
+            decoder_has_grad = any(
+                p.grad is not None and torch.isfinite(p.grad).all() and bool(p.grad.abs().sum() > 0)
+                for p in codec.decoder.parameters()
+            )
+            assert encoder_has_grad and decoder_has_grad
+        opt.step()
+        ema.update(codec)
+
+    ema.ema.eval()
+    eq_vm = eqreg_validation_metrics(ema.ema, x[:1])
+    assert all(math.isfinite(value) for value in eq_vm.values())
+
+    checkpoint_buffer = io.BytesIO()
+    torch.save({
+        "step": 2,
+        "codec": codec.state_dict(),
+        "ema": ema.ema.state_dict(),
+        "optimizer": opt.state_dict(),
+        "config": asdict(TrainConfig(eqreg_every=2, eqreg_weight=1.0)),
+        "metrics": eq_vm,
+    }, checkpoint_buffer)
+    checkpoint_buffer.seek(0)
+    try:
+        restored = torch.load(checkpoint_buffer, map_location=device, weights_only=False)
+    except TypeError:  # Older PyTorch releases do not expose weights_only.
+        restored = torch.load(checkpoint_buffer, map_location=device)
+    assert restored["config"]["eqreg_every"] == 2
+    assert restored["metrics"].keys() == eq_vm.keys()
+
+    # Phase-2 default: a frozen encoder still permits decoder-only EQ updates.
+    codec.zero_grad(set_to_none=True)
+    for parameter in codec.encoder.parameters():
+        parameter.requires_grad_(False)
+    codec.enc_gate.requires_grad_(False)
+    frozen_out = codec(x, sample_posterior=False, deterministic=True)
+    frozen_eq_loss, _frozen_stats, _frozen_tensors = eqreg_reconstruction_loss(
+        codec, x, frozen_out, scale=0.5
     )
-    loss.backward()
-    opt.step()
-    print(f"[smoke] Train step OK  loss={stats['loss']:.4f}  nmse={stats['nmse']:.4f}")
+    frozen_eq_loss.backward()
+    assert all(parameter.grad is None for parameter in codec.encoder.parameters())
+    assert any(
+        parameter.grad is not None and bool(parameter.grad.abs().sum() > 0)
+        for parameter in codec.decoder.parameters()
+    )
+    print(
+        f"[smoke] EQ train OK  loss={float(loss.detach()):.4f}  "
+        f"eq_nmse={float(eq_stats['nmse']):.4f}  eq_err={eq_vm['eq_scale_error']:.5f}"
+    )
 
 
 def smoke_test_extractor_layout() -> None:
@@ -1210,6 +1459,18 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-kl-weight", type=float, default=1e-4)
     p.add_argument("--free-bits", type=float, default=0.0)
     p.add_argument("--ema-decay", type=float, default=0.995)
+    p.add_argument(
+        "--eqreg-every",
+        type=int,
+        default=0,
+        help="apply lazy zoom EQ-VAE regularization every N steps (0 disables)",
+    )
+    p.add_argument(
+        "--eqreg-weight",
+        type=float,
+        default=1.0,
+        help="EQ-VAE objective weight before lazy interval compensation",
+    )
     p.add_argument("--phase", type=str, default="feature", choices=("feature", "finetune"))
     p.add_argument("--lpips-weight", type=float, default=0.5)
     p.add_argument("--rgb-weight", type=float, default=0.1)
@@ -1266,6 +1527,8 @@ def main() -> None:
         max_kl_weight=args.max_kl_weight,
         free_bits=args.free_bits,
         ema_decay=args.ema_decay,
+        eqreg_every=args.eqreg_every,
+        eqreg_weight=args.eqreg_weight,
         phase=args.phase,
         lpips_weight=args.lpips_weight,
         rgb_weight=args.rgb_weight,

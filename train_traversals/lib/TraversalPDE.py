@@ -213,7 +213,7 @@ class TraversalPDE(nn.Module):
         st = PDEState(
             f=self.F,
             z=z_bkd,
-            direction=torch.ones(1,),
+            direction=1,
             need_next=self._needs_next,
             dt_value=dt,
             **self._pde_cfg,
@@ -237,7 +237,7 @@ class TraversalPDE(nn.Module):
                     (latent_noise * step_delta).sum(dim=-1, keepdim=True) / step_delta_sq_norms.clamp_min(1e-12)
                 )
                 latent_noise = latent_noise / latent_noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12)
-                latent_noise = latent_noise * (step_delta_norms.clamp_min(step_delta_norms.mean().item()/3) / 5.0)
+                latent_noise = latent_noise * (step_delta_norms / 5.0)
             x_next_noisy = x_next + latent_noise
         else:
             x_next_noisy = x_next

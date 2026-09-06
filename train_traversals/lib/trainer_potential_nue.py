@@ -154,8 +154,8 @@ class TrainerPotential(object):
     @torch.no_grad()
     def sample_t_idx(self, B: int, target_step: int) -> torch.Tensor:
         randomize = bool(getattr(self.params, "randomize_target_step", True))
-        if randomize and target_step > 2:
-            return torch.randint(2, target_step, (B, 1), device=self.device, dtype=torch.long)
+        if randomize and target_step > 1:
+            return torch.randint(0, target_step-np.random.randint(0, target_step-3), (B, 1), device=self.device, dtype=torch.long)
         return torch.full((B, 1), int(target_step), device=self.device, dtype=torch.long)
 
     def gan_recognizer_context(self):
@@ -167,6 +167,24 @@ class TrainerPotential(object):
         if not self.use_cuda:
             return nullcontext()
         return torch.amp.autocast(device_type=self.device.type, enabled=False)
+
+    def _generator_module(self, generator):
+        return generator.module if hasattr(generator, "module") else generator
+
+    def _maybe_prepare_generator_runtime(self, generator):
+        """Prepare the generator's synthesis-only compiled runtime on-device."""
+        module = self._generator_module(generator)
+        if not hasattr(module, "prepare_runtime"):
+            return
+        if not getattr(module, "compile_enabled", False):
+            return
+        packed = int(self.params.batch_size) * int(self.params.num_traversal_sets)
+        print(
+            f"#. Compile and warm generator synthesis graphs "
+            f"(mixed_precision={self.mixed_precision}, warmup batch={packed})"
+        )
+        warmup_z = sample_z(packed, module, self.params, self.device)
+        module.prepare_runtime(warmup_z)
 
     # ------------------------ checkpoint utils ------------------------
     def get_starting_iteration(self, traversal_sets, recognizer,
@@ -209,7 +227,7 @@ class TrainerPotential(object):
 
     # ------------------------ optim/sched ------------------------
     def init_optimizers(self, traversal_sets, recognizer, acc_steps: int):
-        traversal_set_wd = float(getattr(self.params, "traversal_set_wd", 0.1))
+        traversal_set_wd = float(getattr(self.params, "traversal_set_wd", 0.01))
         recognizer_wd = float(getattr(self.params, "recognizer_wd", 0.01))
         betas = tuple(getattr(self.params, "adam_betas", (0.9, 0.999)))
         eps = float(getattr(self.params, "adam_eps", 1e-8))
@@ -339,7 +357,7 @@ class TrainerPotential(object):
 
 
         DO_ANTISYMMETRIC_LOSS = True # TODO: Replace with global flag
-        if DO_ANTISYMMETRIC_LOSS and t_index[0].item() > 1:
+        if DO_ANTISYMMETRIC_LOSS:
             def uv(a,b,with_g=False, sign=1):
                 "Whitened coordinates (u,v*):=(z^*-v, z+v)"
                 with torch.no_grad() if not with_g else torch.enable_grad():
@@ -347,14 +365,19 @@ class TrainerPotential(object):
 
             with self.gan_recognizer_context():
                 logits0 = recognizer(*uv(img0, img1, with_g=False, sign=1))[0] - recognizer(*uv(img0, img1, with_g=False, sign=-1))[0]
-
                 logits = recognizer(*uv(img1, img2, with_g=True, sign=1))[0] - recognizer(*uv(img1, img2, with_g=True, sign=-1))[0]   # [B*K, K]
                 
 
             with self.fp32_context():
+                loss0 = torch.nn.functional.cross_entropy(logits0.float(), targets, reduction="none")  # [B*K]
+                # if t_index == 0, then img0==img1, so we mask-out the loss from this invalid classification case
+                mask0 = (t_index != 0).expand(B, K).reshape(-1).to(loss0.dtype)
+
+                loss0 = (loss0 * mask0).sum() / mask0.sum().clamp_min(1)
+
                 cls_loss = (
                     self.cross_entropy(logits.float(), targets)
-                    + self.cross_entropy(logits0.float(), targets)
+                    + loss0
                 )
         else:
             logits0 = torch.zeros(B*K, K, device=self.device, dtype=torch.float32)
@@ -378,7 +401,7 @@ class TrainerPotential(object):
         if float(self.params.lambda_cls) != 0.0:
             cls_backward_loss.backward()
             if lat2_bridge.grad is None:
-                raise RuntimeError("GAT+Recognizer loss did not produce a gradient for lat2_bridge.")
+                raise RuntimeError("Generator+Recognizer loss did not produce a gradient for lat2_bridge.")
             bridge_grad = lat2_bridge.grad.detach().to(dtype=lat2_for_gen.dtype)
         else:
             bridge_grad = torch.zeros_like(lat2_for_gen)
@@ -423,7 +446,7 @@ class TrainerPotential(object):
     def train(self, generator, traversal_sets, recognizer):
         # runtime toggles (defaults match your current script)
         enable_analytics = bool(getattr(self.params, "enable_analytics", True))
-        enable_histograms = False #bool(getattr(self.params, "enable_histograms", True))
+        enable_histograms = bool(getattr(self.params, "enable_histograms", False))
         enable_figures = bool(getattr(self.params, "enable_figures", True))
         enable_images = bool(getattr(self.params, "enable_images", True))
         save_checkpoints = bool(getattr(self.params, "save_checkpoints", True))
@@ -438,6 +461,8 @@ class TrainerPotential(object):
         for module in (generator, recognizer):
             if hasattr(module, "set_mixed_precision"):
                 module.set_mixed_precision(self.mixed_precision)
+
+        self._maybe_prepare_generator_runtime(generator)
 
         if self.multi_gpu:
             print(f"#. Parallelize G, R over {torch.cuda.device_count()} GPUs...")
@@ -476,13 +501,13 @@ class TrainerPotential(object):
 
         print(f"#. Start training from micro-step {starting_micro}")
         print(f"#. Training loop: {starting_micro} to {self.params.max_iter}")
-        print(f"#. GAT+Recognizer precision: {self.mixed_precision}")
+        print(f"#. Generator+Recognizer precision: {self.mixed_precision}")
 
         last_ckp_step = None  # avoid redundant saves
+        iter_t0 = time.time()
 
         for micro_idx, iteration in enumerate(range(starting_micro, int(self.params.max_iter) + 1), start=1):
-            iter_t0 = time.time()
-
+            # Boolean flags
             is_boundary = (micro_idx % acc_steps == 0) or (iteration == int(self.params.max_iter))
             step_idx = int(self.stat_tracker.global_opt_step)
             do_log = bool(self.tensorboard)
@@ -639,6 +664,7 @@ class TrainerPotential(object):
                 elapsed_time = time.time() - t0
                 mean_step_time = self.stat_tracker.mean_step_time()
                 eta = (total_opt_steps - self.stat_tracker.global_opt_step) * mean_step_time
+                iter_t0 = time.time()
 
                 self.stat_tracker.finalize_step(
                     step_idx=self.stat_tracker.global_opt_step,

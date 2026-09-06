@@ -8,3 +8,9 @@ from .config import GAN_RESOLUTIONS, GAN_WEIGHTS, RECONSTRUCTOR_TYPES, BIGGAN_CL
 from .TraversalPDE import TraversalPDE
 from .recognizer import Recognizer
 from .trainer_potential_nue import TrainerPotential
+from .aux import PathImages
+from .evaluation.archface.arcface import IDComparator
+from .evaluation.hopenet.hopenet import Hopenet
+from .evaluation.sfd.sfd_detector import SFDDetector
+from .evaluation.au_detector.AU_detector import AUdetector
+from .evaluation.celeba_attributes.celeba_attr_predictor import celeba_attr_predictor

@@ -15,12 +15,18 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+torch.set_float32_matmul_precision('high')
 
 from lib import *  # brings in GAN_WEIGHTS, GAN_RESOLUTIONS, TraversalPDE, etc.
 from models.gan_load import (
-    build_biggan, build_proggan, build_sngan, build_gat,
+    build_biggan,
+    build_proggan,
+    build_sngan,
+    build_gat,
+    build_stylegan2_early_output,
+    build_stylegan2mps,
 )
-from lib.aux import choose_device
+from lib.aux import (choose_device, sample_z)
 # ------------------
 # Helpers
 # ------------------
@@ -28,15 +34,6 @@ from lib.aux import choose_device
 class ModelArgs:
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
-
-def sample_z(batch_size, dim_z, device, truncation=None):
-    """Sample latent z with optional truncation."""
-    if truncation is None or truncation == 1.0:
-        return torch.randn(batch_size, dim_z, device=device)
-    else:
-        from scipy.stats import truncnorm
-        z_np = truncnorm.rvs(-truncation, truncation, size=(batch_size, dim_z))
-        return torch.from_numpy(z_np).to(device=device, dtype=torch.float32)
 
 
 def resolve_gat_checkpoint(exp_args, script_dir):
@@ -78,13 +75,33 @@ def build_gan(exp_args, device, script_dir):
             model_name=exp_args.__dict__.get('gat_model', '') or gan_cfg.get('model'),
             resolution=resolution,
             vae_variant=exp_args.__dict__.get('vae_variant', None) or gan_cfg.get('vae_variant', 'ema'),
-            truncation_psi=float(exp_args.__dict__.get('truncation_psi', 0.8)),
+            truncation_psi=float(exp_args.__dict__.get('truncation_psi', 0.2)),
             mixed_precision=exp_args.__dict__.get('mixed_precision', 'bf16'),
             load_vae=True,
         )
     # StyleGAN2
     elif gan_type == 'StyleGAN2':
-        raise RuntimeError("StyleGAN2 pair generation is not available in the current gan_load.py.")
+        early_output = exp_args.__dict__.get('early_output', False)
+        compile_enabled = exp_args.__dict__.get('compile', False)
+        stylegan2_resolution = exp_args.__dict__.get('stylegan2_resolution', 1024)
+        weight_key = 'early_output' if early_output else stylegan2_resolution
+        stylegan_builder_kwargs = dict(
+            pretrained_gan_weights=GAN_WEIGHTS[gan_type]['weights'][weight_key],
+            shift_in_w_space=exp_args.__dict__.get('shift_in_w_space', False),
+            compile=compile_enabled,
+            compile_mode=exp_args.__dict__.get('compile_mode', 'default'),
+            use_optimized=compile_enabled and (
+                early_output or not exp_args.__dict__.get('no_optimized_synthesis', False)
+            ),
+            mixed_precision=exp_args.__dict__.get('mixed_precision', 'bf16'),
+        )
+        if early_output:
+            G = build_stylegan2_early_output(**stylegan_builder_kwargs)
+        else:
+            G = build_stylegan2mps(
+                resolution=stylegan2_resolution,
+                **stylegan_builder_kwargs,
+            )
     # SNGAN family
     else:
         G = build_sngan(
@@ -172,7 +189,6 @@ def robust_load_waves(S: nn.Module, ckpt):
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description='Generate paired images for VP metric')
     p.add_argument('--exp', type=str, required=True, help="experiment dir (created by train.py)")
-    p.add_argument('--shift-steps', type=int, default=16, help="# shifts per direction (unused for PDE rollout)")
     p.add_argument('--eps', type=float, default=0.2, help="shift magnitude (unused for PDE rollout)")
     p.add_argument('--shift-leap', type=float, default=1.0, help="frame stride for saving (unused here)")
     p.add_argument('--batch-size', type=int, default=2, help="generator batch size")
@@ -201,12 +217,15 @@ if __name__ == '__main__':
     script_dir = Path(__file__).resolve().parent
     G = build_gan(a, device=device, script_dir=script_dir).eval()
 
+    keys= [str(k) for k in a.__dict__.keys()]
+    for k in keys:
+        if "support_" in k:
+            a.__dict__[k.replace("support_", "traversal_")] = a.__dict__[k]
     # Instantiate TraversalPDE with D = G.dim_z (same as train.py), then load weights
     S = TraversalPDE(
         num_traversal_sets=a.__dict__['num_traversal_sets'],
         num_traversal_timesteps=a.__dict__['num_traversal_timesteps'],
         traversal_vectors_dim=G.dim_z,
-        only_potential=a.__dict__.get('only_potential', True)
     ).to(device).eval()
     robust_load_waves(S, ckpt)
 
@@ -234,24 +253,24 @@ if __name__ == '__main__':
         # Each base latent yields K pairs (one per support set).
         cur_B = min(B, int(np.ceil(remaining / float(K))))
 
-        print(f'Generating image pairs batch with base batch-size={cur_B}, remaining={remaining} ...')
+        print(f'Generating image pairs batch with base batch-size={ cur_B}, remaining={remaining} ...')
 
-        # Sample batch z on device, with truncation if specified
-        z0 = sample_z(cur_B*K, G.dim_z, device=device, truncation=z_trunc)
-
-        # Optionally move to W space for StyleGAN2
-        if a.__dict__.get('shift_in_w_space', True if a.__dict__['gan_type'] == 'StyleGAN2' else False) and hasattr(G, 'get_w'):
-            with torch.no_grad():
-                z_cur = G.get_w(z0.reshape(cur_B*K, G.dim_z)).reshape(cur_B, K, G.dim_z)
-        else:
-            z_cur = z0.reshape(cur_B, K, G.dim_z)
-        z0_batch = z_cur.reshape(cur_B * K, G.dim_z)
+        # Sample batch z on device, with truncation if specified in params
+        z0 = sample_z(cur_B*K, G, params=a, device=device)
+        z_cur = z0.reshape(cur_B, K, G.dim_z)
+        z0_batch = z0.reshape(cur_B * K, G.dim_z)
 
         # Rollout by PDE: latent_{t+1} = latent_t + ∇_z u(latent_t, t)
         with torch.no_grad():
             for step in range(half_range-1):
                 t_b = torch.full((cur_B, 1), float(step), device=device, dtype=z_cur.dtype)
-                z_cur, dz = S.inference(z_cur, t_b, dt=args.shift_leap*2/max(1,half_range-1))  # returns (z_curr, delta_z) with K support sets batched
+                dt_b = torch.full(
+                    (cur_B, 1),
+                    args.shift_leap * 2 / max(1, half_range - 1),
+                    device=device,
+                    dtype=z_cur.dtype,
+                )
+                z_cur, dz = S.inference(z_cur, t_b, dt=dt_b)  # returns (z_curr, delta_z), with K paths batched
                 z_cur = z_cur + dz
 
         # One-hot labels for VP: [cur_B*K, K]
@@ -276,8 +295,9 @@ if __name__ == '__main__':
 
         # Save pairs as JPEG
         # Convert from [-1,1] RGB to uint8 BGR for cv2
-        img1 = img1.clamp(-1, 1)
-        img2 = img2.clamp(-1, 1)
+        img1 = img1.to(torch.float32).clamp(-1, 1)
+        img2 = img2.to(torch.float32).clamp(-1, 1)
+
         for im1, im2 in zip(img1, img2):
             a1 = im1.detach().cpu().numpy().transpose(1, 2, 0)  # HWC, RGB
             a2 = im2.detach().cpu().numpy().transpose(1, 2, 0)

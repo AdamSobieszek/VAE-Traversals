@@ -1,5 +1,6 @@
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,15 @@ def _dtype_from_mixed_precision(mixed_precision):
         return torch.float32
     if mixed_precision == "bf16":
         return torch.bfloat16
+    if mixed_precision == "fp16":
+        return torch.float16
     raise ValueError(f"Unsupported mixed precision mode: {mixed_precision!r}")
+
+
+def _amp_disabled(device_type: str):
+    if device_type in ("cuda", "cpu"):
+        return torch.amp.autocast(device_type=device_type, enabled=False)
+    return nullcontext()
 
 
 
@@ -148,12 +157,283 @@ def build_proggan(pretrained_gan_weights):
 ##                                                                                                                    ##
 ########################################################################################################################
 class StyleGAN2MPSWrapper(nn.Module):
-    def __init__(self, G, shift_in_w_space):
+    """Frozen StyleGAN2 wrapper used by TrainerPotential.
+
+    Trainer autocast is disabled around synthesis. The opt-in compiled path
+    runs high-resolution blocks in FP16 or BF16 explicitly, matching
+    ``mixed_precision``, instead of letting AMP rewrite the original
+    StyleGAN FP16 contract.
+    """
+
+    def __init__(
+        self,
+        G,
+        shift_in_w_space,
+        *,
+        compile=False,
+        compile_mode="default",
+        use_optimized=True,
+        mixed_precision="no",
+        noise_mode="random",
+        isolate_amp=True,
+    ):
         super(StyleGAN2MPSWrapper, self).__init__()
         self.G = G
         self.shift_in_w_space = shift_in_w_space
         self.dim_z = 512
         self.dim_w = self.dim_z
+        self.compile_enabled = bool(compile)
+        self.compile_mode = str(compile_mode)
+        self.use_optimized = bool(use_optimized)
+        self.noise_mode = str(noise_mode)
+        self.isolate_amp = bool(isolate_amp)
+        self._optimized = None
+        self._compiled = None
+        self.set_mixed_precision(mixed_precision)
+
+    def set_mixed_precision(self, mixed_precision="no"):
+        """Select the optimized-path compute dtype. Weights stay checkpoint-native."""
+        self.mixed_precision = mixed_precision or "no"
+        self.compute_dtype = _dtype_from_mixed_precision(self.mixed_precision)
+        self._compiled = None
+        self._optimized = None
+
+    def _low_precision_name(self) -> str:
+        if self.compute_dtype == torch.bfloat16:
+            return "bf16"
+        return "fp16"
+
+    def get_w(self, z, truncation_psi=1):
+        """Return batch of w latent codes given a batch of z latent codes.
+
+        Args:
+            z (torch.Tensor) : Z-space latent code of size [batch_size, 512]
+
+        Returns:
+            w (torch.Tensor) : W-space latent code of size [batch_size, 512]
+
+        """
+        return self.G.get_latent(z, truncation_psi=truncation_psi)
+
+    def _ws_from_input(self, z, shift=None):
+        if self.shift_in_w_space:
+            if not isinstance(z, torch.Tensor):
+                z = torch.cat([z if shift is None else z + shift])
+            if shift is not None and not isinstance(shift, torch.Tensor):
+                shift = torch.cat([shift])
+            z = z if shift is None else z + shift
+            if z.dim() == 2:
+                z = z.unsqueeze(1).repeat(1, self.G.num_ws, 1)
+            return z
+        z = torch.cat([z if shift is None else z + shift])
+        return self.G.mapping(z, None, truncation_psi=1)
+
+    def _synthesis_module(self):
+        if not self.use_optimized:
+            return self.G.synthesis
+        if self._optimized is None:
+            from models.StyleGAN2_mps.torch_utils.ops.inference_opt import (
+                b64_compile_config,
+                normalize_scalar_attrs,
+            )
+            from models.StyleGAN2_mps.torch_utils.ops.optimized_synthesis import (
+                build_optimized_synthesis,
+            )
+
+            normalize_scalar_attrs(self.G)
+            self._optimized = build_optimized_synthesis(
+                self.G.synthesis,
+                b64_compile_config(low_precision=self._low_precision_name()),
+                copy_module=False,
+            )
+        return self._optimized
+
+    def _run_synthesis(self, ws):
+        from models.StyleGAN2_mps.torch_utils.ops.native_backend import use_native_ops
+
+        with use_native_ops(upfirdn="native", bias_act="native"):
+            if self._compiled is not None:
+                return self._compiled(ws)
+            return self._synthesis_module()(
+                ws,
+                noise_mode=self.noise_mode,
+                force_fp32=False,
+            )
+
+    def _synthesis_callable(self, synthesis):
+        """Bind synthesis options before Dynamo traces, as in the CUDA benchmark."""
+        noise_mode = self.noise_mode
+
+        def synthesis_forward(ws):
+            return synthesis(
+                ws,
+                noise_mode=noise_mode,
+                force_fp32=False,
+            )
+
+        return synthesis_forward
+
+    def prepare_runtime(self, example_z):
+        """Compile synthesis from W inputs and warm the trainer's two grad modes.
+
+        Mapping stays eager.  This deliberately matches
+        ``benchmark_early_output_cuda.py``: build the optimized synthesis,
+        bind its synthesis options in a one-argument callable, compile that
+        callable, and execute the lazy compiler while native ops are selected.
+        """
+        self.eval()
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+        with torch.no_grad():
+            example_ws = self._ws_from_input(example_z.detach()).detach().clone()
+
+        if self.compile_enabled and self._compiled is None:
+            from models.StyleGAN2_mps.torch_utils.ops.native_backend import use_native_ops
+
+            synthesis = self._synthesis_module()
+            synthesis_forward = self._synthesis_callable(synthesis)
+            torch._dynamo.config.cache_size_limit = 128
+            if hasattr(torch._dynamo.config, "recompile_limit"):
+                torch._dynamo.config.recompile_limit = 128
+            with use_native_ops(upfirdn="native", bias_act="native"):
+                self._compiled = torch.compile(
+                    synthesis_forward,
+                    mode=self.compile_mode,
+                    fullgraph=False,
+                )
+
+        # TrainerPotential evaluates img0/img1 under no_grad, then img2 with
+        # gradients with respect to the latent.  Warm both Dynamo guard sets
+        # here so the first training iteration does not compile another graph.
+        with torch.no_grad():
+            self._run_synthesis(example_ws)
+        ws_grad = example_ws.detach().clone().requires_grad_(True)
+        with torch.enable_grad():
+            image = self._run_synthesis(ws_grad)
+            torch.autograd.grad(image.float().square().mean(), ws_grad)
+
+    def forward(self, z, shift=None):
+        """StyleGAN2 generator forward function.
+
+        Args:
+            z (torch.Tensor)     : Batch of latent codes in Z-space
+            shift (torch.Tensor) : Batch of shift vectors in Z- or W-space (based on self.shift_in_w_space)
+
+        Returns:
+            I (torch.Tensor)     : Output images of size [batch_size, 3, resolution, resolution]
+        """
+        ws = self._ws_from_input(z, shift)
+        amp_ctx = _amp_disabled(ws.device.type) if self.isolate_amp else nullcontext()
+        with amp_ctx:
+            if self.compile_enabled and self._compiled is None:
+                self.prepare_runtime(z.detach())
+                ws = self._ws_from_input(z, shift)
+            return self._run_synthesis(ws)
+
+
+class StyleGAN2EarlyOutputWrapper(StyleGAN2MPSWrapper):
+    """Trainer wrapper for the integrated b256 learned RGB generator."""
+
+    def _synthesis_module(self):
+        if not self.compile_enabled and not self.use_optimized:
+            return self.G.synthesis
+        if self._optimized is None:
+            from models.StyleGAN2_mps.torch_utils.ops.inference_opt import (
+                b64_compile_config,
+                normalize_scalar_attrs,
+            )
+            from models.StyleGAN2_mps.torch_utils.ops.optimized_synthesis import (
+                build_optimized_early_output_synthesis,
+            )
+
+            normalize_scalar_attrs(self.G)
+            self._optimized = build_optimized_early_output_synthesis(
+                self.G.synthesis,
+                b64_compile_config(low_precision=self._low_precision_name()),
+                copy_module=False,
+            )
+            normalize_scalar_attrs(self._optimized)
+        return self._optimized
+
+
+def build_stylegan2mps(
+    pretrained_gan_weights,
+    resolution,
+    shift_in_w_space=False,
+    *,
+    compile=False,
+    compile_mode="default",
+    use_optimized=True,
+    mixed_precision="no",
+    noise_mode="random",
+    isolate_amp=True,
+):
+    # Build StyleGAN2 generator model
+    from models.StyleGAN2_mps.model import Generator as StyleGAN2Generator
+    from models.StyleGAN2_mps.torch_utils.ops.inference_opt import normalize_scalar_attrs
+
+    G = StyleGAN2Generator(512, 0, 512, resolution, 3)
+    # Load pre-trained weights
+    G.load_state_dict(torch.load(pretrained_gan_weights, map_location=torch.device('cpu'))['g_ema'],  strict=False)
+    normalize_scalar_attrs(G)
+    G.eval()
+    for parameter in G.parameters():
+        parameter.requires_grad_(False)
+
+    return StyleGAN2MPSWrapper(
+        G,
+        shift_in_w_space=shift_in_w_space,
+        compile=compile,
+        compile_mode=compile_mode,
+        use_optimized=use_optimized,
+        mixed_precision=mixed_precision,
+        noise_mode=noise_mode,
+        isolate_amp=isolate_amp,
+    )
+
+
+def build_stylegan2_early_output(
+    pretrained_gan_weights,
+    shift_in_w_space=False,
+    *,
+    compile=False,
+    compile_mode="default",
+    use_optimized=True,
+    mixed_precision="no",
+    noise_mode="random",
+    isolate_amp=True,
+):
+    """Load a converted StyleGAN2 prefix + learned 256 RGB checkpoint."""
+    from models.StyleGAN2_mps.early_output_model import load_generator_checkpoint
+    from models.StyleGAN2_mps.torch_utils.ops.inference_opt import normalize_scalar_attrs
+
+    G = load_generator_checkpoint(pretrained_gan_weights, device="cpu")
+    normalize_scalar_attrs(G)
+    G.eval().requires_grad_(False)
+    return StyleGAN2EarlyOutputWrapper(
+        G,
+        shift_in_w_space=shift_in_w_space,
+        compile=compile,
+        compile_mode=compile_mode,
+        use_optimized=use_optimized,
+        mixed_precision=mixed_precision,
+        noise_mode=noise_mode,
+        isolate_amp=isolate_amp,
+    )
+
+########################################################################################################################
+##                                                                                                                    ##
+##                                                  [ StyleGAN2 ]                                                     ##
+##                                                                                                                    ##
+########################################################################################################################
+class StyleGAN2Wrapper(nn.Module):
+    def __init__(self, G, shift_in_w_space):
+        super(StyleGAN2Wrapper, self).__init__()
+        self.G = G
+        self.shift_in_w_space = shift_in_w_space
+        self.dim_z = 512
+        self.dim_w = self.G.style_dim if self.shift_in_w_space else self.dim_z
 
     def get_w(self, z, truncation_psi=1):
         """Return batch of w latent codes given a batch of z latent codes.
@@ -182,99 +462,24 @@ class StyleGAN2MPSWrapper(nn.Module):
         if self.shift_in_w_space:
             #if latent_is_w:
                 # Input latent code is in W-space
-            if not isinstance(z, torch.Tensor):
-                z = torch.cat([z if shift is None else z + shift])
-            if shift is not None and not isinstance(shift, torch.Tensor):
-                shift = torch.cat([shift])
-            z = z if shift is None else z + shift
-            if z.dim() == 2:
-                z = z.unsqueeze(1).repeat(1, self.G.num_ws, 1)
-            return self.G.synthesis(z)
+            return self.G([z if shift is None else z + shift] if not isinstance(z,list) else z, input_is_latent=True)[0]
             #else:
                 # Input latent code is in Z-space -- get w code first
                 #w = self.G.get_latent(z)
                 #return self.G([w if shift is None else w + shift], input_is_latent=True)[0]
         # The given latent codes and shift vectors lie on the Z-space
         else:
-            return self.G(torch.cat([z if shift is None else z + shift]), truncation_psi=1)
+            return self.G([z if shift is None else z + shift] if not isinstance(z,list) else z, input_is_latent=False)[0]
 
 
-def build_stylegan2mps(pretrained_gan_weights, resolution, shift_in_w_space=False):
+def build_stylegan2(pretrained_gan_weights, resolution, shift_in_w_space=False):
     # Build StyleGAN2 generator model
-    from models.StyleGAN2_mps.model import Generator as StyleGAN2Generator
-    G = StyleGAN2Generator(512, 0, 512, resolution, 3)
+    from models.StyleGAN2.model import Generator as StyleGAN2Generator
+    G = StyleGAN2Generator(resolution, 512, 8)
     # Load pre-trained weights
-    G.load_state_dict(torch.load(pretrained_gan_weights, map_location=torch.device('cpu'))['g_ema'],  strict=False)
+    G.load_state_dict(torch.load(pretrained_gan_weights)['g_ema'], strict=False)
 
-    return StyleGAN2MPSWrapper(G, shift_in_w_space=shift_in_w_space)
-
-
-########################################################################################################################
-##                                                                                                                    ##
-##                                                  [ StyleGAN2 MPS ]                                                     ##
-##                                                                                                                    ##
-########################################################################################################################
-class StyleGAN2MPSWrapper(nn.Module):
-    def __init__(self, G, shift_in_w_space):
-        super(StyleGAN2MPSWrapper, self).__init__()
-        self.G = G
-        self.shift_in_w_space = shift_in_w_space
-        self.dim_z = 512
-        self.dim_w = self.dim_z
-
-    def get_w(self, z, truncation_psi=1):
-        """Return batch of w latent codes given a batch of z latent codes.
-
-        Args:
-            z (torch.Tensor) : Z-space latent code of size [batch_size, 512]
-
-        Returns:
-            w (torch.Tensor) : W-space latent code of size [batch_size, 512]
-
-        """
-        return self.G.get_latent(z, truncation_psi=truncation_psi)
-
-    def forward(self, z, shift=None):
-        """StyleGAN2 generator forward function.
-
-        Args:
-            z (torch.Tensor)     : Batch of latent codes in Z-space
-            shift (torch.Tensor) : Batch of shift vectors in Z- or W-space (based on self.shift_in_w_space)
-            latent_is_w (bool)   : Input latent code (denoted by z here) is in W-space
-
-        Returns:
-            I (torch.Tensor)     : Output images of size [batch_size, 3, resolution, resolution]
-        """
-        # The given latent codes lie on Z- or W-space, while the given shifts lie on the W-space
-        if self.shift_in_w_space:
-            #if latent_is_w:
-                # Input latent code is in W-space
-            if not isinstance(z, torch.Tensor):
-                z = torch.cat([z if shift is None else z + shift])
-            if shift is not None and not isinstance(shift, torch.Tensor):
-                shift = torch.cat([shift])
-            z = z if shift is None else z + shift
-            if z.dim() == 2:
-                z = z.unsqueeze(1).repeat(1, self.G.num_ws, 1)
-            return self.G.synthesis(z)
-            #else:
-                # Input latent code is in Z-space -- get w code first
-                #w = self.G.get_latent(z)
-                #return self.G([w if shift is None else w + shift], input_is_latent=True)[0]
-        # The given latent codes and shift vectors lie on the Z-space
-        else:
-            return self.G(torch.cat([z if shift is None else z + shift]), truncation_psi=1)
-
-
-def build_stylegan2mps(pretrained_gan_weights, resolution, shift_in_w_space=False):
-    # Build StyleGAN2 generator model
-    from models.StyleGAN2_mps.model import Generator as StyleGAN2Generator
-    G = StyleGAN2Generator(512, 0, 512, resolution, 3)
-    # Load pre-trained weights
-    G.load_state_dict(torch.load(pretrained_gan_weights, map_location=torch.device('cpu'))['g_ema'],  strict=False)
-
-    return StyleGAN2MPSWrapper(G, shift_in_w_space=shift_in_w_space)
-
+    return StyleGAN2Wrapper(G, shift_in_w_space=shift_in_w_space)
 
 ########################################################################################################################
 ##                                                                                                                    ##

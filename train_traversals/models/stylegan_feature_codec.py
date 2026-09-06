@@ -12,7 +12,7 @@ internal context tower improve on the linear PCA floor.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -112,6 +112,7 @@ class FrozenRank4PCA(nn.Module):
         self,
         x: torch.Tensor,
         z_pca: Optional[torch.Tensor] = None,
+        weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Exact rank-K reconstruction MSE without materializing a C-channel reconstruction."""
         x = x.float()
@@ -121,8 +122,13 @@ class FrozenRank4PCA(nn.Module):
         projected = z_pca.float() * self.scale.to(
             dtype=x.dtype, device=x.device
         )[None, :, None, None]
-        residual_energy = centered.square().sum() - projected.square().sum()
-        return residual_energy.clamp_min(0.0) / x.numel()
+        if weight is None:
+            residual_energy = centered.square().sum() - projected.square().sum()
+            return residual_energy.clamp_min(0.0) / x.numel()
+        pix = centered.square().sum(dim=1, keepdim=True)
+        proj = projected.square().sum(dim=1, keepdim=True)
+        residual = (pix - proj).clamp_min(0.0)
+        return weighted_spatial_mean(residual, weight) / x.shape[1]
 
     def state_dict_compact(self) -> Dict[str, torch.Tensor]:
         return {
@@ -471,6 +477,10 @@ class PCAResidualFeatureCodec(nn.Module):
         sample_posterior: bool = True,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, DiagonalGaussianDistribution, torch.Tensor, torch.Tensor]:
+        # StyleGAN's high-resolution CUDA blocks can emit FP16 activations.
+        # The frozen PCA and the codec parameters use FP32 unless autocast
+        # explicitly selects a lower-precision convolution kernel.
+        x = x.float()
         z_pca = self.pca.encode(x)
         mean_res, logvar = self.encoder(x)
         mean = z_pca + self.enc_gate * mean_res
@@ -510,8 +520,107 @@ class PCAResidualFeatureCodec(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Losses / metrics
+# Face saliency (FFHQ-aligned StyleGAN canvases)
 # ---------------------------------------------------------------------------
+
+# Normalized (x, y, rx, ry) ellipses for NVIDIA FFHQ alignment / StyleGAN2
+# config-f. The crop maps the eye-midpoint slightly above image center, so
+# pupils sit near y=0.48, the nose tip near y=0.60, and the mouth near y=0.70.
+# Measured on this repo's stylegan2-ffhq-config-f outputs.
+_FFHQ_TZONE = (
+    (0.37, 0.48, 0.110, 0.070),  # left eye
+    (0.63, 0.48, 0.110, 0.070),  # right eye
+    (0.50, 0.60, 0.080, 0.100),  # nose
+    (0.50, 0.70, 0.140, 0.070),  # mouth
+)
+_FFHQ_FACE_CENTER = (0.50, 0.55)
+_FFHQ_FACE_SIGMA = (0.36, 0.42)
+_SALIENCY_LAYOUT = "ffhq-sg2-v2"
+_SALIENCY_CACHE: Dict[Tuple[int, int, str], torch.Tensor] = {}
+
+
+def _mesh_norm(height: int, width: int, device=None, dtype=torch.float32):
+    ys = torch.linspace(0.5 / height, 1.0 - 0.5 / height, height, device=device, dtype=dtype)
+    xs = torch.linspace(0.5 / width, 1.0 - 0.5 / width, width, device=device, dtype=dtype)
+    return torch.meshgrid(ys, xs, indexing="ij")
+
+
+def _gaussian2d(yy, xx, cx, cy, sx, sy):
+    return torch.exp(-0.5 * (((xx - cx) / sx) ** 2 + ((yy - cy) / sy) ** 2))
+
+
+def tzone_support_mask(height: int, width: int, device=None, dtype=torch.float32) -> torch.Tensor:
+    """Boolean ``[1, 1, H, W]`` support of the eyes / nose / mouth ellipses."""
+    yy, xx = _mesh_norm(height, width, device=device, dtype=dtype)
+    support = torch.zeros(height, width, device=device, dtype=torch.bool)
+    for cx, cy, rx, ry in _FFHQ_TZONE:
+        support |= ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2 <= 1.0
+    return support.view(1, 1, height, width)
+
+
+def face_saliency_mask(
+    height: int,
+    width: int,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    inner_mass: float = 0.5,
+) -> torch.Tensor:
+    """
+    Spatial weights for an aligned StyleGAN face.
+
+    Half of the total mass (``inner_mass``) sits on the small T-zone around
+    the eyes, nose, and mouth. The remaining mass follows a face-centered
+    falloff that decays toward the background.
+    """
+    key = (int(height), int(width), _SALIENCY_LAYOUT)
+    cached = _SALIENCY_CACHE.get(key)
+    if cached is None:
+        yy, xx = _mesh_norm(height, width, device="cpu", dtype=torch.float32)
+        support = tzone_support_mask(height, width, device="cpu", dtype=torch.float32)[0, 0]
+        inner = torch.zeros(height, width, dtype=torch.float32)
+        for cx, cy, rx, ry in _FFHQ_TZONE:
+            inner = torch.maximum(inner, _gaussian2d(yy, xx, cx, cy, rx, ry))
+        inner = inner * support.float()
+        face = _gaussian2d(yy, xx, _FFHQ_FACE_CENTER[0], _FFHQ_FACE_CENTER[1], *_FFHQ_FACE_SIGMA)
+        outer = face * (~support).float() + 1e-3
+        inner = inner / inner.sum().clamp_min(1e-8)
+        outer = outer / outer.sum().clamp_min(1e-8)
+        cached = (float(inner_mass) * inner + (1.0 - float(inner_mass)) * outer)
+        cached = cached.view(1, 1, height, width)
+        _SALIENCY_CACHE[key] = cached
+    return cached.to(device=device if device is not None else cached.device, dtype=dtype)
+
+
+def resolve_saliency_mask(
+    saliency,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    if saliency is None or saliency is False:
+        return None
+    if saliency is True:
+        return face_saliency_mask(height, width, device=device, dtype=dtype)
+    if not torch.is_tensor(saliency):
+        raise TypeError(f"saliency must be bool or Tensor, got {type(saliency)!r}")
+    mask = saliency.to(device=device, dtype=dtype)
+    if mask.shape[-2:] != (height, width):
+        mask = F.interpolate(mask.expand(1, 1, *mask.shape[-2:]), size=(height, width), mode="bilinear", align_corners=False)
+    if mask.ndim == 2:
+        mask = mask.view(1, 1, height, width)
+    elif mask.ndim == 3:
+        mask = mask.unsqueeze(1) if mask.shape[0] != 1 else mask.unsqueeze(0)
+    return mask
+
+
+def weighted_spatial_mean(values: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Mean of ``values`` with a spatial weight broadcast over batch/channel."""
+    w = weight.to(device=values.device, dtype=values.dtype)
+    while w.ndim < values.ndim:
+        w = w.unsqueeze(0)
+    return (values * w).sum() / w.expand_as(values).sum().clamp_min(1e-8)
+
 
 def charbonnier(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.sqrt(x * x + eps)
@@ -534,26 +643,48 @@ def feature_codec_loss(
     lambda_cov: float = 0.01,
     deterministic: bool = False,
     return_stats_tensors: bool = False,
+    saliency: Union[bool, torch.Tensor] = True,
 ) -> Tuple[torch.Tensor, Dict[str, object]]:
     """Compound Phase-1 feature loss with PCA-relative distortion."""
+    target = target.to(device=recon.device, dtype=recon.dtype)
+    weight = resolve_saliency_mask(
+        saliency, target.shape[-2], target.shape[-1], target.device, target.dtype
+    )
+
     with torch.no_grad():
-        pca_mse = pca.reconstruction_mse(target, z_pca=z_pca).clamp_min(1e-8)
+        pca_mse = pca.reconstruction_mse(target, z_pca=z_pca, weight=weight).clamp_min(1e-8)
 
     std = pca.channel_std.view(1, -1, 1, 1).to(device=target.device, dtype=target.dtype).clamp_min(1e-4)
     err = (recon - target) / std
-    mse = F.mse_loss(recon, target)
+    se = (recon - target).square()
+    mse = weighted_spatial_mean(se, weight) if weight is not None else se.mean()
     nmse = mse / pca_mse
-    charb = charbonnier(err).mean()
+    charb = (
+        weighted_spatial_mean(charbonnier(err), weight)
+        if weight is not None
+        else charbonnier(err).mean()
+    )
 
     gx = recon[:, :8, :, 1:] - recon[:, :8, :, :-1]
     gy = recon[:, :8, 1:, :] - recon[:, :8, :-1, :]
     tx = target[:, :8, :, 1:] - target[:, :8, :, :-1]
     ty = target[:, :8, 1:, :] - target[:, :8, :-1, :]
-    grad = F.l1_loss(gx, tx) + F.l1_loss(gy, ty)
+    if weight is None:
+        grad = F.l1_loss(gx, tx) + F.l1_loss(gy, ty)
+    else:
+        wx = 0.5 * (weight[..., :, 1:] + weight[..., :, :-1])
+        wy = 0.5 * (weight[..., 1:, :] + weight[..., :-1, :])
+        grad = weighted_spatial_mean((gx - tx).abs(), wx) + weighted_spatial_mean((gy - ty).abs(), wy)
 
     ms = target.new_zeros(())
     for s in (2, 4):
-        ms = ms + F.mse_loss(F.avg_pool2d(recon, s), F.avg_pool2d(target, s))
+        rec_s = F.avg_pool2d(recon, s)
+        tgt_s = F.avg_pool2d(target, s)
+        if weight is None:
+            ms = ms + F.mse_loss(rec_s, tgt_s)
+        else:
+            w_s = F.avg_pool2d(weight, s)
+            ms = ms + weighted_spatial_mean((rec_s - tgt_s).square(), w_s)
     ms = ms / 2.0
 
     anchor = target.new_zeros(())
@@ -625,6 +756,7 @@ def eval_metrics(
     pca: FrozenRank4PCA,
     posterior: Optional[DiagonalGaussianDistribution] = None,
 ) -> Dict[str, float]:
+    target = target.to(device=recon.device, dtype=recon.dtype)
     mse = F.mse_loss(recon, target)
     pca_mse = pca.reconstruction_mse(target).clamp_min(1e-8)
     nmse = mse / pca_mse

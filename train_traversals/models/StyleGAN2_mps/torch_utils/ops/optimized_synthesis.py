@@ -8,6 +8,7 @@ state-dict keys, defaults, and checkpoint behavior therefore remain unchanged.
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -342,6 +343,115 @@ class OptimizedSynthesis(nn.Module):
         return img
 
 
+class OptimizedEarlyOutputSynthesis(nn.Module):
+    """Prepared StyleGAN prefix followed by an early-output decoder.
+
+    The regular :class:`OptimizedSynthesis` evaluates the StyleGAN RGB skip
+    pyramid.  Early-output generators instead keep only the feature path
+    through b256 and pass that activation to ``synthesis.decoder``.
+    """
+
+    def __init__(self, synthesis: nn.Module, cfg: Any):
+        super().__init__()
+        if not hasattr(synthesis, "decoder"):
+            raise TypeError("Early-output synthesis must define a decoder module")
+        self.synthesis = synthesis
+        self.cfg = cfg
+        self.resolutions = tuple(int(r) for r in synthesis.block_resolutions)
+        prepare_optimized_synthesis(synthesis, cfg)
+
+    def forward(
+        self,
+        ws: torch.Tensor,
+        noise_mode: str = "const",
+        force_fp32: bool = False,
+    ) -> torch.Tensor:
+        ws = ws.to(torch.float32)
+        features = None
+        w_base = 0
+        low_dtype = getattr(self.cfg, "low_precision_dtype", torch.float16)
+
+        for resolution in self.resolutions:
+            block = getattr(self.synthesis, f"b{resolution}")
+            dtype = (
+                low_dtype
+                if (block.use_fp16 or bool(self.cfg.force_fp16_all_blocks))
+                and not force_fp32
+                else torch.float32
+            )
+            memory_format = (
+                torch.channels_last
+                if block.channels_last and not force_fp32
+                else torch.contiguous_format
+            )
+            if block.in_channels == 0:
+                features = block.const.to(dtype=dtype, memory_format=memory_format)
+                features = features.unsqueeze(0).repeat([ws.shape[0], 1, 1, 1])
+            else:
+                features = features.to(dtype=dtype, memory_format=memory_format)
+
+            w_idx = w_base
+            if block.in_channels == 0:
+                features = _layer(
+                    block.conv1,
+                    features,
+                    ws[:, w_idx],
+                    cfg=self.cfg,
+                    noise_mode=noise_mode,
+                )
+            elif block.architecture == "resnet":
+                skip = block.skip(features, gain=float(0.5**0.5))
+                features = _layer(
+                    block.conv0,
+                    features,
+                    ws[:, w_idx],
+                    cfg=self.cfg,
+                    noise_mode=noise_mode,
+                )
+                w_idx += 1
+                features = _layer(
+                    block.conv1,
+                    features,
+                    ws[:, w_idx],
+                    cfg=self.cfg,
+                    noise_mode=noise_mode,
+                    gain=float(0.5**0.5),
+                )
+                features = skip.add_(features)
+            else:
+                features = _layer(
+                    block.conv0,
+                    features,
+                    ws[:, w_idx],
+                    cfg=self.cfg,
+                    noise_mode=noise_mode,
+                )
+                w_idx += 1
+                features = _layer(
+                    block.conv1,
+                    features,
+                    ws[:, w_idx],
+                    cfg=self.cfg,
+                    noise_mode=noise_mode,
+                )
+
+            # ToRGB consumes an overlapping style slot in StyleGAN2.  We skip
+            # it, so only convolution slots advance the next block's base.
+            w_base += int(block.num_conv)
+
+        if features is None:
+            raise RuntimeError("Early synthesis produced no prefix activation")
+
+        autocast = (
+            torch.autocast(device_type="cuda", dtype=low_dtype)
+            if features.device.type == "cuda" and not force_fp32
+            else nullcontext()
+        )
+        with autocast:
+            output = self.synthesis.decoder(features.float())
+        return output
+
+
 def build_optimized_synthesis(
     synthesis: nn.Module,
     cfg: Any,
@@ -351,6 +461,21 @@ def build_optimized_synthesis(
     """Build an opt-in wrapper without mutating the source module by default."""
     candidate = copy.deepcopy(synthesis) if copy_module else synthesis
     optimized = OptimizedSynthesis(candidate, cfg)
+    optimized.eval()
+    for parameter in optimized.parameters():
+        parameter.requires_grad_(False)
+    return optimized
+
+
+def build_optimized_early_output_synthesis(
+    synthesis: nn.Module,
+    cfg: Any,
+    *,
+    copy_module: bool = True,
+) -> OptimizedEarlyOutputSynthesis:
+    """Build the optimized prefix path without evaluating StyleGAN toRGBs."""
+    candidate = copy.deepcopy(synthesis) if copy_module else synthesis
+    optimized = OptimizedEarlyOutputSynthesis(candidate, cfg)
     optimized.eval()
     for parameter in optimized.parameters():
         parameter.requires_grad_(False)

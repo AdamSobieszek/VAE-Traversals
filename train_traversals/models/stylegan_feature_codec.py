@@ -536,7 +536,7 @@ _FFHQ_TZONE = (
 _FFHQ_FACE_CENTER = (0.50, 0.55)
 _FFHQ_FACE_SIGMA = (0.36, 0.42)
 _SALIENCY_LAYOUT = "ffhq-sg2-v2"
-_SALIENCY_CACHE: Dict[Tuple[int, int, str], torch.Tensor] = {}
+_SALIENCY_CACHE: Dict[Tuple[int, int, str, float], torch.Tensor] = {}
 
 
 def _mesh_norm(height: int, width: int, device=None, dtype=torch.float32):
@@ -572,7 +572,9 @@ def face_saliency_mask(
     the eyes, nose, and mouth. The remaining mass follows a face-centered
     falloff that decays toward the background.
     """
-    key = (int(height), int(width), _SALIENCY_LAYOUT)
+    if not 0.0 <= inner_mass <= 1.0:
+        raise ValueError("inner_mass must be in [0, 1]")
+    key = (int(height), int(width), _SALIENCY_LAYOUT, float(inner_mass))
     cached = _SALIENCY_CACHE.get(key)
     if cached is None:
         yy, xx = _mesh_norm(height, width, device="cpu", dtype=torch.float32)

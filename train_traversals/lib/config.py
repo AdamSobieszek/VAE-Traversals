@@ -60,8 +60,7 @@ GAN_WEIGHTS = {
         'weights': {
             256: 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-256-550000.pt',
             1024: 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-config-f.pt',
-            "early_output": 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-config-f-early-output.pt',
-            "early_output_128": 'models/pretrained/generators/StyleGAN2/stylegan2-ffhq-config-f-early-output-128.pt',
+            "early_output_128": 'models/pretrained/generators/StyleGAN2/sg128_pointwise_style32.pt',
         }
     },
     'GAT': {

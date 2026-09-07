@@ -276,8 +276,7 @@ class StyleGAN2MPSWrapper(nn.Module):
     def prepare_runtime(self, example_z):
         """Compile synthesis from W inputs and warm the trainer's two grad modes.
 
-        Mapping stays eager.  This deliberately matches
-        ``benchmark_early_output_cuda.py``: build the optimized synthesis,
+        Mapping stays eager. Build the optimized synthesis,
         bind its synthesis options in a one-argument callable, compile that
         callable, and execute the lazy compiler while native ops are selected.
         """
@@ -333,7 +332,7 @@ class StyleGAN2MPSWrapper(nn.Module):
 
 
 class StyleGAN2EarlyOutputWrapper(StyleGAN2MPSWrapper):
-    """Trainer wrapper for the integrated b256 learned RGB generator."""
+    """Trainer wrapper for the pointwise_style32 128x128 generator."""
 
     def _synthesis_module(self):
         if not self.compile_enabled and not self.use_optimized:
@@ -343,7 +342,7 @@ class StyleGAN2EarlyOutputWrapper(StyleGAN2MPSWrapper):
                 b64_compile_config,
                 normalize_scalar_attrs,
             )
-            from models.StyleGAN2_mps.torch_utils.ops.optimized_synthesis import (
+            from models.StyleGAN2_mps.early_output_model import (
                 build_optimized_early_output_synthesis,
             )
 
@@ -404,7 +403,7 @@ def build_stylegan2_early_output(
     noise_mode="random",
     isolate_amp=True,
 ):
-    """Load a converted StyleGAN2 prefix + learned 256 RGB checkpoint."""
+    """Load the trained pointwise_style32 generator."""
     from models.StyleGAN2_mps.early_output_model import load_generator_checkpoint
     from models.StyleGAN2_mps.torch_utils.ops.inference_opt import normalize_scalar_attrs
 

@@ -1,336 +1,172 @@
 # Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.
-# Modifications implement a learned early RGB output at StyleGAN2 b128/b256.
+"""StyleGAN2 b128 prefix with the trained pointwise_style32 RGB head.
 
-"""StyleGAN2 generator whose high-resolution tail is replaced by an RGB decoder.
+Load the trained model (public export or training checkpoint)::
 
-The mapping network and synthesis blocks through ``b128`` or ``b256`` use the
-classes and fast operators from :mod:`models.StyleGAN2_mps.model`.  RGB skip
-outputs are not evaluated while producing the prefix activation.  Instead,
-the captured activation is decoded by the trained early-output network
-embedded in this file.
+    G = load_generator_checkpoint("sg128_pointwise_style32.pt", device="cuda")
+    image = G(torch.randn(1, 512, device="cuda"), noise_mode="const")
 
-Convert an FFHQ generator and a trained decoder into one checkpoint::
-
-    python -m models.StyleGAN2_mps.early_output_model \
-        --ffhq-weights /path/to/stylegan2-ffhq-1024x1024.pkl \
-        --decoder-weights experiments/stylegan_early_output_fast_v2/checkpoint.pt \
-        --output experiments/stylegan_early_output_fast_v2/generator.pt
-
-Load and run the converted generator::
-
-    G = load_generator_checkpoint("generator.pt", device="cuda")
-    image = G(torch.randn(1, G.z_dim, device="cuda"))
+For optimized inference, use this module's build_optimized_early_output_synthesis.
+The shared optimized_synthesis.py requires no modifications.
 """
-
 from __future__ import annotations
 
-import argparse
-import json
-import os
+import copy
 import os.path as osp
 import pickle
 import sys
-from dataclasses import asdict, dataclass
-from typing import Dict, Mapping, Optional, Tuple
+from contextlib import nullcontext
+from typing import Dict, Mapping, Optional
 
-import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
+from torch.nn import functional as F
 
-try:
-    from .model import (
-        Generator as FullStyleGAN2Generator,
-        MappingNetwork,
-        SynthesisBlock,
-    )
-    from .torch_utils import misc, persistence
-except ImportError:  # pragma: no cover - permits direct execution from train_traversals
-    from models.StyleGAN2_mps.model import (
-        Generator as FullStyleGAN2Generator,
-        MappingNetwork,
-        SynthesisBlock,
-    )
-    from models.StyleGAN2_mps.torch_utils import misc, persistence
-
+from .model import Generator as FullStyleGAN2Generator, MappingNetwork, SynthesisBlock
+from .torch_utils import misc
 
 FORMAT_NAME = "stylegan2_early_output_generator_v2"
-Z_DIM = 512
-W_DIM = 512
+Z_DIM = W_DIM = 512
 SOURCE_RESOLUTION = 1024
-OUTPUT_RESOLUTION = 256
+OUTPUT_RESOLUTION = 128
 IMG_CHANNELS = 3
-SUPPORTED_OUTPUT_RESOLUTIONS = (128, 256)
-PREFIX_NUM_WS_BY_RESOLUTION = {128: 12, 256: 14}
-# Retained for callers that imported the original b256 constant.
-PREFIX_NUM_WS = PREFIX_NUM_WS_BY_RESOLUTION[OUTPUT_RESOLUTION]
+PREFIX_NUM_WS = 12
+# Fixed metadata also validates the uploaded winning checkpoint. No other
+# resolutions, decoder variants, or channel widths are implemented.
+GENERATOR_CONFIG = dict(z_dim=512, c_dim=0, w_dim=512, img_resolution=128,
+                        img_channels=3, decoder_hidden_channels=16,
+                        decoder_architecture="pointwise_style", decoder_spatial_channels=32)
 
 
-# ---------------------------------------------------------------------------
-# Fused deployment decoder (state-compatible with StyleGAN_SkipNetwork.py)
-# ---------------------------------------------------------------------------
+class PointwiseStyleDecoder(nn.Module):
+    """Fused linear RGB + width-16 residual + width-32 W-conditioned correction.
 
-
-@torch.no_grad()
-def _fold_average_w_torgb(
-    to_rgb: nn.Module, average_w: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Turn the fixed average-W toRGB into an ordinary 1x1 convolution."""
-    average_w = average_w.detach().to(
-        device=to_rgb.weight.device,
-        dtype=to_rgb.weight.dtype,
-    ).reshape(1, -1)
-    style = to_rgb.affine(average_w).reshape(-1) * float(to_rgb.weight_gain)
-    weight = to_rgb.weight.detach() * style.reshape(1, -1, 1, 1)
-    return weight.contiguous(), to_rgb.bias.detach().reshape(-1).contiguous()
-
-
-class FusedFastEarlyOutputDecoder(nn.Module):
-    """Three-convolution deployment head used by v2 integrated generators."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_channels: int = 16,
-        baseline_weight: Optional[torch.Tensor] = None,
-        baseline_bias: Optional[torch.Tensor] = None,
-    ):
+    Keep trained tensor names (spatial_in/out) so the winning checkpoint loads
+    directly. The conditioned branch contains only 1x1 convolutions.
+    """
+    def __init__(self):
         super().__init__()
-        self.in_channels = int(in_channels)
-        self.linear = nn.Conv2d(in_channels, IMG_CHANNELS, kernel_size=3, padding=1)
-        self.mix_in = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
-        self.activation = nn.SiLU(inplace=True)
-        self.mix_out = nn.Conv2d(hidden_channels, IMG_CHANNELS, kernel_size=1)
-        nn.init.zeros_(self.linear.weight)
-        nn.init.zeros_(self.linear.bias)
-        nn.init.zeros_(self.mix_out.weight)
-        nn.init.zeros_(self.mix_out.bias)
-        if baseline_weight is not None:
-            center = self.linear.weight.shape[-1] // 2
-            with torch.no_grad():
-                self.linear.weight[:, :, center, center].copy_(
-                    baseline_weight[:, :, 0, 0]
-                )
-                self.linear.bias.copy_(baseline_bias)
+        self.linear = nn.Conv2d(256, 3, 3, padding=1)
+        self.mix_in = nn.Conv2d(256, 16, 1)
+        self.mix_out = nn.Conv2d(16, 3, 1)
+        self.spatial_in = nn.Conv2d(256, 32, 1)
+        self.spatial_out = nn.Conv2d(32, 3, 1)
+        self.style = nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, 64),
+                                   nn.SiLU(), nn.Linear(64, 64))
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def forward(self, features: torch.Tensor, ws: torch.Tensor) -> torch.Tensor:
         features = features.float()
-        return self.linear(features) + self.mix_out(
-            self.activation(self.mix_in(features))
-        )
+        output = self.linear(features) + self.mix_out(F.silu(self.mix_in(features)))
+        hidden = F.silu(self.spatial_in(features))
+        scale, bias = self.style(ws[:, 9:11].flatten(1).float()).chunk(2, dim=1)
+        hidden = hidden * (1 + scale[:, :, None, None]) + bias[:, :, None, None]
+        return output + self.spatial_out(F.silu(hidden))
 
 
-# ---------------------------------------------------------------------------
-# StyleGAN prefix synthesis and integrated Generator
-# ---------------------------------------------------------------------------
-
-@persistence.persistent_class
 class SynthesisNetwork(nn.Module):
-    """StyleGAN2 prefix synthesis followed by ``EarlyOutputDecoder``."""
-
-    def __init__(
-        self,
-        w_dim: int,
-        img_resolution: int = OUTPUT_RESOLUTION,
-        img_channels: int = IMG_CHANNELS,
-        channel_base: int = 32768,
-        channel_max: int = 512,
-        source_img_resolution: int = SOURCE_RESOLUTION,
-        source_num_fp16_res: int = 4,
-        decoder_hidden_channels: int = 16,
-        average_w: Optional[torch.Tensor] = None,
-        **block_kwargs,
-    ):
+    """Original 1024 generator's convolution path through b128, then RGB."""
+    def __init__(self):
         super().__init__()
-        if img_resolution not in SUPPORTED_OUTPUT_RESOLUTIONS:
-            raise ValueError(
-                "Early-output synthesis resolution must be one of "
-                f"{SUPPORTED_OUTPUT_RESOLUTIONS}, got {img_resolution}"
-            )
-        if img_channels != IMG_CHANNELS:
-            raise ValueError(f"Early-output synthesis must have {IMG_CHANNELS} image channels")
-        self.w_dim = int(w_dim)
-        self.img_resolution = int(img_resolution)
-        self.img_resolution_log2 = int(np.log2(img_resolution))
-        self.img_channels = int(img_channels)
-        self.block_resolutions = [
-            2**index for index in range(2, self.img_resolution_log2 + 1)
-        ]
-        channels = {
-            resolution: min(channel_base // resolution, channel_max)
-            for resolution in self.block_resolutions
-        }
-
-        # Match the precision assignment of the original 1024 generator.  A
-        # standalone 256 calculation would otherwise start FP16 too early.
-        source_log2 = int(np.log2(source_img_resolution))
-        fp16_resolution = max(2 ** (source_log2 + 1 - source_num_fp16_res), 8)
-        self.num_ws = 0
+        self.w_dim, self.num_ws = W_DIM, PREFIX_NUM_WS
+        self.img_resolution, self.img_channels = OUTPUT_RESOLUTION, IMG_CHANNELS
+        self.block_resolutions = [4, 8, 16, 32, 64, 128]
+        channels = {r: min(32768 // r, 512) for r in self.block_resolutions}
         for resolution in self.block_resolutions:
-            in_channels = channels[resolution // 2] if resolution > 4 else 0
-            out_channels = channels[resolution]
+            # Retain source toRGB tensors for strict checkpoint loading; they
+            # are skipped during forward and frozen during finetuning.
             block = SynthesisBlock(
-                in_channels,
-                out_channels,
-                w_dim=w_dim,
-                resolution=resolution,
-                img_channels=img_channels,
-                is_last=resolution == img_resolution,
-                use_fp16=resolution >= fp16_resolution,
-                **block_kwargs,
+                channels[resolution // 2] if resolution > 4 else 0,
+                channels[resolution], w_dim=W_DIM, resolution=resolution,
+                img_channels=3, is_last=resolution == 128,
+                use_fp16=resolution >= 128,
             )
-            self.num_ws += block.num_conv
-            if resolution == img_resolution:
-                self.num_ws += block.num_torgb
             setattr(self, f"b{resolution}", block)
+        self.decoder = PointwiseStyleDecoder()
 
-        expected_num_ws = PREFIX_NUM_WS_BY_RESOLUTION[self.img_resolution]
-        if self.num_ws != expected_num_ws:
-            raise RuntimeError(
-                f"Expected {expected_num_ws} prefix W slots for b{self.img_resolution}, "
-                f"got {self.num_ws}"
-            )
-        if average_w is None:
-            average_w = torch.zeros(w_dim)
-        to_rgb = getattr(self, f"b{self.img_resolution}").torgb
-        baseline_weight, baseline_bias = _fold_average_w_torgb(to_rgb, average_w)
-        self.decoder = FusedFastEarlyOutputDecoder(
-            to_rgb.in_channels,
-            hidden_channels=decoder_hidden_channels,
-            baseline_weight=baseline_weight,
-            baseline_bias=baseline_bias,
-        )
-
-    def forward(
-        self,
-        ws: torch.Tensor,
-        return_components: bool = False,
-        **block_kwargs,
-    ):
-        with misc.record_function("split_ws"):
-            misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
-            ws = ws.to(torch.float32)
-            block_ws = []
-            w_index = 0
-            for resolution in self.block_resolutions:
-                block = getattr(self, f"b{resolution}")
-                block_ws.append(
-                    ws.narrow(1, w_index, block.num_conv + block.num_torgb)
-                )
-                w_index += block.num_conv
-
+    def forward(self, ws: torch.Tensor, **block_kwargs) -> torch.Tensor:
+        misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
+        ws = ws.float()
         features = None
-        for resolution, current_ws in zip(self.block_resolutions, block_ws):
+        index = 0
+        for resolution in self.block_resolutions:
             block = getattr(self, f"b{resolution}")
-            features, _ = block(
-                features,
-                None,
-                current_ws,
-                skip_torgb=True,
-                **block_kwargs,
-            )
-        if features is None:
-            raise RuntimeError("StyleGAN prefix produced no features")
-        output = self.decoder(features.float())
-        if return_components:
-            return {"prediction": output, "features": features}
-        return output
-
-    def extra_repr(self):
-        return (
-            f"w_dim={self.w_dim}, num_ws={self.num_ws}, "
-            f"img_resolution={self.img_resolution}, img_channels={self.img_channels}"
-        )
+            current = ws.narrow(1, index, block.num_conv + block.num_torgb)
+            features, _ = block(features, None, current, skip_torgb=True, **block_kwargs)
+            index += block.num_conv
+        return self.decoder(features, ws)
 
 
-@persistence.persistent_class
 class Generator(nn.Module):
-    """Drop-in StyleGAN2 generator producing learned 128 or 256 RGB."""
-
-    def __init__(
-        self,
-        z_dim: int = Z_DIM,
-        c_dim: int = 0,
-        w_dim: int = W_DIM,
-        img_resolution: int = OUTPUT_RESOLUTION,
-        img_channels: int = IMG_CHANNELS,
-        mapping_kwargs: Optional[dict] = None,
-        **synthesis_kwargs,
-    ):
+    """Fixed 128x128 pointwise_style32 generator with the full source mapping."""
+    def __init__(self, **config):
         super().__init__()
-        self.z_dim = int(z_dim)
-        self.c_dim = int(c_dim)
-        self.w_dim = int(w_dim)
-        self.img_resolution = int(img_resolution)
-        self.img_channels = int(img_channels)
-        mapping_kwargs = {} if mapping_kwargs is None else dict(mapping_kwargs)
-
-        # Mapping is built first so its average W initializes the embedded
-        # fixed-style baseline. Converted decoder state subsequently restores
-        # the exact training-time value.
-        if self.img_resolution not in SUPPORTED_OUTPUT_RESOLUTIONS:
-            raise ValueError(
-                "Early-output generator resolution must be one of "
-                f"{SUPPORTED_OUTPUT_RESOLUTIONS}, got {self.img_resolution}"
-            )
-        self.num_ws = PREFIX_NUM_WS_BY_RESOLUTION[self.img_resolution]
-        self.mapping = MappingNetwork(
-            z_dim=z_dim,
-            c_dim=c_dim,
-            w_dim=w_dim,
-            num_ws=self.num_ws,
-            **mapping_kwargs,
-        )
-        self.synthesis = SynthesisNetwork(
-            w_dim=w_dim,
-            img_resolution=img_resolution,
-            img_channels=img_channels,
-            average_w=self.mapping.w_avg,
-            **synthesis_kwargs,
-        )
-        if self.synthesis.num_ws != self.num_ws:
-            raise RuntimeError("Mapping and synthesis disagree on num_ws")
+        if any(key not in GENERATOR_CONFIG or value != GENERATOR_CONFIG[key]
+               for key, value in config.items()):
+            raise ValueError("Only the trained 128x128 pointwise_style32 configuration is supported")
+        self.z_dim, self.c_dim, self.w_dim = Z_DIM, 0, W_DIM
+        self.img_resolution, self.img_channels = OUTPUT_RESOLUTION, IMG_CHANNELS
+        self.num_ws = PREFIX_NUM_WS
+        self.mapping = MappingNetwork(Z_DIM, 0, W_DIM, self.num_ws)
+        self.synthesis = SynthesisNetwork()
 
     @property
-    def device(self) -> torch.device:
+    def device(self):
         return next(self.parameters()).device
 
-    def get_latent(self, z: torch.Tensor, truncation_psi: float = 1.0) -> torch.Tensor:
+    def get_latent(self, z, truncation_psi=1.0):
         return self.mapping(z, None, truncation_psi=truncation_psi)[:, 0]
 
-    def mean_latent(self, count: int, truncation_psi: float = 1.0) -> torch.Tensor:
-        latent_in = torch.randn(count, self.z_dim, device=self.device)
-        return self.mapping(
-            latent_in, None, truncation_psi=truncation_psi
-        ).mean(0, keepdim=True)
+    def mean_latent(self, count, truncation_psi=1.0):
+        z = torch.randn(count, self.z_dim, device=self.device)
+        return self.mapping(z, None, truncation_psi=truncation_psi).mean(0, keepdim=True)
 
-    def forward(
-        self,
-        z: torch.Tensor,
-        c: Optional[torch.Tensor] = None,
-        truncation_psi: float = 1.0,
-        truncation_cutoff: Optional[int] = None,
-        update_emas: bool = False,
-        **synthesis_kwargs,
-    ):
-        ws = self.mapping(
-            z,
-            c,
-            truncation_psi=truncation_psi,
-            truncation_cutoff=truncation_cutoff,
-            update_emas=update_emas,
-        )
+    def forward(self, z, c=None, truncation_psi=1.0, truncation_cutoff=None,
+                update_emas=False, **synthesis_kwargs):
+        ws = self.mapping(z, c, truncation_psi=truncation_psi,
+                          truncation_cutoff=truncation_cutoff, update_emas=update_emas)
         return self.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
 
-    @classmethod
-    def from_checkpoint(
-        cls, path: str, device: torch.device | str = "cpu"
-    ) -> "Generator":
-        return load_generator_checkpoint(path, device=device)
+
+class OptimizedPointwiseStyleSynthesis(nn.Module):
+    """Compose the unmodified optimized prefix with this file's W-aware head."""
+    def __init__(self, synthesis, cfg, copy_module=True):
+        super().__init__()
+        from .torch_utils.ops.optimized_synthesis import build_optimized_early_output_synthesis
+        synthesis = copy.deepcopy(synthesis) if copy_module else synthesis
+        self.decoder = synthesis.decoder
+        # A private module registry lets the generic optimized code return
+        # features through Identity, without replacing the caller's decoder.
+        prefix = copy.copy(synthesis)
+        prefix._modules = dict(synthesis._modules)
+        prefix.decoder = nn.Identity()
+        self.prefix = build_optimized_early_output_synthesis(prefix, cfg, copy_module=False)
+        self.cfg = cfg
+
+    def forward(self, ws, noise_mode="const", force_fp32=False):
+        features = self.prefix(ws, noise_mode=noise_mode, force_fp32=force_fp32)
+        context = (torch.autocast("cuda", dtype=self.cfg.low_precision_dtype)
+                   if features.device.type == "cuda" and not force_fp32 else nullcontext())
+        with context:
+            return self.decoder(features, ws)
 
 
-# ---------------------------------------------------------------------------
-# Source checkpoint loading and conversion
-# ---------------------------------------------------------------------------
+def build_optimized_early_output_synthesis(synthesis, cfg, *, copy_module=True):
+    return OptimizedPointwiseStyleSynthesis(synthesis, cfg, copy_module).eval().requires_grad_(False)
+
+
+def load_generator_checkpoint(path: str, device="cpu") -> Generator:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    config = checkpoint.get("generator_config") or checkpoint.get("config", {})
+    if config != GENERATOR_CONFIG or "generator" not in checkpoint:
+        raise ValueError("Expected a pointwise_style32 generator export or training checkpoint")
+    model = Generator()
+    model.load_state_dict(checkpoint["generator"], strict=True)
+    return model.eval().requires_grad_(False).to(device)
+
+
+# The full 1024 teacher is needed only for continued distillation. These
+# readers handle the repo's Rosinality weights and NVIDIA source checkpoints.
+
 
 def _convert_rosinality_stylegan2_state_dict(
     state: Mapping[str, torch.Tensor], latent_avg: Optional[torch.Tensor] = None
@@ -456,327 +292,3 @@ def _load_full_source_generator(path: str) -> FullStyleGAN2Generator:
     for parameter in source.parameters():
         parameter.requires_grad_(False)
     return source
-
-
-def _strip_module_prefix(state: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    if state and all(key.startswith("module.") for key in state):
-        return {key[len("module.") :]: value for key, value in state.items()}
-    return dict(state)
-
-
-@dataclass
-class DecoderConfig:
-    hidden_channels: int = 16
-    train_baseline: bool = False
-    output_resolution: int = OUTPUT_RESOLUTION
-
-
-def _infer_decoder_config(
-    state: Mapping[str, torch.Tensor], saved_config: Optional[Mapping] = None,
-    saved_architecture: Optional[str] = None,
-) -> DecoderConfig:
-    saved_config = {} if saved_config is None else saved_config
-    mix_in = state.get("refiner.mix_in.weight")
-    if mix_in is None:
-        raise ValueError(
-            "Decoder checkpoint is not the fast v2 architecture; legacy decoders "
-            "are no longer supported"
-        )
-    input_channels = int(mix_in.shape[1])
-    resolution_by_channels = {
-        min(32768 // resolution, 512): resolution
-        for resolution in SUPPORTED_OUTPUT_RESOLUTIONS
-    }
-    state_resolution = resolution_by_channels.get(input_channels)
-    if state_resolution is None:
-        raise ValueError(
-            f"Unsupported decoder input width {input_channels}; expected one of "
-            f"{sorted(resolution_by_channels)} for b128/b256"
-        )
-
-    declared_resolution = saved_config.get(
-        "output_resolution", saved_config.get("stop_resolution")
-    )
-    architecture_resolutions = {
-        "stylegan_early_output_v2": 256,
-        "stylegan_early_output_128_v2": 128,
-    }
-    architecture_resolution = architecture_resolutions.get(saved_architecture)
-    for label, resolution in (
-        ("saved config", declared_resolution),
-        ("checkpoint architecture", architecture_resolution),
-    ):
-        if resolution is not None and int(resolution) != state_resolution:
-            raise ValueError(
-                f"Decoder {label} declares b{resolution}, but its {input_channels} "
-                f"input channels identify b{state_resolution}"
-            )
-
-    return DecoderConfig(
-        hidden_channels=int(saved_config.get("hidden_channels", mix_in.shape[0])),
-        train_baseline=bool(saved_config.get("train_baseline", False)),
-        output_resolution=state_resolution,
-    )
-
-
-def load_decoder_checkpoint(
-    path: str, state_choice: str = "auto"
-) -> Tuple[Dict[str, torch.Tensor], DecoderConfig, str]:
-    """Load a training checkpoint, best EMA checkpoint, or raw decoder state."""
-    if state_choice not in ("auto", "ema", "model"):
-        raise ValueError("state_choice must be auto, ema, or model")
-    if not osp.isfile(path):
-        raise FileNotFoundError(f"Decoder checkpoint not found: {path!r}")
-    checkpoint = _torch_load(path, map_location="cpu")
-    saved_config: Mapping = {}
-    selected = "raw"
-    if isinstance(checkpoint, Mapping):
-        saved_config = checkpoint.get("config", {})
-        if state_choice in ("auto", "ema") and isinstance(checkpoint.get("ema"), Mapping):
-            state = checkpoint["ema"]
-            selected = "ema"
-        elif isinstance(checkpoint.get("decoder"), Mapping):
-            state = checkpoint["decoder"]
-            selected = "decoder"
-        elif state_choice == "ema":
-            raise KeyError("Requested EMA state, but checkpoint has no 'ema' entry")
-        elif checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
-            state = checkpoint
-        else:
-            raise ValueError("Could not locate a decoder state dictionary in checkpoint")
-    else:
-        raise ValueError("Decoder checkpoint must contain a state dictionary")
-    state = _strip_module_prefix(state)
-    saved_architecture = checkpoint.get("architecture")
-    config = _infer_decoder_config(state, saved_config, saved_architecture)
-    return state, config, selected
-
-
-def _validate_decoder_source_match(
-    decoder_state: Mapping[str, torch.Tensor],
-    decoder_config: DecoderConfig,
-    source: FullStyleGAN2Generator,
-    allow_mismatch: bool,
-) -> None:
-    mismatches = []
-    if decoder_config.train_baseline:
-        print("  \\__Baseline source equality check skipped: baseline was fine-tuned")
-    else:
-        expected_weight, expected_bias = _fold_average_w_torgb(
-            getattr(
-                source.synthesis, f"b{decoder_config.output_resolution}"
-            ).torgb,
-            source.mapping.w_avg,
-        )
-        for key, expected in (
-            ("baseline.weight", expected_weight),
-            ("baseline.bias", expected_bias),
-        ):
-            actual = decoder_state.get(key)
-            if actual is None or not torch.allclose(
-                actual.detach().cpu(), expected.detach().cpu(), rtol=1e-5, atol=1e-6
-            ):
-                mismatches.append(key)
-    if mismatches and not allow_mismatch:
-        raise ValueError(
-            "Decoder baseline does not match the supplied FFHQ generator "
-            f"({len(mismatches)} mismatches; first: {mismatches[:5]}). "
-            "Use the same FFHQ weights used for training, or pass "
-            "--allow-baseline-mismatch deliberately."
-        )
-    if mismatches:
-        print(f"  \\__Warning: accepted {len(mismatches)} decoder/source mismatches")
-
-
-def convert_checkpoints(
-    ffhq_weights: str,
-    decoder_weights: str,
-    output_path: str,
-    *,
-    state_choice: str = "auto",
-    allow_baseline_mismatch: bool = False,
-    verify: bool = True,
-) -> dict:
-    """Merge frozen StyleGAN prefix and trained decoder into one checkpoint."""
-    print(f"#. Loading FFHQ generator: {ffhq_weights}")
-    source = _load_full_source_generator(ffhq_weights)
-    print(f"#. Loading decoder: {decoder_weights}")
-    decoder_state, decoder_config, selected_state = load_decoder_checkpoint(
-        decoder_weights, state_choice=state_choice
-    )
-    print(f"  \\__Selected decoder state: {selected_state}")
-    print(f"  \\__Decoder config: {json.dumps(asdict(decoder_config), sort_keys=True)}")
-    _validate_decoder_source_match(
-        decoder_state,
-        decoder_config,
-        source,
-        allow_mismatch=allow_baseline_mismatch,
-    )
-
-    generator = Generator(
-        z_dim=source.z_dim,
-        c_dim=source.c_dim,
-        w_dim=source.w_dim,
-        img_resolution=decoder_config.output_resolution,
-        img_channels=source.img_channels,
-        decoder_hidden_channels=decoder_config.hidden_channels,
-    )
-    generator.mapping.load_state_dict(source.mapping.state_dict(), strict=True)
-    for resolution in generator.synthesis.block_resolutions:
-        target_block = getattr(generator.synthesis, f"b{resolution}")
-        source_block = getattr(source.synthesis, f"b{resolution}")
-        target_block.load_state_dict(source_block.state_dict(), strict=True)
-    from models.StyleGAN_SkipNetwork import (
-        EarlyOutputDecoder as TrainingEarlyOutputDecoder,
-        FrozenToRGBBaseline as TrainingFrozenToRGBBaseline,
-    )
-
-    training_decoder = TrainingEarlyOutputDecoder(
-        TrainingFrozenToRGBBaseline(
-            getattr(
-                source.synthesis, f"b{decoder_config.output_resolution}"
-            ).torgb,
-            source.mapping.w_avg,
-            trainable=decoder_config.train_baseline,
-        ),
-        hidden_channels=decoder_config.hidden_channels,
-    )
-    training_decoder.load_state_dict(decoder_state, strict=True)
-    deployed_decoder = training_decoder.eval().to_deploy()
-    generator.synthesis.decoder.load_state_dict(
-        deployed_decoder.state_dict(), strict=True
-    )
-    generator.eval()
-
-    config = {
-        "z_dim": generator.z_dim,
-        "c_dim": generator.c_dim,
-        "w_dim": generator.w_dim,
-        "img_resolution": generator.img_resolution,
-        "img_channels": generator.img_channels,
-        "decoder_hidden_channels": decoder_config.hidden_channels,
-    }
-    checkpoint = {
-        "format": FORMAT_NAME,
-        "generator": generator.state_dict(),
-        "config": config,
-        "source": {
-            "ffhq_weights": osp.basename(ffhq_weights),
-            "decoder_weights": osp.basename(decoder_weights),
-            "decoder_state": selected_state,
-            "train_baseline": decoder_config.train_baseline,
-            "output_resolution": decoder_config.output_resolution,
-        },
-    }
-
-    output_directory = osp.dirname(osp.abspath(output_path))
-    os.makedirs(output_directory, exist_ok=True)
-    torch.save(checkpoint, output_path)
-    print(f"#. Saved integrated generator: {output_path}")
-
-    if verify:
-        print("#. Verifying converted generator...")
-        with torch.inference_mode():
-            z = torch.randn(1, generator.z_dim)
-            image = generator(z, noise_mode="const", force_fp32=True)
-        expected_shape = (
-            1,
-            IMG_CHANNELS,
-            decoder_config.output_resolution,
-            decoder_config.output_resolution,
-        )
-        if image.shape != expected_shape:
-            raise RuntimeError(f"Converted generator produced unexpected shape {tuple(image.shape)}")
-        if not torch.isfinite(image).all():
-            raise RuntimeError("Converted generator produced non-finite values")
-        reloaded = load_generator_checkpoint(output_path, device="cpu")
-        with torch.inference_mode():
-            reloaded_image = reloaded(z, noise_mode="const", force_fp32=True)
-        if not torch.equal(image, reloaded_image):
-            max_difference = float((image - reloaded_image).abs().max())
-            raise RuntimeError(
-                f"Reloaded generator changed output (max difference {max_difference:.3e})"
-            )
-        print(f"  \\__Verified output shape {tuple(image.shape)} and exact reload")
-    return checkpoint
-
-
-def load_generator_checkpoint(
-    path: str, device: torch.device | str = "cpu"
-) -> Generator:
-    checkpoint = _torch_load(path, map_location="cpu")
-    checkpoint_format = checkpoint.get("format") if isinstance(checkpoint, Mapping) else None
-    if checkpoint_format != FORMAT_NAME:
-        raise ValueError(f"Not a {FORMAT_NAME} checkpoint: {path!r}")
-    config = dict(checkpoint["config"])
-    generator = Generator(**config)
-    generator.load_state_dict(checkpoint["generator"], strict=True)
-    generator.eval().requires_grad_(False)
-    return generator.to(device)
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Merge FFHQ StyleGAN2 and an early-output decoder checkpoint"
-    )
-    parser.add_argument("--ffhq-weights", default=None)
-    parser.add_argument("--decoder-weights", required=True)
-    parser.add_argument("--output", default=None)
-    parser.add_argument(
-        "--decoder-state",
-        choices=("auto", "ema", "model"),
-        default="auto",
-        help="auto prefers EMA, then decoder; model selects the decoder entry",
-    )
-    parser.add_argument(
-        "--allow-baseline-mismatch",
-        action="store_true",
-        help="allow decoder toRGB/average-W from a different FFHQ checkpoint",
-    )
-    parser.add_argument(
-        "--verify",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="run a CPU forward and exact save/reload comparison",
-    )
-    return parser
-
-
-def main() -> None:
-    args = build_argparser().parse_args()
-    _TRAVERSALS_MODELS_DIR = osp.dirname(osp.dirname(osp.abspath(__file__)))
-
-    if args.ffhq_weights is None:
-        args.ffhq_weights = osp.join(
-            _TRAVERSALS_MODELS_DIR,
-            "pretrained",
-            "generators",
-            "StyleGAN2",
-            "stylegan2-ffhq-config-f.pt",
-        )
-    if args.output is None:
-        _, decoder_config, _ = load_decoder_checkpoint(
-            args.decoder_weights, state_choice=args.decoder_state
-        )
-        resolution_suffix = (
-            "" if decoder_config.output_resolution == OUTPUT_RESOLUTION else "-128"
-        )
-        args.output = osp.join(
-            _TRAVERSALS_MODELS_DIR,
-            "pretrained",
-            "generators",
-            "StyleGAN2",
-            f"stylegan2-ffhq-config-f-early-output{resolution_suffix}.pt",
-        )
-    convert_checkpoints(
-        args.ffhq_weights,
-        args.decoder_weights,
-        args.output,
-        state_choice=args.decoder_state,
-        allow_baseline_mismatch=args.allow_baseline_mismatch,
-        verify=args.verify,
-    )
-
-
-if __name__ == "__main__":
-    main()

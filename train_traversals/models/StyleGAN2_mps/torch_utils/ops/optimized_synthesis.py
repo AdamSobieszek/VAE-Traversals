@@ -448,10 +448,7 @@ class OptimizedEarlyOutputSynthesis(nn.Module):
             else nullcontext()
         )
         with autocast:
-            if getattr(self.synthesis.decoder, "architecture", "pointwise") != "pointwise":
-                output = self.synthesis.decoder(features.float(), ws)
-            else:
-                output = self.synthesis.decoder(features.float())
+            output = self.synthesis.decoder(features.float())
         return output
 
 

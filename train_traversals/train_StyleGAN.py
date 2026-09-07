@@ -33,7 +33,6 @@ def main():
         --biggan-target-classes    : set list of classes to use for conditional BigGAN (see BIGGAN_CLASSES in
                                      lib/config.py). E.g., --biggan-target-classes 14 239.
         --stylegan2-resolution     : set StyleGAN2 generator output images resolution:  256 or 1024 (default: 1024)
-        --early-output-resolution  : select the learned early-output model resolution: 128 or 256 (default: 256)
         --shift-in-w-space         : search latent paths in StyleGAN2's W-space (otherwise, look in Z-space)
 
         ===[ Support Sets (S) ]=========================================================================================
@@ -65,13 +64,6 @@ def main():
     parser.add_argument('--biggan-target-classes', nargs='+', type=int, help="list of classes for conditional BigGAN")
     parser.add_argument('--stylegan2-resolution', type=int, default=1024, choices=(256, 1024),
                         help="StyleGAN2 image resolution")
-    parser.add_argument(
-        '--early-output-resolution',
-        type=int,
-        default=256,
-        choices=(128, 256),
-        help="learned early-output model resolution (requires --early-output)",
-    )
     parser.add_argument('--shift-in-w-space', action='store_true', help="search latent paths in StyleGAN2's W-space")
 
     # === Support Sets (S) ======================================================================== #
@@ -134,15 +126,8 @@ def main():
     args = parser.parse_args()
     if args.early_output and args.gan_type != 'StyleGAN2':
         parser.error("--early-output requires --gan-type StyleGAN2")
-    if args.early_output_resolution != 256 and not args.early_output:
-        parser.error("--early-output-resolution requires --early-output")
-
     if args.early_output:
-        stylegan2_weight_key = (
-            "early_output_128"
-            if args.early_output_resolution == 128
-            else "early_output"
-        )
+        stylegan2_weight_key = "early_output_128"
     else:
         stylegan2_weight_key = args.stylegan2_resolution
 
@@ -163,10 +148,7 @@ def main():
     if args.gan_type == 'StyleGAN2':
         print("  \\__Search for paths in {}-space".format('W' if args.shift_in_w_space else 'Z'))
         if args.early_output:
-            print("  \\__Output mode: learned early output ({}x{})".format(
-                args.early_output_resolution,
-                args.early_output_resolution,
-            ))
+            print("  \\__Output mode: pointwise_style32 (128x128)")
     if args.z_truncation:
         print("  \\__Input noise truncation: {}".format(args.z_truncation))
     print("  \\__Pre-trained weights: {}".format(

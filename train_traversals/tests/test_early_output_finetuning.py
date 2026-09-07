@@ -1,5 +1,4 @@
 """Bounded correctness checks; image/decoder checks use MPS at batch one locally."""
-import copy
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -9,7 +8,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from models import StyleGAN_SkipNetwork128 as training
-from models.StyleGAN2_mps.early_output_model import FusedFastEarlyOutputDecoder
+from models.StyleGAN2_mps.early_output_model import (
+    PointwiseStyleDecoder, load_generator_checkpoint, build_optimized_early_output_synthesis,
+)
+from models.StyleGAN2_mps.torch_utils.ops.inference_opt import InferenceOptConfig
 
 
 class FinetuningTests(unittest.TestCase):
@@ -73,48 +75,40 @@ class FinetuningTests(unittest.TestCase):
             torch.testing.assert_close(ws1[:, i], ws1[:, 9 if i % 2 else 10])
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "Local decoder tests require MPS")
-    def test_migration_gradients_and_decoder_reload_mps(self):
-        device = torch.device("mps")
+    def test_style_and_feature_gradients_and_reload_mps(self):
         torch.manual_seed(7)
-        old = FusedFastEarlyOutputDecoder(256, 16).to(device)
+        decoder = PointwiseStyleDecoder().to("mps")
+        features = torch.randn(1, 256, 16, 16, device="mps", requires_grad=True)
+        ws = torch.randn(1, 12, 512, device="mps", requires_grad=True)
+        decoder(features, ws).square().mean().backward()
+        for gradient in (features.grad, ws.grad[:, 9:11], decoder.style[1].weight.grad):
+            self.assertTrue(torch.isfinite(gradient).all())
+            self.assertGreater(float(gradient.abs().sum()), 0)
+        restored = PointwiseStyleDecoder().to("mps")
+        restored.load_state_dict(decoder.state_dict(), strict=True)
         with torch.no_grad():
-            old.linear.weight.normal_(std=.01)
-            old.mix_out.weight.normal_(std=.01)
-        features = torch.randn(1, 256, 16, 16, device=device)
-        ws = torch.randn(1, 12, 512, device=device)
+            torch.testing.assert_close(restored(features, ws), decoder(features, ws), rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "Local inference tests require MPS")
+    def test_optimized_output_and_latent_gradient_mps(self):
+        if not Path(training.DEFAULT_EARLY_OUTPUT_WEIGHTS).is_file():
+            self.skipTest("Trained checkpoint is not installed")
+        model = load_generator_checkpoint(training.DEFAULT_EARLY_OUTPUT_WEIGHTS, "mps")
+        torch.manual_seed(13)
         with torch.no_grad():
-            expected = old(features, ws)
-        for architecture, hidden in (("pointwise", 16), ("pointwise", 32), ("pointwise_style", 16), ("spatial_style", 16)):
-            model = SimpleNamespace(synthesis=SimpleNamespace(decoder=copy.deepcopy(old)))
-            cfg = training.TrainConfig(hidden_channels=hidden, decoder_architecture=architecture)
-            training.migrate_finetuning_decoder(model, cfg)
-            decoder = model.synthesis.decoder
-            if architecture == "pointwise_style":
-                self.assertIsInstance(decoder.spatial_conv, torch.nn.Identity)
-            with torch.no_grad():
-                torch.testing.assert_close(decoder(features, ws), expected, rtol=2e-5, atol=2e-6)
-            optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3)
-            target = torch.randn_like(expected)
-            for _ in range(4):
-                optimizer.zero_grad()
-                (decoder(features, ws) - target).square().mean().backward()
-                self.assertTrue(all(torch.isfinite(p.grad).all() for p in decoder.parameters() if p.grad is not None))
-                optimizer.step()
-            if architecture != "pointwise":
-                self.assertGreater(float(decoder.spatial_in.weight.grad.abs().sum()), 0)
-                self.assertGreater(float(decoder.style[1].weight.grad.abs().sum()), 0)
-                with self.assertRaisesRegex(ValueError, "W slots"):
-                    decoder(features)
-                with torch.no_grad():
-                    self.assertFalse(torch.equal(decoder(features, ws), decoder(features, -ws)))
-            restored = FusedFastEarlyOutputDecoder(256, hidden, architecture=architecture).to(device)
-            restored.load_state_dict(decoder.state_dict(), strict=True)
-            with torch.no_grad():
-                torch.testing.assert_close(restored(features, ws), decoder(features, ws), rtol=0, atol=0)
-                # Continuing a trained conditioned head must retain its branch.
-                expected_trained = decoder(features, ws)
-                training.migrate_finetuning_decoder(model, cfg)
-                torch.testing.assert_close(model.synthesis.decoder(features, ws), expected_trained, rtol=0, atol=0)
+            ws = model.mapping(torch.randn(1, 512, device="mps"), None)
+        ws = ws.clone().requires_grad_(True)
+        expected = model.synthesis(ws, noise_mode="const", fused_modconv=False)
+        gradient = torch.autograd.grad(expected.square().mean(), ws)[0]
+        decoder = model.synthesis.decoder
+        optimized = build_optimized_early_output_synthesis(
+            model.synthesis, InferenceOptConfig(shared_modconv=True, fir_compose=False,
+                                               fused_modconv=False), copy_module=False)
+        self.assertIs(model.synthesis.decoder, decoder)
+        actual = optimized(ws, noise_mode="const", force_fp32=True)
+        actual_gradient = torch.autograd.grad(actual.square().mean(), ws)[0]
+        torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(actual_gradient, gradient, rtol=2e-3, atol=2e-5)
 
 
 if __name__ == "__main__":

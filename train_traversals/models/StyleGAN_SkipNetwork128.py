@@ -37,6 +37,7 @@ Run from ``train_traversals`` with, for example::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import copy
 import io
 import json
@@ -60,10 +61,11 @@ try:
 except ImportError:  # pragma: no cover - compatibility with older PyTorch
     from torch.cuda.amp import GradScaler, autocast
 
-from models.stylegan_feature_codec import face_saliency_mask, weighted_spatial_mean
+from models.stylegan_feature_codec import face_saliency_mask, tzone_support_mask
 from models.StyleGAN2_mps.early_output_model import (
     FORMAT_NAME as EARLY_OUTPUT_FORMAT_NAME,
     Generator as IntegratedEarlyOutputGenerator,
+    FusedFastEarlyOutputDecoder,
     load_generator_checkpoint,
 )
 
@@ -95,6 +97,7 @@ Z_DIM = 512
 W_DIM = 512
 TRAINING_MODES = ("decoder", "finetuning")
 W_AUGMENTATION_TYPES = 3
+EVAL_GROUPS = ("normal", "all", "first8", "odd")
 DECODER_LOSS_WEIGHTS = {
     "l1_weight": 1.0,
     "mse_weight": 0.25,
@@ -295,7 +298,7 @@ class StyleGANFeatureExtractor(nn.Module):
                 and not key.endswith("resample_filter")
             ]
             if missing:
-                print(f"  \\__Warning: missing StyleGAN keys: {len(missing)}")
+                raise ValueError(f"Teacher checkpoint is incomplete: {missing[:10]}")
             if unexpected:
                 print(f"  \\__Warning: unexpected StyleGAN keys: {len(unexpected)}")
 
@@ -537,24 +540,6 @@ class FastRGBResidualRefiner(nn.Module):
         return self.spatial(features) + nonlinear
 
 
-class FusedFastEarlyOutputDecoder(nn.Module):
-    """Deployment form: fused toRGB/spatial conv plus a pointwise MLP."""
-
-    def __init__(self, in_channels: int, hidden_channels: int = 16):
-        super().__init__()
-        self.in_channels = int(in_channels)
-        self.linear = nn.Conv2d(in_channels, 3, kernel_size=3, padding=1)
-        self.mix_in = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
-        self.activation = nn.SiLU(inplace=True)
-        self.mix_out = nn.Conv2d(hidden_channels, 3, kernel_size=1)
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        features = features.float()
-        return self.linear(features) + self.mix_out(
-            self.activation(self.mix_in(features))
-        )
-
-
 class EarlyOutputDecoder(nn.Module):
     """Fast train-time decoder initialized as folded toRGB plus zero residual."""
 
@@ -697,6 +682,7 @@ class AdamWWithReferenceDecay(torch.optim.AdamW):
                         "reference_weight_decay * lr must be in [0, 1], "
                         f"got {amount} for group {group.get('group_name')!r}"
                     )
+                buckets = {}
                 for parameter in group["params"]:
                     # Match AdamW semantics: parameters without a gradient are
                     # not changed merely because they belong to an optimizer.
@@ -707,7 +693,15 @@ class AdamWWithReferenceDecay(torch.optim.AdamW):
                         raise RuntimeError(
                             "Reference-decayed optimizer parameter has no teacher value"
                         )
-                    parameter.lerp_(reference, amount)
+                    bucket = buckets.setdefault((parameter.device, parameter.dtype), ([], []))
+                    bucket[0].append(parameter)
+                    bucket[1].append(reference)
+                for parameters, references in buckets.values():
+                    if parameters[0].device.type in ("cuda", "cpu"):
+                        torch._foreach_lerp_(parameters, references, amount)
+                    else:
+                        for parameter, reference in zip(parameters, references):
+                            parameter.lerp_(reference, amount)
 
         adam_loss = super().step(closure=None)
         return loss if closure is not None else adam_loss
@@ -745,6 +739,14 @@ def random_crop_pair(*tensors: torch.Tensor, crop: int) -> Tuple[torch.Tensor, .
     return tuple(
         tensor[..., top : top + crop, left : left + crop] for tensor in tensors
     )
+
+
+def weighted_spatial_mean(values: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """FP32 products and per-image normalization, including under autocast."""
+    values = values.float()
+    weight = weight.to(device=values.device, dtype=torch.float32).expand_as(values)
+    axes = tuple(range(1, values.ndim))
+    return ((values * weight).sum(axes) / weight.sum(axes).clamp_min(1e-12)).mean()
 
 
 def _weighted_or_mean(values: torch.Tensor, weight: Optional[torch.Tensor]) -> torch.Tensor:
@@ -865,16 +867,19 @@ def image_reconstruction_loss(
     saliency: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """LPIPS plus pixel and focal-detail losses in native ``[-1, 1]`` space."""
-    target = target.to(device=prediction.device, dtype=prediction.dtype)
+    prediction = prediction.float()
+    target = target.to(device=prediction.device, dtype=torch.float32)
     difference = prediction - target
     l1 = _weighted_or_mean(difference.abs(), saliency)
     mse = _weighted_or_mean(difference.square(), saliency)
-    edge = _fine_detail_loss(prediction, target, saliency)
+    edge = (_fine_detail_loss(prediction, target, saliency)
+            if edge_weight > 0 else prediction.new_zeros(()))
     perceptual = prediction.new_zeros(())
     if lpips_weight > 0.0:
         if lpips_fn is None:
             raise RuntimeError("LPIPS weight is nonzero but no LPIPS network was provided")
-        perceptual_map = lpips_fn(prediction.clamp(-1, 1), target.clamp(-1, 1))
+        with torch.autocast(prediction.device.type, enabled=False):
+            perceptual_map = lpips_fn(prediction.clamp(-1, 1), target.clamp(-1, 1)).float()
         if saliency is not None:
             perceptual_weight = saliency
             if perceptual_weight.shape[-2:] != perceptual_map.shape[-2:]:
@@ -1162,7 +1167,7 @@ class TrainConfig:
     out_dir: str = "experiments/stylegan_early_output_128_fast_v2"
     batch_size: int = 2
     max_steps: int = 10_000
-    lr: float = 2e-4
+    lr: float = 1e-4
     synthesis_lr: Optional[float] = None
     weight_decay: float = 2e-4
     synthesis_reference_decay: Optional[float] = None
@@ -1176,11 +1181,11 @@ class TrainConfig:
     edge_weight: Optional[float] = None
     lpips_weight: Optional[float] = None
     crop_size: int = 128
-    crops_per_sample: int = 4
+    crops_per_sample: int = 1
     fullres_every: int = 100
     saliency: bool = True
     warmup_steps: int = 500
-    ema_decay: float = 0.995
+    ema_decay: float = 0.0
     grad_clip: float = 1.0
     log_every: int = 25
     val_every: int = 200
@@ -1192,6 +1197,20 @@ class TrainConfig:
     reset_steps: bool = False
     amp: bool = False
     skip_gan_load: bool = False
+    device: str = "auto"
+    decoder_architecture: str = "spatial_style"
+    spatial_channels: int = 32
+    head_only_steps: int = 500
+    finetune_min_resolution: int = 32
+    early_synthesis_lr_scale: float = 0.25
+    truncation_jitter: float = 0.0
+    balanced_augmentations: bool = True
+    saliency_uniform_mix: float = 0.5
+    val_count: int = 64
+    test_count: int = 128
+    eval_batch_size: int = 4
+    eval_cache_dir: Optional[str] = None
+    benchmark_repeats: int = 20
 
     def __post_init__(self) -> None:
         defaults = (
@@ -1203,12 +1222,12 @@ class TrainConfig:
             if getattr(self, name) is None:
                 setattr(self, name, value)
         if self.synthesis_lr is None:
-            self.synthesis_lr = 0.1 * self.lr
+            self.synthesis_lr = self.lr
         if self.synthesis_reference_decay is None:
             # AdamW-style coefficient: the optimizer multiplies it by the
             # synthesis group's current scheduled LR on every step.
             self.synthesis_reference_decay = (
-                0.1 if self.training_mode == "finetuning" else self.weight_decay
+                0.001 if self.training_mode == "finetuning" else self.weight_decay
             )
 
 
@@ -1275,6 +1294,8 @@ def _integrated_generator_config(model: IntegratedEarlyOutputGenerator) -> dict:
         "img_resolution": model.img_resolution,
         "img_channels": model.img_channels,
         "decoder_hidden_channels": int(model.synthesis.decoder.mix_in.out_channels),
+        "decoder_architecture": model.synthesis.decoder.architecture,
+        "decoder_spatial_channels": model.synthesis.decoder.spatial_channels,
     }
 
 
@@ -1300,76 +1321,6 @@ def _validate_mapping_match(
         )
 
 
-def _finetuning_parameter_groups(
-    model: IntegratedEarlyOutputGenerator,
-    teacher: StyleGANFeatureExtractor,
-    cfg: TrainConfig,
-) -> Tuple[List[dict], List[nn.Parameter], Dict[int, torch.Tensor]]:
-    """Unfreeze used prefix/decoder parameters while keeping mapping and toRGBs fixed."""
-    model.requires_grad_(False)
-    model.mapping.eval()
-
-    decoder = model.synthesis.decoder
-    residual_parameters = list(decoder.mix_in.parameters()) + list(
-        decoder.mix_out.parameters()
-    )
-    linear_parameters = list(decoder.linear.parameters())
-    synthesis_named_parameters = [
-        (name, parameter)
-        for name, parameter in model.synthesis.named_parameters()
-        if not name.startswith("decoder.") and ".torgb." not in name
-    ]
-    synthesis_parameters = [parameter for _, parameter in synthesis_named_parameters]
-    teacher_parameters = dict(teacher.G.synthesis.named_parameters())
-    reference_parameters: Dict[int, torch.Tensor] = {}
-    for name, parameter in synthesis_named_parameters:
-        reference = teacher_parameters.get(name)
-        if reference is None or reference.shape != parameter.shape:
-            raise ValueError(
-                f"Teacher has no matching synthesis reference for {name!r} "
-                f"with shape {tuple(parameter.shape)}"
-            )
-        reference_parameters[id(parameter)] = reference.detach()
-    for parameter in residual_parameters + linear_parameters + synthesis_parameters:
-        parameter.requires_grad_(True)
-
-    parameter_groups = [
-        {
-            "params": residual_parameters,
-            "lr": cfg.lr,
-            "base_lr": cfg.lr,
-            "lr_scale": 1.0,
-            "warmup_steps": cfg.warmup_steps,
-            "group_name": "decoder_residual",
-        },
-        {
-            "params": linear_parameters,
-            "lr": 0.5 * cfg.lr,
-            "base_lr": 0.5 * cfg.lr,
-            "lr_scale": 0.5,
-            "warmup_steps": 0,
-            "group_name": "decoder_linear",
-        },
-        {
-            "params": synthesis_parameters,
-            "lr": float(cfg.synthesis_lr),
-            "base_lr": float(cfg.synthesis_lr),
-            "warmup_steps": 0,
-            "group_name": "synthesis_prefix",
-            # Disable zero-centered AdamW decay for the pretrained prefix and
-            # use decoupled decay toward the full teacher weights instead.
-            "weight_decay": 0.0,
-            "reference_weight_decay": float(cfg.synthesis_reference_decay),
-        },
-    ]
-    trainable_parameters = (
-        residual_parameters + linear_parameters + synthesis_parameters
-    )
-    if not all(group["params"] for group in parameter_groups):
-        raise RuntimeError("A finetuning optimizer parameter group is unexpectedly empty")
-    return parameter_groups, trainable_parameters, reference_parameters
-
-
 def _save_integrated_generator(
     path: str,
     model: IntegratedEarlyOutputGenerator,
@@ -1384,7 +1335,7 @@ def _save_integrated_generator(
         "generator": model.state_dict(),
         "config": _integrated_generator_config(model),
         "source": {
-            "finetuned_from": osp.basename(cfg.early_output_weights),
+            "finetuned_from": osp.basename(cfg.resume or cfg.early_output_weights),
             "teacher_weights": osp.basename(cfg.gan_weights),
             "step": int(step),
             "synthesis_reference_decay": float(cfg.synthesis_reference_decay),
@@ -1423,9 +1374,9 @@ def export_finetuning_checkpoint(
             "finetuning run's checkpoint.pt instead"
         )
     architecture = training_checkpoint.get("architecture")
-    if architecture != "stylegan_early_output_128_finetuning_v1":
+    if architecture not in ("stylegan_early_output_128_finetuning_v1", "stylegan_early_output_128_finetuning_v2"):
         raise ValueError(
-            "Expected a stylegan_early_output_128_finetuning_v1 checkpoint, got "
+            "Expected a stylegan_early_output_128_finetuning_v1/v2 checkpoint, got "
             f"{architecture!r}"
         )
 
@@ -1536,6 +1487,8 @@ def _validate_config(cfg: TrainConfig) -> None:
 
 def train(cfg: TrainConfig) -> nn.Module:
     _validate_config(cfg)
+    if cfg.training_mode == "finetuning":
+        return train_finetuning(cfg)
     device = select_device()
     set_seed(cfg.seed, device)
     use_amp = bool(cfg.amp and device.type == "cuda")
@@ -1561,112 +1514,65 @@ def train(cfg: TrainConfig) -> nn.Module:
         device=device,
         load_weights=not cfg.skip_gan_load,
     )
-    reference_parameters: Dict[int, torch.Tensor] = {}
-    if cfg.training_mode == "decoder":
-        print(
-            f"  \\__Input: [{extractor.feature_channels}, {STOP_RESOLUTION}, "
-            f"{STOP_RESOLUTION}]; target: [3, {STOP_RESOLUTION}, "
-            f"{STOP_RESOLUTION}] from area-downsampled 1024 RGB"
-        )
-        model: nn.Module = EarlyOutputDecoder(
-            baseline=extractor.make_torgb_baseline(trainable=cfg.train_baseline),
-            hidden_channels=cfg.hidden_channels,
-        ).to(device)
-        print(f"#. Trainable decoder parameters: {model.num_parameters():,}")
-        print(
-            f"  \\__Estimated deployed decoder MACs: "
-            f"{model.deploy_macs() / 1e9:.3f}G per image"
-        )
-        baseline_parameters = [
-            parameter
-            for parameter in model.baseline.parameters()
-            if parameter.requires_grad
-        ]
-        baseline_parameter_ids = {id(parameter) for parameter in baseline_parameters}
-        refiner_parameters = [
-            parameter
-            for parameter in model.parameters()
-            if parameter.requires_grad and id(parameter) not in baseline_parameter_ids
-        ]
-        parameter_groups = [
+    print(
+        f"  \\__Input: [{extractor.feature_channels}, {STOP_RESOLUTION}, "
+        f"{STOP_RESOLUTION}]; target: [3, {STOP_RESOLUTION}, "
+        f"{STOP_RESOLUTION}] from area-downsampled 1024 RGB"
+    )
+    model: nn.Module = EarlyOutputDecoder(
+        baseline=extractor.make_torgb_baseline(trainable=cfg.train_baseline),
+        hidden_channels=cfg.hidden_channels,
+    ).to(device)
+    print(f"#. Trainable decoder parameters: {model.num_parameters():,}")
+    print(
+        f"  \\__Estimated deployed decoder MACs: "
+        f"{model.deploy_macs() / 1e9:.3f}G per image"
+    )
+    baseline_parameters = [
+        parameter
+        for parameter in model.baseline.parameters()
+        if parameter.requires_grad
+    ]
+    baseline_parameter_ids = {id(parameter) for parameter in baseline_parameters}
+    refiner_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in baseline_parameter_ids
+    ]
+    parameter_groups = [
+        {
+            "params": refiner_parameters,
+            "lr": cfg.lr,
+            "base_lr": cfg.lr,
+            "lr_scale": 1.0,
+            "warmup_steps": cfg.warmup_steps,
+            "group_name": "decoder_refiner",
+        }
+    ]
+    if baseline_parameters:
+        parameter_groups.append(
             {
-                "params": refiner_parameters,
-                "lr": cfg.lr,
-                "base_lr": cfg.lr,
-                "lr_scale": 1.0,
-                "warmup_steps": cfg.warmup_steps,
-                "group_name": "decoder_refiner",
+                "params": baseline_parameters,
+                "lr": 0.5 * cfg.lr,
+                "base_lr": 0.5 * cfg.lr,
+                "lr_scale": 0.5,
+                "warmup_steps": 0,
+                "group_name": "decoder_baseline",
             }
-        ]
-        if baseline_parameters:
-            parameter_groups.append(
-                {
-                    "params": baseline_parameters,
-                    "lr": 0.5 * cfg.lr,
-                    "base_lr": 0.5 * cfg.lr,
-                    "lr_scale": 0.5,
-                    "warmup_steps": 0,
-                    "group_name": "decoder_baseline",
-                }
-            )
-            print(
-                "  \\__Trainable folded toRGB baseline LR: 0.5x, "
-                "cosine with no warmup"
-            )
-        trainable_parameters = [
-            parameter for parameter in model.parameters() if parameter.requires_grad
-        ]
-    else:
-        print(f"#. Loading integrated early-output model: {cfg.early_output_weights}")
-        model = load_generator_checkpoint(cfg.early_output_weights, device=device)
-        if model.img_resolution != STOP_RESOLUTION:
-            raise ValueError(
-                f"Finetuning requires a b{STOP_RESOLUTION} combined model; "
-                f"checkpoint produces b{model.img_resolution}"
-            )
-        _validate_mapping_match(model, extractor)
-        (
-            parameter_groups,
-            trainable_parameters,
-            reference_parameters,
-        ) = _finetuning_parameter_groups(model, extractor, cfg)
-        synthesis_count = sum(
-            parameter.numel() for parameter in parameter_groups[2]["params"]
-        )
-        decoder_count = sum(
-            parameter.numel()
-            for group in parameter_groups[:2]
-            for parameter in group["params"]
         )
         print(
-            f"  \\__Teacher W input: [B, {extractor.G.num_ws}, {W_DIM}]; "
-            f"student prefix consumes first {model.num_ws} slots"
+            "  \\__Trainable folded toRGB baseline LR: 0.5x, "
+            "cosine with no warmup"
         )
-        print(
-            f"  \\__Trainable prefix: {synthesis_count:,} params at "
-            f"{float(cfg.synthesis_lr):.2e}; decoder: {decoder_count:,} params "
-            f"at {cfg.lr:.2e} (linear branch 0.5x)"
-        )
-        print(
-            "  \\__Synthesis reference-decay coefficient: "
-            f"{float(cfg.synthesis_reference_decay):.2e}; peak per-step pull "
-            f"= {float(cfg.synthesis_lr) * float(cfg.synthesis_reference_decay):.2e} "
-            "(scaled by scheduled LR; zero-centered decay disabled)"
-        )
-        print("  \\__Frozen mapping verified equal to the teacher mapping")
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
     optimizer_kwargs = {
         "lr": cfg.lr,
         "weight_decay": cfg.weight_decay,
         "betas": (0.9, 0.999),
     }
-    if cfg.training_mode == "finetuning":
-        optimizer = AdamWWithReferenceDecay(
-            parameter_groups,
-            reference_parameters=reference_parameters,
-            **optimizer_kwargs,
-        )
-    else:
-        optimizer = torch.optim.AdamW(parameter_groups, **optimizer_kwargs)
+    optimizer = torch.optim.AdamW(parameter_groups, **optimizer_kwargs)
     try:
         scaler = GradScaler("cuda", enabled=use_amp)
     except TypeError:  # pragma: no cover - older PyTorch
@@ -1688,51 +1594,26 @@ def train(cfg: TrainConfig) -> nn.Module:
             )
         except TypeError:  # pragma: no cover - older PyTorch
             checkpoint = torch.load(cfg.resume, map_location=device)
-        expected_architecture = (
-            "stylegan_early_output_128_v2"
-            if cfg.training_mode == "decoder"
-            else "stylegan_early_output_128_finetuning_v1"
-        )
+        expected_architecture = "stylegan_early_output_128_v2"
         if checkpoint.get("architecture") != expected_architecture:
             raise ValueError(
                 f"Resume checkpoint architecture {checkpoint.get('architecture')!r} "
                 f"does not match {expected_architecture!r}."
             )
-        if cfg.training_mode == "decoder":
-            saved_train_baseline = bool(
-                checkpoint.get("config", {}).get("train_baseline", False)
+        saved_train_baseline = bool(
+            checkpoint.get("config", {}).get("train_baseline", False)
+        )
+        if saved_train_baseline != cfg.train_baseline:
+            raise ValueError(
+                "Resume checkpoint train_baseline setting does not match this run"
             )
-            if saved_train_baseline != cfg.train_baseline:
-                raise ValueError(
-                    "Resume checkpoint train_baseline setting does not match this run"
-                )
-            model_state = checkpoint["decoder"]
-        else:
-            model_state = checkpoint["generator"]
+        model_state = checkpoint["decoder"]
         model.load_state_dict(model_state)
         ema.ema.load_state_dict(checkpoint.get("ema", model_state))
         best_loss = float(checkpoint.get("best_loss", best_loss))
         if not cfg.reset_steps:
             if "optimizer" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer"])
-                if cfg.training_mode == "finetuning":
-                    # Normalize optimizer-group fields across earlier reference
-                    # decay implementations and resume with the requested
-                    # AdamW-style coefficient.
-                    synthesis_group = optimizer.param_groups[2]
-                    synthesis_group["weight_decay"] = 0.0
-                    synthesis_group.pop("reference_decay", None)
-                    synthesis_group["reference_weight_decay"] = float(
-                        cfg.synthesis_reference_decay
-                    )
-                    saved_semantics = checkpoint.get(
-                        "synthesis_reference_decay_semantics"
-                    )
-                    if saved_semantics != "adamw_lr_scaled_pre_update_v1":
-                        print(
-                            "  \\__Migrated optimizer reference decay to "
-                            "AdamW-style LR scaling applied before the task update"
-                        )
             start_step = int(checkpoint.get("step", 0))
 
     validation_count = max(cfg.plot_count, 1)
@@ -1745,9 +1626,6 @@ def train(cfg: TrainConfig) -> nn.Module:
         cfg.skip_gan_load,
         cfg.training_mode,
     )
-    # Inference tensors cannot be saved for backward by the finetuned prefix.
-    # Validation never backpropagates, but ordinary tensors also keep behavior
-    # consistent across PyTorch backends.
     val_features = val_features.detach().clone()
     val_targets = val_targets.detach().clone()
     saliency_full = (
@@ -1758,22 +1636,19 @@ def train(cfg: TrainConfig) -> nn.Module:
         else None
     )
 
-    if cfg.training_mode == "decoder":
-        with torch.no_grad():
-            initial = _forward_training_model(
-                model,
-                val_features[:1],
-                training_mode=cfg.training_mode,
-                noise_mode=cfg.noise_mode,
-            )
-            initial_delta = (
-                initial["prediction"] - initial["baseline"]
-            ).abs().max()
-        print(f"  \\__Initial residual max: {float(initial_delta):.2e} (should be 0)")
+    with torch.no_grad():
+        initial = _forward_training_model(
+            model,
+            val_features[:1],
+            training_mode=cfg.training_mode,
+            noise_mode=cfg.noise_mode,
+        )
+        initial_delta = (
+            initial["prediction"] - initial["baseline"]
+        ).abs().max()
+    print(f"  \\__Initial residual max: {float(initial_delta):.2e} (should be 0)")
 
     model.train()
-    if cfg.training_mode == "finetuning":
-        model.mapping.eval()
     cached_features: Optional[torch.Tensor] = None
     cached_targets: Optional[torch.Tensor] = None
     running: Dict[str, torch.Tensor] = {}
@@ -1809,20 +1684,11 @@ def train(cfg: TrainConfig) -> nn.Module:
                     )
                     generated_targets = torch.tanh(generated_features[:, :3])
                 else:
-                    if cfg.training_mode == "finetuning":
-                        generated_features, generated_targets = (
-                            extractor.sample_ws_targets(
-                                cfg.batch_size,
-                                device,
-                                w_augment_percent=cfg.w_augment_percent,
-                            )
-                        )
-                    else:
-                        generated_features, generated_targets = extractor.sample_pairs(
-                            cfg.batch_size,
-                            device,
-                            w_augment_percent=cfg.w_augment_percent,
-                        )
+                    generated_features, generated_targets = extractor.sample_pairs(
+                        cfg.batch_size,
+                        device,
+                        w_augment_percent=cfg.w_augment_percent,
+                    )
             # ``detach`` preserves an inference tensor's special status. Clone
             # outside inference_mode so the trainable decoder can save its
             # input for backward while the generator remains fully detached.
@@ -1833,13 +1699,7 @@ def train(cfg: TrainConfig) -> nn.Module:
         use_full_resolution = (
             cfg.fullres_every > 0 and step % cfg.fullres_every == 0
         )
-        if cfg.training_mode == "finetuning":
-            # Prefix synthesis needs complete W inputs and full spatial frames.
-            # Cropping is applied to its RGB prediction and the target below.
-            features = cached_features
-            targets = cached_targets
-            saliency = saliency_full
-        elif use_full_resolution or cfg.crop_size == STOP_RESOLUTION:
+        if use_full_resolution or cfg.crop_size == STOP_RESOLUTION:
             features = cached_features
             targets = cached_targets
             saliency = saliency_full
@@ -1871,22 +1731,6 @@ def train(cfg: TrainConfig) -> nn.Module:
             prediction = output["prediction"]
             loss_targets = targets
             loss_saliency = saliency
-            if (
-                cfg.training_mode == "finetuning"
-                and not use_full_resolution
-                and cfg.crop_size < STOP_RESOLUTION
-            ):
-                if saliency is None:
-                    prediction, loss_targets = random_crop_pair(
-                        prediction, targets, crop=cfg.crop_size
-                    )
-                else:
-                    prediction, loss_targets, loss_saliency = random_crop_pair(
-                        prediction,
-                        targets,
-                        saliency,
-                        crop=cfg.crop_size,
-                    )
             loss, stats = image_reconstruction_loss(
                 prediction,
                 loss_targets,
@@ -1930,8 +1774,7 @@ def train(cfg: TrainConfig) -> nn.Module:
 
         if step % cfg.log_every == 0 or step == 1:
             keys = ["loss", "l1", "mse", "edge", "lpips"]
-            if cfg.training_mode == "decoder":
-                keys.append("baseline_mse")
+            keys.append("baseline_mse")
             zero = torch.zeros((), device=device)
             values = torch.stack(
                 [running.get(key, zero) / running_updates for key in keys]
@@ -1946,13 +1789,10 @@ def train(cfg: TrainConfig) -> nn.Module:
                 f"l1={average['l1']:.4f}  mse={average['mse']:.5f}  "
                 f"lpips={average['lpips']:.4f}  detail={average['edge']:.4f}  "
             )
-            if cfg.training_mode == "decoder":
-                relative = (
-                    average["baseline_mse"] - average["mse"]
-                ) / max(average["baseline_mse"], 1e-12)
-                message += f"ΔtoRGB={relative:+.2%}  "
-            elif len(optimizer.param_groups) > 2:
-                message += f"synth_lr={optimizer.param_groups[2]['lr']:.2e}  "
+            relative = (
+                average["baseline_mse"] - average["mse"]
+            ) / max(average["baseline_mse"], 1e-12)
+            message += f"ΔtoRGB={relative:+.2%}  "
             message += (
                 f"full={int(use_full_resolution)}  "
                 f"lr={learning_rate:.2e}  rate={rate:.2f} step/s  t={elapsed:.0f}s"
@@ -1985,25 +1825,16 @@ def train(cfg: TrainConfig) -> nn.Module:
             if metrics["loss"] < best_loss:
                 best_loss = metrics["loss"]
                 best_path = osp.join(cfg.out_dir, "best_ema.pt")
-                if cfg.training_mode == "decoder":
-                    torch.save(
-                        {
-                            "architecture": "stylegan_early_output_128_v2",
-                            "step": step,
-                            "decoder": ema.ema.state_dict(),
-                            "metrics": metrics,
-                            "config": asdict(cfg),
-                        },
-                        best_path,
-                    )
-                else:
-                    _save_integrated_generator(
-                        best_path,
-                        ema.ema,
-                        cfg,
-                        step=step,
-                        metrics=metrics,
-                    )
+                torch.save(
+                    {
+                        "architecture": "stylegan_early_output_128_v2",
+                        "step": step,
+                        "decoder": ema.ema.state_dict(),
+                        "metrics": metrics,
+                        "config": asdict(cfg),
+                    },
+                    best_path,
+                )
 
         if cfg.plot_every > 0 and (step % cfg.plot_every == 0 or step == 1):
             plot_path = osp.join(plots_dir, f"early_output_step_{step:06d}.jpg")
@@ -2016,11 +1847,7 @@ def train(cfg: TrainConfig) -> nn.Module:
                 training_mode=cfg.training_mode,
                 noise_mode=cfg.noise_mode,
             )
-            plot_rows = (
-                "target / toRGB / refined / |refined-target|"
-                if cfg.training_mode == "decoder"
-                else "target / finetuned / |finetuned-target|"
-            )
+            plot_rows = "target / toRGB / refined / |refined-target|"
             print(f"  \\__Plot {plot_path} (rows: {plot_rows})")
             augmentation_plot_path = osp.join(
                 plots_dir,
@@ -2043,57 +1870,508 @@ def train(cfg: TrainConfig) -> nn.Module:
         if step % cfg.ckpt_every == 0 or step == cfg.max_steps:
             checkpoint_path = osp.join(cfg.out_dir, "checkpoint.pt")
             checkpoint = {
-                "architecture": (
-                    "stylegan_early_output_128_v2"
-                    if cfg.training_mode == "decoder"
-                    else "stylegan_early_output_128_finetuning_v1"
-                ),
+                "architecture": "stylegan_early_output_128_v2",
                 "step": step,
                 "ema": ema.ema.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "config": asdict(cfg),
                 "best_loss": best_loss,
             }
-            if cfg.training_mode == "decoder":
-                checkpoint["decoder"] = model.state_dict()
-            else:
-                checkpoint["generator"] = model.state_dict()
-                checkpoint["generator_config"] = _integrated_generator_config(model)
-                checkpoint[
-                    "synthesis_reference_decay_semantics"
-                ] = "adamw_lr_scaled_pre_update_v1"
+            checkpoint["decoder"] = model.state_dict()
             torch.save(checkpoint, checkpoint_path)
-            if cfg.training_mode == "decoder":
-                torch.save(
-                    ema.ema.state_dict(),
-                    osp.join(cfg.out_dir, "early_output_decoder_ema.pt"),
-                )
-            else:
-                _save_integrated_generator(
-                    osp.join(cfg.out_dir, "early_output_generator_ema.pt"),
-                    ema.ema,
-                    cfg,
-                    step=step,
-                )
+            torch.save(
+                ema.ema.state_dict(),
+                osp.join(cfg.out_dir, "early_output_decoder_ema.pt"),
+            )
             print(f"  \\__Saved {checkpoint_path}")
-
-    if cfg.training_mode == "finetuning":
-        final_checkpoint_path = osp.join(cfg.out_dir, "checkpoint.pt")
-        final_generator_path = osp.join(
-            cfg.out_dir, "early_output_generator_last.pt"
-        )
-        export_finetuning_checkpoint(
-            final_checkpoint_path,
-            final_generator_path,
-            verify=True,
-        )
-        print(
-            "  \\__Exported final non-EMA combined generator: "
-            f"{final_generator_path}"
-        )
-
     print(f"#. Training finished. Best EMA validation loss: {best_loss:.5f}")
     return model
+
+
+# ---------------------------------------------------------------------------
+# Finetuning: deterministic paired evaluation and function-preserving head edits
+# ---------------------------------------------------------------------------
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_checkpoint(path: str) -> dict:
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _atomic_save(value: dict, path: str) -> None:
+    torch.save(value, path + ".tmp")
+    os.replace(path + ".tmp", path)
+
+
+@torch.no_grad()
+def migrate_finetuning_decoder(model: IntegratedEarlyOutputGenerator, cfg: TrainConfig) -> None:
+    """Widen/add branches without changing the source function at initialization."""
+    old = model.synthesis.decoder
+    old_width = old.mix_in.out_channels
+    if cfg.hidden_channels < old_width:
+        raise ValueError(f"Cannot shrink a trained head ({old_width} -> {cfg.hidden_channels})")
+    if old.architecture != "pointwise" and old.architecture != cfg.decoder_architecture:
+        raise ValueError("Cannot discard/change a trained conditioned branch; keep its architecture")
+    if old.architecture != "pointwise" and old.spatial_channels != cfg.spatial_channels:
+        raise ValueError("Cannot resize an existing trained conditioned branch")
+    new = FusedFastEarlyOutputDecoder(
+        old.in_channels, cfg.hidden_channels, architecture=cfg.decoder_architecture,
+        spatial_channels=cfg.spatial_channels,
+    ).to(device=old.linear.weight.device, dtype=old.linear.weight.dtype)
+    new.linear.load_state_dict(old.linear.state_dict())
+    new.mix_in.weight[:old_width].copy_(old.mix_in.weight)
+    new.mix_in.bias[:old_width].copy_(old.mix_in.bias)
+    new.mix_out.weight[:, :old_width].copy_(old.mix_out.weight)
+    new.mix_out.bias.copy_(old.mix_out.bias)
+    if old.architecture != "pointwise":
+        for name in ("spatial_in", "spatial_conv", "spatial_out", "style"):
+            if hasattr(old, name):
+                getattr(new, name).load_state_dict(getattr(old, name).state_dict())
+    model.synthesis.decoder = new
+
+
+@torch.inference_mode()
+def _sample_training_ws(extractor, cfg, generator, device):
+    # CPU RNG is private and architecture/plot/validation independent. Draw
+    # displacement vectors for all examples to keep its consumption stable.
+    z = torch.randn(cfg.batch_size, Z_DIM, generator=generator).to(device)
+    dz = torch.randn(cfg.batch_size, Z_DIM, generator=generator).to(device)
+    ws = extractor.map_z(z)
+    if cfg.truncation_jitter:
+        jitter = 1 + cfg.truncation_jitter * torch.randn(cfg.batch_size, 1, 1, generator=generator)
+        avg = extractor.G.mapping.w_avg.reshape(1, 1, -1)
+        ws = avg + (ws - avg) * jitter.to(device)
+    displacement = extractor.G.mapping(dz, None, truncation_psi=1.0)
+    if cfg.balanced_augmentations:
+        # Largest-remainder allocation with a rotating randomized remainder.
+        augmented = int(round(cfg.batch_size * cfg.w_augment_percent))
+        labels = torch.zeros(cfg.batch_size, dtype=torch.long)
+        cycle = torch.randperm(3, generator=generator) + 1
+        labels[:augmented] = cycle.repeat(math.ceil(augmented / 3))[:augmented]
+        labels = labels[torch.randperm(cfg.batch_size, generator=generator)]
+    else:
+        labels = torch.randint(1, 4, (cfg.batch_size,), generator=generator)
+        labels[torch.rand(cfg.batch_size, generator=generator) >= cfg.w_augment_percent] = 0
+    indices = torch.arange(ws.shape[1], device=device)
+    masks = torch.stack((torch.zeros_like(indices), torch.ones_like(indices),
+                         (indices < 8).long(), (indices % 2).long()))
+    ws = ws + displacement * masks[labels.to(device), :, None]
+    return ws, labels
+
+
+@torch.inference_mode()
+def make_evaluation_bank(extractor, cfg, count, seed, teacher_hash, device):
+    metadata = dict(version=1, identities=count, seed=seed, teacher_sha256=teacher_hash,
+                    backend=device.type, torch_version=str(torch.__version__),
+                    psi=cfg.truncation_psi, noise=cfg.noise_mode, target="raw_area128_fp32")
+    key = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()[:24]
+    path = None
+    if cfg.eval_cache_dir:
+        os.makedirs(cfg.eval_cache_dir, exist_ok=True)
+        path = osp.join(cfg.eval_cache_dir, f"bank_{key}.pt")
+        if osp.isfile(path):
+            bank = _load_checkpoint(path)
+            if bank["metadata"] != metadata:
+                raise ValueError("Evaluation bank metadata mismatch")
+            return bank
+    generator = torch.Generator().manual_seed(seed)
+    z = torch.randn(count, Z_DIM, generator=generator)
+    dz = torch.randn(count, Z_DIM, generator=generator)
+    all_ws, all_targets = [], []
+    for start in range(0, count, cfg.eval_batch_size):
+        base = extractor.map_z(z[start:start + cfg.eval_batch_size].to(device))
+        displacement = extractor.G.mapping(dz[start:start + cfg.eval_batch_size].to(device), None)
+        ws = base.repeat_interleave(4, 0)
+        displacement = displacement.repeat_interleave(4, 0)
+        labels = torch.arange(4, device=device).repeat(base.shape[0])
+        indices = torch.arange(ws.shape[1], device=device)
+        masks = torch.stack((torch.zeros_like(indices), torch.ones_like(indices),
+                             (indices < 8).long(), (indices % 2).long()))
+        ws = ws + displacement * masks[labels, :, None]
+        for offset in range(0, ws.shape[0], cfg.eval_batch_size):
+            current = ws[offset:offset + cfg.eval_batch_size]
+            all_ws.append(current.cpu())
+            all_targets.append(extractor.target_from_ws(current).cpu())
+        print(f"  evaluation bank: {min(start + cfg.eval_batch_size, count)}/{count} identities", flush=True)
+    bank = dict(metadata=metadata, ws=torch.cat(all_ws), targets=torch.cat(all_targets),
+                labels=torch.arange(4).repeat(count), identities=torch.arange(count).repeat_interleave(4))
+    if path:
+        _atomic_save(bank, path)
+    return bank
+
+
+def _image_means(values, weight=None):
+    values = values.float()
+    if weight is None:
+        return values.flatten(1).mean(1)
+    weights = weight.to(values).expand_as(values)
+    return (values * weights).flatten(1).sum(1) / weights.flatten(1).sum(1).clamp_min(1e-12)
+
+
+def _summarize_evaluation(rows):
+    summary = {}
+    for label, name in enumerate(EVAL_GROUPS):
+        selected = [row for row in rows if row["group"] == name]
+        metrics = [key for key in selected[0] if key not in ("group", "identity")]
+        summary[name] = {key: float(np.mean([row[key] for row in selected])) for key in metrics}
+        summary[name]["psnr"] = 10 * math.log10(4 / max(summary[name]["mse"], 1e-12))
+        summary[name]["lpips_p90"] = float(np.percentile([row["lpips"] for row in selected], 90))
+    return summary
+
+
+@torch.no_grad()
+def evaluate_bank(model, bank, lpips_fn, cfg, device):
+    was_training = model.training
+    model.eval()
+    face = face_saliency_mask(128, 128, device=device)
+    zone = tzone_support_mask(128, 128, device=device).float()
+    rows = []
+    for start in range(0, len(bank["ws"]), cfg.eval_batch_size):
+        ws = bank["ws"][start:start + cfg.eval_batch_size].to(device)
+        target = bank["targets"][start:start + cfg.eval_batch_size].to(device)
+        prediction = _forward_training_model(model, ws, training_mode="finetuning", noise_mode=cfg.noise_mode)["prediction"].float()
+        error = prediction - target
+        # Always FP32, same definitions for every architecture and train loss.
+        with torch.autocast(device.type, enabled=False):
+            perceptual = lpips_fn(prediction.clamp(-1, 1), target.clamp(-1, 1)).float()
+        metrics = dict(l1=_image_means(error.abs()), mse=_image_means(error.square()),
+                       lpips=_image_means(perceptual), face_lpips=_image_means(perceptual, face),
+                       face_l1=_image_means(error.abs(), face), tzone_l1=_image_means(error.abs(), zone),
+                       outside_l1=_image_means(error.abs(), 1 - zone),
+                       out_of_range=_image_means((prediction.abs() > 1).float()))
+        # Fixed, non-focal gradient metric measures edge placement independently
+        # of the training detail weights and current prediction's focal mask.
+        dx = error[:, :, :, 1:] - error[:, :, :, :-1]
+        dy = error[:, :, 1:, :] - error[:, :, :-1, :]
+        metrics["tzone_edge"] = 0.5 * (_image_means(dx.abs(), zone[..., 1:]) + _image_means(dy.abs(), zone[..., 1:, :]))
+        values = {key: value.cpu().tolist() for key, value in metrics.items()}
+        for offset in range(len(ws)):
+            index = start + offset
+            rows.append(dict(identity=int(bank["identities"][index]), group=EVAL_GROUPS[int(bank["labels"][index])],
+                             **{key: value[offset] for key, value in values.items()}))
+    model.train(was_training)
+    model.mapping.eval()
+    return _summarize_evaluation(rows), rows
+
+
+def evaluation_score(metrics, initial, augment_percent):
+    weights = (1 - augment_percent, *(augment_percent / 3 for _ in range(3)))
+    return sum(weight * 0.5 * sum(metrics[name][key] / max(initial[name][key], 1e-8)
+                                 for key in ("l1", "lpips"))
+               for name, weight in zip(EVAL_GROUPS, weights))
+
+
+def _write_json(path, value):
+    with open(path, "w") as handle:
+        json.dump(value, handle, indent=2, allow_nan=False)
+
+
+@torch.no_grad()
+def _save_bank_panels(model, bank, cfg, device, prefix):
+    model.eval()
+    for label, name in enumerate(EVAL_GROUPS):
+        indices = torch.where(bank["labels"] == label)[0][:cfg.plot_count]
+        target = bank["targets"][indices]
+        images = []
+        for index in indices:
+            ws = bank["ws"][int(index):int(index) + 1].to(device)
+            images.append(_forward_training_model(model, ws, training_mode="finetuning", noise_mode=cfg.noise_mode)["prediction"].cpu())
+        prediction = torch.cat(images)
+        rows = (_rgb_for_display(target), _rgb_for_display(prediction),
+                ((prediction - target).abs() * 2).clamp(0, 1))
+        canvas = torch.cat([torch.cat(list(row), dim=2) for row in rows], dim=1)
+        array = (canvas.permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
+        Image.fromarray(array).save(f"{prefix}_{name}.png")
+
+
+def _finetuning_groups_v2(model, teacher, cfg):
+    model.requires_grad_(False)
+    references = dict(teacher.G.synthesis.named_parameters())
+    groups, reference_map = [], {}
+    decoder_params = list(model.synthesis.decoder.parameters())
+    groups.append(dict(params=decoder_params, base_lr=cfg.lr, group_name="decoder", weight_decay=cfg.weight_decay))
+    for resolution in model.synthesis.block_resolutions:
+        if resolution < cfg.finetune_min_resolution:
+            continue
+        named = [(name, p) for name, p in model.synthesis.named_parameters()
+                 if name.startswith(f"b{resolution}.") and ".torgb." not in name]
+        scale = cfg.early_synthesis_lr_scale if resolution < 64 else 1.0
+        groups.append(dict(params=[p for _, p in named], base_lr=float(cfg.synthesis_lr) * scale,
+                           group_name=f"b{resolution}", weight_decay=0.0,
+                           reference_weight_decay=float(cfg.synthesis_reference_decay)))
+        for name, parameter in named:
+            reference = references.get(name)
+            if reference is None or reference.shape != parameter.shape:
+                raise ValueError(f"Missing source reference: {name}")
+            reference_map[id(parameter)] = reference
+    for group in groups:
+        for parameter in group["params"]:
+            parameter.requires_grad_(True)
+    return groups, reference_map
+
+
+@torch.no_grad()
+def _prefix_drift(model, teacher):
+    reference = dict(teacher.G.synthesis.named_parameters())
+    result = {}
+    for resolution in model.synthesis.block_resolutions:
+        pairs = [(p, reference[n]) for n, p in model.synthesis.named_parameters()
+                 if n.startswith(f"b{resolution}.") and ".torgb." not in n]
+        delta = sum((p - r).square().sum() for p, r in pairs)
+        norm = sum(r.square().sum() for _, r in pairs)
+        result[f"b{resolution}"] = float((delta / norm.clamp_min(1e-12)).sqrt())
+    return result
+
+
+def _synchronize(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+@torch.no_grad()
+def _benchmark_finetuning(model, bank, cfg, device):
+    model.eval()
+    results = {}
+    for batch in sorted(set((1, cfg.batch_size))):
+        ws = bank["ws"][:1].repeat(batch, 1, 1).to(device)
+        for _ in range(3):
+            _forward_training_model(model, ws, training_mode="finetuning", noise_mode=cfg.noise_mode)
+        _synchronize(device)
+        samples = []
+        for _ in range(cfg.benchmark_repeats):
+            started = time.perf_counter()
+            _forward_training_model(model, ws, training_mode="finetuning", noise_mode=cfg.noise_mode)
+            _synchronize(device)
+            samples.append(1000 * (time.perf_counter() - started))
+        results[str(batch)] = dict(batch_ms_median=float(np.median(samples)), batch_ms_p90=float(np.percentile(samples, 90)))
+    return results
+
+
+def train_finetuning(cfg: TrainConfig) -> nn.Module:
+    """Finetune an exact source checkpoint; select on a fixed four-group bank."""
+    workflow_started = time.perf_counter()
+    if cfg.crop_size != 128 or cfg.crops_per_sample != 1:
+        raise ValueError("Finetuning v2 uses full 128 frames and fresh pairs: set --crop-size 128 --crops-per-sample 1")
+    if min(cfg.val_count, cfg.test_count, cfg.eval_batch_size, cfg.spatial_channels, cfg.benchmark_repeats) < 1:
+        raise ValueError("Evaluation counts, spatial width and benchmark repeats must be positive")
+    if not 0 <= cfg.head_only_steps < cfg.max_steps or cfg.warmup_steps < 0:
+        raise ValueError("Require 0 <= head-only-steps < max-steps and nonnegative warmup")
+    if not 0 <= cfg.saliency_uniform_mix <= 1 or cfg.early_synthesis_lr_scale <= 0 or cfg.truncation_jitter < 0 or cfg.grad_clip <= 0:
+        raise ValueError("Invalid saliency mixture, early LR scale, truncation jitter or clipping")
+    device = select_device() if cfg.device == "auto" else torch.device(cfg.device)
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS is unavailable in this Python process")
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable in this Python process")
+    set_seed(cfg.seed, device)
+    source_path = cfg.resume or cfg.early_output_weights
+    source = _load_checkpoint(source_path)
+    if source.get("format") == EARLY_OUTPUT_FORMAT_NAME:
+        source_config = source["config"]
+    else:
+        source_config = source.get("generator_config")
+    if not source_config or "generator" not in source:
+        raise ValueError("Finetuning source must contain generator and its configuration")
+    continuing = bool(cfg.resume and not cfg.reset_steps)
+    if continuing and source.get("architecture") != "stylegan_early_output_128_finetuning_v2":
+        raise ValueError("Use --reset-steps to start finetuning from a legacy checkpoint")
+    model = IntegratedEarlyOutputGenerator(**source_config)
+    model.load_state_dict(source["generator"], strict=True)
+    if model.img_resolution != 128:
+        raise ValueError("This trainer requires a 128-output student")
+    migrate_finetuning_decoder(model, cfg)
+    model.to(device)
+    extractor = StyleGANFeatureExtractor(cfg.gan_weights, cfg.noise_mode, cfg.truncation_psi, device)
+    _validate_mapping_match(model, extractor)
+    teacher_buffers = dict(extractor.G.synthesis.named_buffers())
+    for name, value in model.synthesis.named_buffers():
+        if name.endswith("noise_const") and not torch.equal(value, teacher_buffers[name]):
+            raise ValueError(f"Student/teacher constant noise mismatch: {name}")
+    teacher_hash = _file_sha256(cfg.gan_weights)
+    source_hash = _file_sha256(source_path)
+    if continuing:
+        # Exact continuation only. Altered schedules/architecture/data settings
+        # require an explicit weights-only restart.
+        ignored = {"resume", "reset_steps", "out_dir", "log_every", "plot_every", "ckpt_every", "device", "eval_cache_dir"}
+        changed = [key for key, value in asdict(cfg).items()
+                   if key not in ignored and source["config"].get(key) != value]
+        if changed or source["teacher_sha256"] != teacher_hash:
+            raise ValueError(f"Continuation configuration changed ({changed}); use --reset-steps")
+        source_hash = source["source_sha256"]
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    plots = osp.join(cfg.out_dir, "plots")
+    os.makedirs(plots, exist_ok=True)
+    if osp.exists(osp.join(cfg.out_dir, "run_summary.json")) and not continuing:
+        raise ValueError("Output already contains a completed run; choose a fresh directory")
+    _write_json(osp.join(cfg.out_dir, "args.json"), asdict(cfg))
+    groups, references = _finetuning_groups_v2(model, extractor, cfg)
+    optimizer = AdamWWithReferenceDecay(groups, reference_parameters=references, lr=cfg.lr, betas=(0.9, 0.999))
+    scaler = GradScaler("cuda", enabled=bool(cfg.amp and device.type == "cuda"))
+    # Native synthesis FP16 on CUDA needs scaling even when LPIPS is FP32.
+    if device.type == "cuda" and not cfg.amp:
+        for block in model.synthesis.block_resolutions:
+            getattr(model.synthesis, f"b{block}").use_fp16 = False
+    ema = ModelEMA(model, cfg.ema_decay) if cfg.ema_decay > 0 else None
+    lpips_fn = build_lpips(device, required=True, spatial=True)
+    private_rng = torch.Generator().manual_seed(cfg.seed + 777)
+    step = 0
+    attempts = 0
+    if continuing:
+        optimizer.load_state_dict(source["optimizer"])
+        scaler.load_state_dict(source["scaler"])
+        private_rng.set_state(source["sampling_rng"])
+        torch.set_rng_state(source["torch_rng"])
+        np.random.set_state(source["numpy_rng"])
+        if device.type == "cuda":
+            torch.cuda.set_rng_state_all(source["cuda_rng"])
+        if ema is not None:
+            ema.ema.load_state_dict(source["ema"])
+        step, attempts = source["step"], source["attempts"]
+    if step >= cfg.max_steps:
+        raise ValueError("Checkpoint already reached max-steps")
+    print(f"Finetuning {source_path} on {device}; architecture={cfg.decoder_architecture}; width={cfg.hidden_channels}", flush=True)
+    val_bank = make_evaluation_bank(extractor, cfg, cfg.val_count, cfg.seed + 12345, teacher_hash, device)
+    test_bank = make_evaluation_bank(extractor, cfg, cfg.test_count, cfg.seed + 54321, teacher_hash, device)
+    selected = ema.ema if ema else model
+    if continuing:
+        initial_val, initial_test = source["initial_val"], source["initial_test"]
+        best_score, best_step = source["best_score"], source["best_step"]
+        best_state = source["best_generator"]
+    else:
+        initial_val, initial_val_rows = evaluate_bank(selected, val_bank, lpips_fn, cfg, device)
+        initial_test, initial_test_rows = evaluate_bank(selected, test_bank, lpips_fn, cfg, device)
+        _write_json(osp.join(cfg.out_dir, "initial_validation.json"), dict(metrics=initial_val, samples=initial_val_rows))
+        _write_json(osp.join(cfg.out_dir, "initial_test.json"), dict(metrics=initial_test, samples=initial_test_rows))
+        _write_json(osp.join(cfg.out_dir, "best_validation.json"), dict(step=0, score=1., metrics=initial_val, samples=initial_val_rows))
+        best_score, best_step = 1.0, 0
+        best_state = {key: value.detach().cpu().clone() for key, value in selected.state_dict().items()}
+    face = face_saliency_mask(128, 128, device=device)
+    mask = ((1 - cfg.saliency_uniform_mix) * face + cfg.saliency_uniform_mix / (128 * 128)) if cfg.saliency else None
+    trainable = [p for group in optimizer.param_groups for p in group["params"]]
+    started = time.perf_counter()
+    train_seconds = float(source.get("training_seconds", 0.0)) if continuing else 0.0
+    skipped = int(source.get("skipped_updates", 0)) if continuing else 0
+    clipped_updates = int(source.get("clipped_updates", 0)) if continuing else 0
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    for key in ("train_metrics.jsonl", "val_metrics.jsonl"):
+        if not continuing:
+            open(osp.join(cfg.out_dir, key), "w").close()
+    while step < cfg.max_steps:
+        update = step + 1
+        model.train()
+        model.mapping.eval()
+        for group in optimizer.param_groups:
+            prefix = group["group_name"] != "decoder"
+            active = not prefix or update > cfg.head_only_steps
+            local_step = update - cfg.head_only_steps if prefix else update
+            total = cfg.max_steps - cfg.head_only_steps if prefix else cfg.max_steps
+            group["lr"] = cosine_lr(local_step, total, group["base_lr"], cfg.warmup_steps) if active else 0.0
+            for parameter in group["params"]:
+                parameter.requires_grad_(active)
+        _synchronize(device)
+        tick = time.perf_counter()
+        generated_ws, labels = _sample_training_ws(extractor, cfg, private_rng, device)
+        generated_targets = extractor.target_from_ws(generated_ws)
+        ws, targets = generated_ws.clone(), generated_targets.clone()
+        optimizer.zero_grad(set_to_none=True)
+        prediction = _forward_training_model(model, ws, training_mode="finetuning", noise_mode=cfg.noise_mode)["prediction"]
+        loss, stats = image_reconstruction_loss(prediction, targets, lpips_fn, l1_weight=cfg.l1_weight,
+                     mse_weight=cfg.mse_weight, edge_weight=cfg.edge_weight, lpips_weight=cfg.lpips_weight, saliency=mask)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        gradient_groups = {}
+        if update == 1 or update % cfg.log_every == 0:
+            for group in optimizer.param_groups:
+                norms = [p.grad.detach().float().norm() for p in group["params"] if p.grad is not None]
+                gradient_groups[group["group_name"]] = float(torch.stack(norms).norm()) if norms else 0.0
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
+        old_scale = scaler.get_scale()
+        if not scaler.is_enabled() and not torch.isfinite(grad_norm):
+            raise FloatingPointError("Non-finite unscaled gradient")
+        scaler.step(optimizer)
+        scaler.update()
+        attempts += 1
+        _synchronize(device)
+        train_seconds += time.perf_counter() - tick
+        if scaler.get_scale() < old_scale:
+            skipped += 1
+            if skipped > 100:
+                raise FloatingPointError("More than 100 skipped AMP updates; inspect precision/gradients")
+            continue
+        step = update
+        clipped_updates += int(grad_norm > cfg.grad_clip)
+        if ema:
+            ema.update(model)
+        if step == 1 or step % cfg.log_every == 0:
+            record = dict(step=step, attempts=attempts, skipped=skipped, grad_norm=float(grad_norm),
+                          clipped=bool(grad_norm > cfg.grad_clip), clipping_fraction=clipped_updates / step, scale=scaler.get_scale(),
+                          learning_rates={g["group_name"]: g["lr"] for g in optimizer.param_groups},
+                          source_drift=_prefix_drift(model, extractor),
+                          gradient_norms=gradient_groups,
+                          groups={name: int((labels == index).sum()) for index, name in enumerate(EVAL_GROUPS)},
+                          training_seconds=train_seconds, **{key: float(value) for key, value in stats.items()})
+            with open(osp.join(cfg.out_dir, "train_metrics.jsonl"), "a") as handle:
+                handle.write(json.dumps(record) + "\n")
+            print(f"step {step}/{cfg.max_steps} loss={float(loss.detach()):.5f} grad={float(grad_norm):.3f} skipped={skipped}", flush=True)
+        if (cfg.val_every and step % cfg.val_every == 0) or step == cfg.max_steps:
+            metrics, rows = evaluate_bank(selected, val_bank, lpips_fn, cfg, device)
+            score = evaluation_score(metrics, initial_val, cfg.w_augment_percent)
+            with open(osp.join(cfg.out_dir, "val_metrics.jsonl"), "a") as handle:
+                handle.write(json.dumps(dict(step=step, score=score, groups=metrics)) + "\n")
+            print(f"VAL step={step} score={score:.5f} (initial=1)", flush=True)
+            if score < best_score:
+                best_score, best_step = score, step
+                best_state = {key: value.detach().cpu().clone() for key, value in selected.state_dict().items()}
+                _write_json(osp.join(cfg.out_dir, "best_validation.json"), dict(step=step, score=score, metrics=metrics, samples=rows))
+                _save_integrated_generator(osp.join(cfg.out_dir, "best_generator.pt"), selected, cfg, step=step)
+        if cfg.plot_every and step % cfg.plot_every == 0:
+            _save_bank_panels(selected, val_bank, cfg, device, osp.join(plots, f"step_{step:06d}"))
+        if step % cfg.ckpt_every == 0 or step == cfg.max_steps:
+            checkpoint = dict(architecture="stylegan_early_output_128_finetuning_v2", step=step, attempts=attempts,
+                generator=model.state_dict(), generator_config=_integrated_generator_config(model),
+                optimizer=optimizer.state_dict(), scaler=scaler.state_dict(), config=asdict(cfg),
+                source_sha256=source_hash, teacher_sha256=teacher_hash, initial_val=initial_val, initial_test=initial_test,
+                best_generator=best_state, best_score=best_score, best_step=best_step,
+                training_seconds=train_seconds, skipped_updates=skipped, clipped_updates=clipped_updates,
+                sampling_rng=private_rng.get_state(), torch_rng=torch.get_rng_state(), numpy_rng=np.random.get_state(),
+                cuda_rng=torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
+                synthesis_reference_decay_semantics="adamw_lr_scaled_pre_update_v1")
+            if ema:
+                checkpoint["ema"] = ema.ema.state_dict()
+            _atomic_save(checkpoint, osp.join(cfg.out_dir, "checkpoint.pt"))
+    last_test, last_rows = evaluate_bank(selected, test_bank, lpips_fn, cfg, device)
+    _write_json(osp.join(cfg.out_dir, "last_test.json"), dict(step=step, metrics=last_test, samples=last_rows))
+    _save_integrated_generator(osp.join(cfg.out_dir, "early_output_generator_last.pt"), selected, cfg, step=step)
+    selected.load_state_dict(best_state)
+    best_test, best_rows = evaluate_bank(selected, test_bank, lpips_fn, cfg, device)
+    _write_json(osp.join(cfg.out_dir, "best_test.json"), dict(step=best_step, metrics=best_test, samples=best_rows))
+    _save_integrated_generator(osp.join(cfg.out_dir, "best_generator.pt"), selected, cfg, step=best_step)
+    _save_bank_panels(selected, test_bank, cfg, device, osp.join(plots, "best_test"))
+    latency = _benchmark_finetuning(selected, val_bank, cfg, device)
+    summary = dict(completed=True, steps=step, best_step=best_step, best_validation_score=best_score,
+        source_sha256=source_hash, teacher_sha256=teacher_hash, config=asdict(cfg),
+        initial_test=initial_test, best_test=best_test, last_test=last_test,
+        source_drift=_prefix_drift(selected, extractor), latency=latency,
+        training_seconds=train_seconds, wall_seconds=time.perf_counter() - started,
+        setup_seconds=started - workflow_started, total_wall_seconds=time.perf_counter() - workflow_started,
+        skipped_updates=skipped,
+        clipping_fraction=clipped_updates / step,
+        peak_cuda_memory_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+        trainable_parameters=sum(p.numel() for p in trainable), decoder_parameters=sum(p.numel() for p in selected.synthesis.decoder.parameters()),
+        torch_version=str(torch.__version__), device=str(device), gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        validation_bank=val_bank["metadata"], test_bank=test_bank["metadata"])
+    _write_json(osp.join(cfg.out_dir, "run_summary.json"), summary)
+    print(f"Completed: {cfg.out_dir}; best step={best_step}, validation score={best_score:.5f}", flush=True)
+    return selected
 
 
 # ---------------------------------------------------------------------------
@@ -2201,7 +2479,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--synthesis-lr",
         type=float,
         default=None,
-        help="copied StyleGAN prefix LR in finetuning mode (default: 0.1x --lr)",
+        help="copied StyleGAN prefix LR in finetuning mode (default: --lr)",
     )
     parser.add_argument("--weight-decay", type=float, default=2e-4)
     parser.add_argument(
@@ -2211,7 +2489,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "AdamW-style decoupled decay coefficient for synthesis-prefix "
             "weights toward the frozen teacher; the per-step pull is this "
-            "value times the current synthesis LR (finetuning default: 0.1). "
+            "value times the current synthesis LR (finetuning default: 0.001). "
             "Ordinary zero-centered weight decay is disabled"
         ),
     )
@@ -2264,11 +2542,11 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="mode default: decoder 0.5, finetuning 1.0",
     )
-    parser.add_argument("--crop-size", type=int, default=96)
+    parser.add_argument("--crop-size", type=int, default=128)
     parser.add_argument(
         "--crops-per-sample",
         type=int,
-        default=4,
+        default=1,
         help="optimizer steps that reuse one expensive StyleGAN pair batch",
     )
     parser.add_argument(
@@ -2283,8 +2561,8 @@ def build_argparser() -> argparse.ArgumentParser:
         default=True,
         help="weight LPIPS/pixel/detail losses toward aligned FFHQ face detail",
     )
-    parser.add_argument("--warmup-steps", type=int, default=10_000)
-    parser.add_argument("--ema-decay", type=float, default=0.9)
+    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--ema-decay", type=float, default=0.0, help="0 disables the EMA copy in finetuning")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=200)
     parser.add_argument("--val-every", type=int, default=400)
@@ -2295,6 +2573,20 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--resume")
     parser.add_argument("--reset-steps", action="store_true")
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
+    parser.add_argument("--decoder-architecture", choices=("pointwise", "pointwise_style", "spatial_style"), default="spatial_style")
+    parser.add_argument("--spatial-channels", type=int, default=32, help="correction branch width for either style-conditioned head")
+    parser.add_argument("--head-only-steps", type=int, default=500)
+    parser.add_argument("--finetune-min-resolution", type=int, choices=(4, 8, 16, 32, 64, 128), default=32)
+    parser.add_argument("--early-synthesis-lr-scale", type=float, default=0.25)
+    parser.add_argument("--truncation-jitter", type=float, default=0.0)
+    parser.add_argument("--balanced-augmentations", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--saliency-uniform-mix", type=float, default=0.5)
+    parser.add_argument("--val-count", type=int, default=64, help="Independent identities, each under all four conditions")
+    parser.add_argument("--test-count", type=int, default=128)
+    parser.add_argument("--eval-batch-size", type=int, default=4)
+    parser.add_argument("--eval-cache-dir", help="Shared deterministic teacher validation/test banks")
+    parser.add_argument("--benchmark-repeats", type=int, default=20)
     parser.add_argument(
         "--skip-gan-load",
         action="store_true",
@@ -2350,6 +2642,20 @@ def main() -> None:
         resume=args.resume,
         reset_steps=args.reset_steps,
         amp=args.amp,
+        device=args.device,
+        decoder_architecture=args.decoder_architecture,
+        spatial_channels=args.spatial_channels,
+        head_only_steps=args.head_only_steps,
+        finetune_min_resolution=args.finetune_min_resolution,
+        early_synthesis_lr_scale=args.early_synthesis_lr_scale,
+        truncation_jitter=args.truncation_jitter,
+        balanced_augmentations=args.balanced_augmentations,
+        saliency_uniform_mix=args.saliency_uniform_mix,
+        val_count=args.val_count,
+        test_count=args.test_count,
+        eval_batch_size=args.eval_batch_size,
+        eval_cache_dir=args.eval_cache_dir,
+        benchmark_repeats=args.benchmark_repeats,
         skip_gan_load=args.skip_gan_load,
     )
     train(cfg)

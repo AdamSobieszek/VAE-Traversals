@@ -85,7 +85,12 @@ def _fold_average_w_torgb(
 
 
 class FusedFastEarlyOutputDecoder(nn.Module):
-    """Three-convolution deployment head used by v2 integrated generators."""
+    """Original fused head with an optional W-conditioned correction branch.
+
+    ``pointwise_style`` omits the correction branch's 3x3 convolution. The
+    original fused toRGB/spatial linear convolution remains in all three heads.
+    ``spatial_*`` module names preserve existing spatial_style checkpoints.
+    """
 
     def __init__(
         self,
@@ -93,9 +98,15 @@ class FusedFastEarlyOutputDecoder(nn.Module):
         hidden_channels: int = 16,
         baseline_weight: Optional[torch.Tensor] = None,
         baseline_bias: Optional[torch.Tensor] = None,
+        architecture: str = "pointwise",
+        spatial_channels: int = 32,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
+        if architecture not in ("pointwise", "pointwise_style", "spatial_style"):
+            raise ValueError(f"Unknown decoder architecture: {architecture}")
+        self.architecture = architecture
+        self.spatial_channels = int(spatial_channels)
         self.linear = nn.Conv2d(in_channels, IMG_CHANNELS, kernel_size=3, padding=1)
         self.mix_in = nn.Conv2d(in_channels, hidden_channels, kernel_size=1)
         self.activation = nn.SiLU(inplace=True)
@@ -104,6 +115,23 @@ class FusedFastEarlyOutputDecoder(nn.Module):
         nn.init.zeros_(self.linear.bias)
         nn.init.zeros_(self.mix_out.weight)
         nn.init.zeros_(self.mix_out.bias)
+        if architecture != "pointwise":
+            self.spatial_in = nn.Conv2d(in_channels, spatial_channels, 1)
+            self.spatial_conv = (
+                nn.Conv2d(spatial_channels, spatial_channels, 3, padding=1)
+                if architecture == "spatial_style" else nn.Identity()
+            )
+            self.spatial_out = nn.Conv2d(spatial_channels, IMG_CHANNELS, 1)
+            nn.init.zeros_(self.spatial_out.weight)
+            nn.init.zeros_(self.spatial_out.bias)
+            # W9/W10 encode the repeated odd/even tail styles for the supported
+            # augmentations. LayerNorm has no running state or batch dependence.
+            self.style = nn.Sequential(
+                nn.LayerNorm(2 * W_DIM), nn.Linear(2 * W_DIM, 64), nn.SiLU(),
+                nn.Linear(64, 2 * spatial_channels),
+            )
+            nn.init.zeros_(self.style[-1].weight)
+            nn.init.zeros_(self.style[-1].bias)
         if baseline_weight is not None:
             center = self.linear.weight.shape[-1] // 2
             with torch.no_grad():
@@ -112,11 +140,21 @@ class FusedFastEarlyOutputDecoder(nn.Module):
                 )
                 self.linear.bias.copy_(baseline_bias)
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def forward(self, features: torch.Tensor, ws: Optional[torch.Tensor] = None) -> torch.Tensor:
         features = features.float()
-        return self.linear(features) + self.mix_out(
+        output = self.linear(features) + self.mix_out(
             self.activation(self.mix_in(features))
         )
+        if self.architecture != "pointwise":
+            hidden = torch.nn.functional.silu(self.spatial_in(features))
+            if ws is None or ws.shape[1] < 11:
+                raise ValueError("Style-conditioned decoder requires W slots 9 and 10")
+            scale, bias = self.style(ws[:, 9:11].flatten(1).float()).chunk(2, dim=1)
+            hidden = hidden * (1 + scale[:, :, None, None]) + bias[:, :, None, None]
+            output = output + self.spatial_out(
+                torch.nn.functional.silu(self.spatial_conv(hidden))
+            )
+        return output
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +175,8 @@ class SynthesisNetwork(nn.Module):
         source_img_resolution: int = SOURCE_RESOLUTION,
         source_num_fp16_res: int = 4,
         decoder_hidden_channels: int = 16,
+        decoder_architecture: str = "pointwise",
+        decoder_spatial_channels: int = 32,
         average_w: Optional[torch.Tensor] = None,
         **block_kwargs,
     ):
@@ -198,6 +238,8 @@ class SynthesisNetwork(nn.Module):
             hidden_channels=decoder_hidden_channels,
             baseline_weight=baseline_weight,
             baseline_bias=baseline_bias,
+            architecture=decoder_architecture,
+            spatial_channels=decoder_spatial_channels,
         )
 
     def forward(
@@ -230,7 +272,7 @@ class SynthesisNetwork(nn.Module):
             )
         if features is None:
             raise RuntimeError("StyleGAN prefix produced no features")
-        output = self.decoder(features.float())
+        output = self.decoder(features.float(), ws)
         if return_components:
             return {"prediction": output, "features": features}
         return output

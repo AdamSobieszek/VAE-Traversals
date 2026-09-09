@@ -119,32 +119,15 @@ def sample_z(batch_size, generator, params, device = torch.device('cuda')):
     """
     dim_z = generator.dim_z if hasattr(generator, 'dim_z') else generator.latent_size
 
-    # Draw one random vector
-    z0 = torch.randn(dim_z, device=device)
-    z0_norm = z0.norm()
-    z0 = z0 / (z0_norm + 1e-8)
-
-    # Create orthonormal basis (including z0 as the first vector)
-    basis = [z0]
-    for _ in range(1, min(batch_size, dim_z)):
-        v = torch.randn(dim_z, device=device)
-        # Gram-Schmidt orthogonalization
-        for b in basis:
-            v = v - (v @ b) * b
-        v_norm = v.norm()
-        if v_norm < 1e-8:
-            # If degenerate, resample
-            v = torch.randn(dim_z, device=device)
-            for b in basis:
-                v = v - (v @ b) * b
-            v_norm = v.norm()
-            if v_norm < 1e-8:
-                v = torch.zeros_like(v)
-        else:
-            v = v / v_norm
-        basis.append(v)
-    # Stack basis vectors
-    z = torch.stack(basis, dim=0)*z0_norm
+    # Reduced QR is the vectorized equivalent of Gram-Schmidt on Gaussian
+    # columns. Correcting the arbitrary QR signs also makes the first basis
+    # vector equal to the normalized first sample, as in the legacy code.
+    basis_size = min(batch_size, dim_z)
+    raw = torch.randn(dim_z, basis_size, device=device)
+    z0_norm = raw[:, 0].norm()
+    q, r = torch.linalg.qr(raw, mode="reduced")
+    signs = r.diagonal().sign().masked_fill_(r.diagonal() == 0, 1)
+    z = q.mul(signs.unsqueeze(0)).mT.mul_(z0_norm)
     # If batch_size > dim_z, pad with zeros
     if batch_size > dim_z:
         pad = torch.zeros(batch_size - dim_z, dim_z, device=device)
@@ -709,6 +692,32 @@ class TrainingStatTracker(object):
             g = float(grad_norm_selected_mlp)
             self.per_k_ema_grad[true_k] = self.per_k_ema_grad[true_k] * self.ema_decay + g * (1.0 - self.ema_decay)
 
+    def update_all_k_after_micro(
+        self,
+        *,
+        preds: np.ndarray,
+        grad_norms: np.ndarray | None = None,
+    ):
+        """Vectorized update for predictions shaped [B,K] (column k is true class k)."""
+        if self.K is None:
+            return
+        K = int(self.K)
+        preds = np.asarray(preds).reshape(-1, K).astype(np.int64, copy=False)
+        valid = (preds >= 0) & (preds < K)
+        true = np.broadcast_to(np.arange(K, dtype=np.int64), preds.shape)
+
+        self.per_k_ema_acc *= self.ema_decay
+        self.per_k_ema_acc += (preds == true).mean(axis=0) * (1.0 - self.ema_decay)
+        self.per_k_select_counts += valid.sum(axis=0)
+
+        flat = true[valid] * K + preds[valid]
+        self.confusion += np.bincount(flat, minlength=K * K).reshape(K, K)
+
+        if grad_norms is not None:
+            grad_norms = np.asarray(grad_norms, dtype=np.float32).reshape(K)
+            self.per_k_ema_grad *= self.ema_decay
+            self.per_k_ema_grad += grad_norms * (1.0 - self.ema_decay)
+
     def snapshot_per_k_history(self, step_idx: int):
         """Keep a thin history (capped) for heatmaps."""
         if self.K is None:
@@ -1010,6 +1019,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
+from concurrent.futures import ThreadPoolExecutor
 import re
 
 try:
@@ -2000,18 +2010,20 @@ class ImageViz:
 class ImageLogger:
     """
     Writes images into the SAME TensorBoard run directory as your main SummaryWriter.
-    Keeps only the last `keep_last_images` image events by:
-      • opening a short-lived SummaryWriter with a `.images.<step>` suffix,
-      • logging the images for that step,
-      • closing it,
-      • pruning older `events.*.images*` files in the same run directory.
+    PNG encoding overlaps training, with at most one pending triplet. Device
+    transfer and grid construction stay on the caller; the worker gets detached
+    host grids only. close() drains pending images and propagates worker errors.
+    Legacy image-file pruning helpers remain available but are not enabled.
     """
-    def __init__(self, writer: SummaryWriter, keep_last_images: int = 50, downscale: Optional[float] = None):
+    def __init__(self, writer: SummaryWriter, keep_last_images: int = 50,
+                 downscale: Optional[float] = None, *, asynchronous: bool = True):
         self.writer = writer
         self.keep_last_images = int(keep_last_images)
         self.downscale = downscale
         # Ensure we can glob files reliably regardless of SummaryWriter implementation.
         self._log_dir = Path(getattr(writer, "log_dir", ""))
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tb-images") if asynchronous else None
+        self._pending = None
 
     def _list_image_eventfiles(self):
         # PyTorch appends filename_suffix to event filename, so match *.images*
@@ -2034,15 +2046,36 @@ class ImageLogger:
 
     def log_triplet(self, tag_prefix: str, x0: torch.Tensor, x1: torch.Tensor, x2: torch.Tensor,
                     step: int, n_vis: int = 8):
-        # short-lived writer to the SAME run dir; one event file per image step
+        # Drain before making new grids, bounding host memory to one image batch.
+        self._drain()
         triplet, diffs = ImageViz.make_triplet_grids(x0, x1, x2, n_vis=n_vis, downscale=self.downscale)
+        if self._executor is None:
+            self._write_triplet(tag_prefix, triplet, diffs, step)
+        else:
+            self._pending = self._executor.submit(self._write_triplet, tag_prefix, triplet, diffs, step)
+
+    def _write_triplet(self, tag_prefix, triplet, diffs, step):
         self.writer.add_image(f"{tag_prefix}/triplet", triplet, step)
         self.writer.add_image(f"{tag_prefix}/diff_triplet_abs", diffs, step)
-        self.writer.flush()
         #  writer.close()
         # self._prune_old_images()
         
-    def close(self): self.writer.close()
+    def _drain(self):
+        if self._pending is not None:
+            self._pending.result()
+            self._pending = None
+
+    def flush(self):
+        self._drain()
+        self.writer.flush()
+
+    def close(self):
+        try:
+            self.flush()
+        finally:
+            if self._executor is not None:
+                self._executor.shutdown(wait=True)
+            self.writer.close()
 
 # =========================
 # TensorBoard server + ngrok
@@ -2335,23 +2368,22 @@ def sample_dt(trainer, B: int, half_range: int, total_opt_steps: int, *, dtype=t
     else:
         raise ValueError(f"Unknown dt_beta_mode={beta_mode!r}")
 
-    # ---- lightweight stats cache (for TB/debug) ----
-    try:
+    # ---- optional lightweight stats cache (for TB/debug) ----
+    # Disabled by default because every .item() synchronizes accelerator work.
+    if bool(getattr(p, "track_dt_stats", False)):
         cache = getattr(trainer, "_dt_cache", None)
         if cache is None:
             cache = {}
             setattr(trainer, "_dt_cache", cache)
-
-        cache["dt_mean"] = float(dt.abs().mean().item())
-        cache["dt_std"] = float(dt.abs().std(unbiased=False).item())
+        stats = [dt.abs().mean(), dt.abs().std(unbiased=False)]
         if beta is not None:
-            cache["beta_mean"] = float(beta.mean().item())
-            cache["beta_min"] = float(beta.min().item())
-            cache["beta_max"] = float(beta.max().item())
+            stats.extend((beta.mean(), beta.min(), beta.max()))
+        values = torch.stack(stats).detach().float().cpu().tolist()
+        cache["dt_mean"], cache["dt_std"] = values[:2]
+        if beta is not None:
+            cache["beta_mean"], cache["beta_min"], cache["beta_max"] = values[2:]
         cache["dt_mode"] = base_mode
         cache["dt_beta_mode"] = beta_mode
-    except Exception:
-        pass
 
     return out
 
@@ -2374,32 +2406,43 @@ def dual_batch_acc_from_logits(
     K: int,
     device,
 ) -> tuple[float, float, float, torch.Tensor]:
-    step1_acc, _ = batch_acc_from_logits(logits0, B, K, device)
-    step2_acc, preds = batch_acc_from_logits(logits, B, K, device)
+    true_2d = torch.arange(K, device=device).unsqueeze(0)
+    preds0 = torch.argmax(logits0, dim=1).view(B, K)
+    preds = torch.argmax(logits, dim=1).view(B, K)
+    accs = torch.stack(((preds0 == true_2d).float().mean(), (preds == true_2d).float().mean()))
+    step1_acc, step2_acc = accs.cpu().tolist()
     acc = 0.5 * (step1_acc + step2_acc)
     return acc, step1_acc, step2_acc, preds
 
 
 @torch.no_grad()
-def entropy_from_logits(logits: torch.Tensor) -> float:
+def entropy_from_logits(logits: torch.Tensor, *, as_tensor: bool = False):
     probs = torch.softmax(logits, dim=1)
     ent = -(probs * probs.clamp_min(1e-8).log()).sum(dim=1).mean()
-    return float(ent.item())
+    return ent if as_tensor else float(ent.item())
 
 
 @torch.no_grad()
 def collect_wave_stats(traversal_sets, potential_preds: torch.Tensor) -> dict:
-    wave_dict = traversal_sets.get_losses()
-    wave_dict["potential_std"] = float(potential_preds.std().item())
+    wave_dict = dict(traversal_sets.get_losses())
+    wave_dict["potential_std"] = potential_preds.std()
     if "xf_now" in wave_dict and torch.is_tensor(wave_dict["xf_now"]):
-        wave_dict["xf_now"] = float(wave_dict["xf_now"].norm(dim=-1).mean().item())
-    # normalize to python floats
+        wave_dict["xf_now"] = wave_dict["xf_now"].norm(dim=-1).mean()
+    # Normalize scalar tensors with one device-to-host synchronization.
     out = {}
+    scalar_keys = []
+    scalar_tensors = []
     for k, v in wave_dict.items():
         if torch.is_tensor(v):
-            out[k] = float(v.item()) if v.numel() == 1 else v
+            if v.numel() == 1:
+                scalar_keys.append(k)
+                scalar_tensors.append(v.detach().float().reshape(()))
+            else:
+                out[k] = v
         else:
             out[k] = float(v) if isinstance(v, (int, float)) else v
+    if scalar_tensors:
+        out.update(zip(scalar_keys, torch.stack(scalar_tensors).cpu().tolist()))
     return out
 
 
@@ -2463,9 +2506,11 @@ def tb_hists(writer, step: int, *, logits_det: torch.Tensor,
     if logits_tb is not None:
         writer.add_histogram("train/logits", logits_tb, step)
     if log_potential and potential_preds_det is not None:
+        potential_cpu = potential_preds_det.detach().float().cpu()
         for k in range(K):
-            potential_tb = _tb_finite_tensor(potential_preds_det[:, k])
-            if potential_tb is not None:
+            potential_tb = potential_cpu[:, k].reshape(-1)
+            potential_tb = potential_tb[torch.isfinite(potential_tb)]
+            if potential_tb.numel():
                 writer.add_histogram(f"potential_distribution/{k}", potential_tb, step)
 
 
@@ -2694,9 +2739,6 @@ def torch_append_by_step(path: str, step: int, payload: dict):
 # =========================
 # prophet clipping
 # =========================
-
-        
-
 @torch.no_grad()
 def clip_accum_grads_(
     module,
@@ -2806,196 +2848,6 @@ def clip_accum_grads_(
         if isinstance(st, dict):
             st["prev"] = None
             st["cap"] = None
-
-
-
-
-
-
-
-
-
-
-
-
-# aux.py
-import math
-import numpy as np
-import torch
-import torch.nn.functional as F
-
-class DualConfusionThermalizer:
-    """
-    Tracks two confusions:
-      - step0: logits0 from (img0,img1)
-      - step2: logits  from (img1,img2)  (the one that gives traversal_sets gradients)
-
-    Maintains EMA confusion *probabilities* (row-stochastic), and produces beta_k.
-
-    Beta rule (default):
-      E0_k = -log(C0_kk + eps)
-      E2_k = -log(C2_kk + eps)
-      score_k = (E0_k - E2_k)  # >0 => step2 easier => increase beta to push out
-      beta_k = exp(eta * (score_k - ema(score_k)))  (lag-based, centered)
-      clamp + optional renorm to mean=1.
-    """
-    def __init__(
-        self,
-        K: int,
-        ema_decay: float = 0.99,
-        eps: float = 1e-8,
-        use_soft: bool = True,
-        eta: float = 0.5,
-        beta_min: float = 0.5,
-        beta_max: float = 2.0,
-        renorm_mean1: bool = True,
-        use_lag: bool = True,
-    ):
-        self.K = int(K)
-        self.decay = float(ema_decay)
-        self.eps = float(eps)
-        self.use_soft = bool(use_soft)
-
-        # confusion EMAs as float64 for stability (row=true, col=pred)
-        self.C0 = np.eye(self.K, dtype=np.float64) / self.K  # harmless init
-        self.C2 = np.eye(self.K, dtype=np.float64) / self.K
-
-        # beta config
-        self.eta = float(eta)
-        self.beta_min = float(beta_min)
-        self.beta_max = float(beta_max)
-        self.renorm = bool(renorm_mean1)
-        self.use_lag = bool(use_lag)
-
-        # EMA of score for lag-based beta
-        self.score_ema = np.zeros((self.K,), dtype=np.float64)
-
-        # latest diagnostics
-        self.last = {}
-
-    @torch.no_grad()
-    def update(self, logits0: torch.Tensor, logits2: torch.Tensor, B: int):
-        """
-        logits0/logits2: [B*K, K]
-        """
-        K = self.K
-        device = logits2.device
-        B = int(B)
-
-        # reshape -> [B, K, K]  (dim1 = true_k, dim2 = pred_k)
-        L0 = logits0.view(B, K, K)
-        L2 = logits2.view(B, K, K)
-
-        if self.use_soft:
-            P0 = F.softmax(L0, dim=-1)   # [B,K,K]
-            P2 = F.softmax(L2, dim=-1)
-            # sum over batch -> mass per true_k/pred_k
-            M0 = P0.sum(dim=0) / float(B)  # [K,K], row sums to 1
-            M2 = P2.sum(dim=0) / float(B)
-        else:
-            # hard confusion counts turned into row-probs
-            pred0 = L0.argmax(dim=-1)  # [B,K]
-            pred2 = L2.argmax(dim=-1)
-            oh0 = F.one_hot(pred0, num_classes=K).float().sum(dim=0) / float(B)  # [K,K]
-            oh2 = F.one_hot(pred2, num_classes=K).float().sum(dim=0) / float(B)
-            M0, M2 = oh0, oh2
-
-        m0 = M0.detach().cpu().double().numpy()
-        m2 = M2.detach().cpu().double().numpy()
-
-        # EMA update
-        d = self.decay
-        self.C0 = d * self.C0 + (1.0 - d) * m0
-        self.C2 = d * self.C2 + (1.0 - d) * m2
-
-        # diag energies
-        diag0 = np.clip(np.diag(self.C0), self.eps, 1.0)
-        diag2 = np.clip(np.diag(self.C2), self.eps, 1.0)
-        E0 = -np.log(diag0)
-        E2 = -np.log(diag2)
-
-        # score: >0 => step2 easier than step0 => boost beta to increase exploration/energy
-        score = (E0 - E2)
-
-        # lag-based center (prevents drift)
-        if self.use_lag:
-            self.score_ema = d * self.score_ema + (1.0 - d) * score
-            score_used = (score - self.score_ema)
-        else:
-            score_used = (score - score.mean())
-
-        beta = np.exp(self.eta * score_used)
-        beta = np.clip(beta, self.beta_min, self.beta_max)
-
-        if self.renorm:
-            beta = beta * (float(K) / max(self.eps, beta.sum()))
-
-        self.last = {
-            "diag0_mean": float(diag0.mean()),
-            "diag2_mean": float(diag2.mean()),
-            "E0_mean": float(E0.mean()),
-            "E2_mean": float(E2.mean()),
-            "score_mean": float(score.mean()),
-            "beta_mean": float(beta.mean()),
-            "beta_min": float(beta.min()),
-            "beta_max": float(beta.max()),
-        }
-
-        self._beta = beta  # store as numpy
-
-    def beta_k(self, device=None, dtype=torch.float32) -> torch.Tensor:
-        beta = getattr(self, "_beta", None)
-        if beta is None:
-            beta = np.ones((self.K,), dtype=np.float64)
-        t = torch.tensor(beta, device=device, dtype=dtype)
-        return t  # [K]
-
-
-# --------------------------
-# tiny convenience wrapper
-# --------------------------
-@torch.no_grad()
-def update_dual_confusion_(
-    stat_tracker,
-    *,
-    logits0: torch.Tensor,        # [B*K, K]
-    logits2: torch.Tensor,        # [B*K, K]
-    B: int,
-    K: int,
-    # defaults (can be overridden via params if you pass them in)
-    ema_decay: float = 0.99,
-    use_soft: bool = True,
-    eta: float = 0.5,
-    beta_min: float = 0.5,
-    beta_max: float = 2.0,
-    renorm_mean1: bool = True,
-    use_lag: bool = True,
-    eps: float = 1e-8,
-):
-    """
-    Creates/updates stat_tracker.thermal (DualConfusionThermalizer).
-    Also exposes stat_tracker.get_beta_k().
-    """
-    if not hasattr(stat_tracker, "thermal") or stat_tracker.thermal is None or getattr(stat_tracker.thermal, "K", None) != int(K):
-        stat_tracker.thermal = DualConfusionThermalizer(
-            K=int(K),
-            ema_decay=float(ema_decay),
-            eps=float(eps),
-            use_soft=bool(use_soft),
-            eta=float(eta),
-            beta_min=float(beta_min),
-            beta_max=float(beta_max),
-            renorm_mean1=bool(renorm_mean1),
-            use_lag=bool(use_lag),
-        )
-
-        # attach a getter (so your dt sampler can call stat_tracker.get_beta_k())
-        def _get_beta_k():
-            return stat_tracker.thermal.beta_k(device=logits2.device, dtype=logits2.dtype)
-        stat_tracker.get_beta_k = _get_beta_k
-
-    stat_tracker.thermal.update(logits0=logits0, logits2=logits2, B=int(B))
-
 
 
 # --------------------------

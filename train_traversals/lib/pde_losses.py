@@ -80,7 +80,7 @@ class BB(PDELoss):
     name = "bb"
 
     def _loss(self, st: PDEState) -> torch.Tensor:
-        eps = float(self.ctx.get("epsilon", 1e-8))
+        eps = float(self.ctx.get("epsilon", 1e-4))
         return 1.0 / (st.f_grad("now").pow(2).sum(dim=-1, keepdim=True) + eps)
 
 class UnitSpeed(PDELoss):
@@ -139,7 +139,7 @@ class FConvex(PDELoss):
     name = "fconvex"
 
     def _loss(self, st: PDEState) -> torch.Tensor:
-        q = st.f_laplace(probes=int(self.ctx.get("probes", 1)))  # [B,K,1]
+        q = st.f_laplace(probes=int(st.cfg.get("laplace_probes", 1)))  # [B,K,1]
         margin = float(self.ctx.get("margin", 1e-3))
         return (margin - q).clamp_min(0.0).pow(2)
 
@@ -367,7 +367,7 @@ class FCurvUpper(PDELoss):
 
     def _loss(self, st: PDEState) -> torch.Tensor:
         kappa_max = float(self.ctx.get("kappa_max", 0.05))
-        q = st.f_laplace(probes=int(self.ctx.get("probes", 1)))  # [B,K,1]
+        q = st.f_laplace(probes=int(st.cfg.get("laplace_probes", 1)))  # [B,K,1]
         return (q - kappa_max).clamp_min(0.0).pow(2)
 
 class FAlongCurv(PDELoss):

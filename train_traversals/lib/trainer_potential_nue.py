@@ -14,16 +14,17 @@ from typing import Optional
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
+from .recognizer import Recognizer, AntisymmetricRecognizer
+from .generator_vjp import FrozenGeneratorVJP
 
 from .aux import (
     sample_z, TrainingStatTracker, update_progress, update_stdout, sec2dhms,
-    CosineScheduleWithWarmup, build_adamw, ImageLogger, ImageViz,
-    _pack_BK, _per_k_grad_norms, module_grad_norm,
-    # new aux funcs
+    CosineScheduleWithWarmup, build_adamw, ImageLogger,
+    _per_k_grad_norms,
     tb_start, dual_batch_acc_from_logits,
     entropy_from_logits, collect_wave_stats,
-    tb_scalars, tb_grad_norms, tb_hists, tb_figs, tb_images,clip_accum_grads_, update_dual_confusion_,
-    tb_path_figs, tb_information_matrix_figs, tb_pairwise_distance_figs,
+    tb_scalars, tb_grad_norms, tb_hists, tb_figs, tb_images, clip_accum_grads_,
+    tb_path_figs,
 )
 
 DTYPE = torch.float32
@@ -107,17 +108,22 @@ class TrainerPotential(object):
             update_stdout(12)
         stats = self.stat_tracker.stats_by_step.get(int(step_idx), {})
         total_opt_steps = math.ceil(self.params.max_iter / max(1, int(getattr(self.params, "accumulate_grad_steps", 1))))
+        completed_steps = int(step_idx) + 1
         update_progress(
-            "\\__.Training [bs: {}] [opt-step: {:06d}/{:06d}] ".format(self.params.batch_size, step_idx, total_opt_steps),
+            "\\__.Training [bs: {}] [opt-step: {:06d}/{:06d}] ".format(
+                self.params.batch_size, completed_steps, total_opt_steps
+            ),
             total_opt_steps,
-            step_idx + 1,
+            completed_steps,
         )
         print()
         print("   \\__Batch accuracy Index      : {:.03f}".format(stats.get("accuracy_index", 0.0)))
         print("   \\__Step 1 accuracy           : {:.03f}".format(stats.get("step1_accuracy", 0.0)))
         print("   \\__Step 2 accuracy           : {:.03f}".format(stats.get("step2_accuracy", 0.0)))
         print("   \\__Classification loss       : {:.08f}".format(stats.get("classification_loss", 0.0)))
-        print("   \\__Wave loss (PDE-JVP combo) : {:.08f}".format(stats.get("wave_loss", 0.0)))
+        print("   \\__Wave loss (PDE-JVP combo) : {:.08f}".format(
+            stats.get("wave_loss", stats.get("pde_loss", 0.0))
+        ))
         print("   \\__Total loss                : {:.08f}".format(stats.get("total_loss", 0.0)))
         print("      ==============================================================")
         print("   \\__Opt-step time  : {:.3f} sec".format(mean_step_time))
@@ -316,131 +322,112 @@ class TrainerPotential(object):
         return starting_micro, opt_step_idx, traversal_sets_optim, recognizer_optim, sched_support, sched_recon
 
     # ------------------------ forward+loss (all K) ------------------------
-    def loss_allK(self, traversal_sets, generator, recognizer,
-                  z, t_index, dt, acc_denominator: int,
-                  *, need_images: bool = False):
-        """
-        One forward for all K in parallel.
-        Optional: only materialize img*_bk if need_images=True (for TB logging).
-        """
-        with self.fp32_context():
-            potential_preds, latent1_bk, latent2_bk, pde_loss, dt = traversal_sets(z, t_index, dt=dt, direction=dt)
-        B, K, D = latent1_bk.shape
-
-        lat1_flat, targets, _, (B, K) = _pack_BK(latent1_bk)
-        lat2_flat, _, _, _ = _pack_BK(latent2_bk)
-
-        z0 = z.clone().unsqueeze(1).expand(B, K, D)
-        lat0_flat, _, _, _ = _pack_BK(z0)
-
-        lat0_for_gen = lat0_flat
-        lat1_for_gen = lat1_flat
-        lat2_for_gen = lat2_flat
-        
-        DO_VAE_RESHAPE = getattr(generator, "uses_vae_latent_shape", False)
-        if DO_VAE_RESHAPE:
-            reshape_z = lambda z: z.reshape(z.shape[0], generator.latent_channels, generator.latent_size, generator.latent_size).contiguous() if z.ndim == 2 else z
-            lat0_for_gen = reshape_z(lat0_for_gen)
-            lat1_for_gen = reshape_z(lat1_for_gen)
-            lat2_for_gen = reshape_z(lat2_for_gen)
-
-        lat2_bridge = lat2_for_gen.detach().requires_grad_(True)
-
-        with torch.no_grad(), self.gan_recognizer_context():
-            img0 = generator(lat0_for_gen)
-            img1 = generator(lat1_for_gen)
-            detach_img1 = bool(getattr(self.params, "detach_img1_for_cls", False))
-            img1 = img1.detach() if detach_img1 else img1
-       
+    def _synthesize(self, generator, latents):
+        """One generator call, including wrappers with image-shaped latents."""
+        base = self._generator_module(generator)
+        if getattr(base, "uses_vae_latent_shape", False) and latents.ndim == 2:
+            latents = latents.reshape(-1, base.latent_channels, base.latent_size, base.latent_size)
         with self.gan_recognizer_context():
-            img2 = generator(lat2_bridge)
+            return generator(latents)
 
-
-        DO_ANTISYMMETRIC_LOSS = True # TODO: Replace with global flag
-        if DO_ANTISYMMETRIC_LOSS:
-            def uv(a,b,with_g=False, sign=1):
-                "Whitened coordinates (u,v*):=(z^*-v, z+v)"
-                with torch.no_grad() if not with_g else torch.enable_grad():
-                    return (2*a-b, b) if sign>0 else (b, 2*a-b)
-
-            with self.gan_recognizer_context():
-                logits0 = recognizer(*uv(img0, img1, with_g=False, sign=1))[0] - recognizer(*uv(img0, img1, with_g=False, sign=-1))[0]
-                logits = recognizer(*uv(img1, img2, with_g=True, sign=1))[0] - recognizer(*uv(img1, img2, with_g=True, sign=-1))[0]   # [B*K, K]
-                
-
-            with self.fp32_context():
-                loss0 = torch.nn.functional.cross_entropy(logits0.float(), targets, reduction="none")  # [B*K]
-                # if t_index == 0, then img0==img1, so we mask-out the loss from this invalid classification case
-                mask0 = (t_index != 0).expand(B, K).reshape(-1).to(loss0.dtype)
-
-                loss0 = (loss0 * mask0).sum() / mask0.sum().clamp_min(1)
-
-                cls_loss = (
-                    self.cross_entropy(logits.float(), targets)
-                    + loss0
-                )
+    def _pair_logits(self, recognizer, center, endpoint):
+        """Whiten once; shared centers broadcast over the traversal axis."""
+        if center.shape[0] != endpoint.shape[0]:
+            pairs = endpoint.unflatten(0, (center.shape[0], -1))
+            reflected = (2 * center[:, None] - pairs).flatten(0, 1)
         else:
-            logits0 = torch.zeros(B*K, K, device=self.device, dtype=torch.float32)
-            with self.gan_recognizer_context():
-                logits, magnitudes = recognizer(img1, img2)   # [B*K, K]
-            with self.fp32_context():
-                cls_loss = self.cross_entropy(logits.float(), targets)
+            reflected = 2 * center - endpoint
+        with self.gan_recognizer_context():
+            # Invoke DataParallel.forward, not a bound method of its module.
+            if isinstance(recognizer, nn.DataParallel):
+                if isinstance(recognizer.module, (Recognizer, AntisymmetricRecognizer)):
+                    return recognizer(reflected, endpoint, antisymmetric=True)[0]
+            elif hasattr(recognizer, "antisymmetric_pair_logits"):
+                return recognizer.antisymmetric_pair_logits(reflected, endpoint)
+            return recognizer(reflected, endpoint)[0] - recognizer(endpoint, reflected)[0]
 
+    def _endpoint_image(self, generator, latents):
+        chunk = int(getattr(self.params, "generator_recompute_chunk", 0))
+        if not chunk:
+            return self._synthesize(generator, latents)
+        if chunk < 0 or generator.training or any(p.requires_grad for p in generator.parameters()):
+            raise ValueError("Generator recomputation requires a positive chunk and a frozen eval generator.")
+        if not getattr(self._generator_module(generator), "share_initial_output", False):
+            raise ValueError("Generator recomputation requires deterministic, batch-independent synthesis.")
+        return FrozenGeneratorVJP.apply(latents, lambda z: self._synthesize(generator, z), chunk)
 
-
-        acc_denominator = max(1, int(acc_denominator))
-        with self.fp32_context():
-            total_loss = (
-                self.params.lambda_cls * cls_loss.float()
-                + self.params.lambda_pde * pde_loss.float()
-            )
-            loss = total_loss / acc_denominator
-            cls_backward_loss = self.params.lambda_cls * cls_loss.float() / acc_denominator
-            traversal_backward_loss = self.params.lambda_pde * pde_loss.float() / acc_denominator
-
-        if float(self.params.lambda_cls) != 0.0:
-            cls_backward_loss.backward()
-            if lat2_bridge.grad is None:
-                raise RuntimeError("Generator+Recognizer loss did not produce a gradient for lat2_bridge.")
-            bridge_grad = lat2_bridge.grad.detach().to(dtype=lat2_for_gen.dtype)
-        else:
-            bridge_grad = torch.zeros_like(lat2_for_gen)
-
-        traversal_outputs = []
-        traversal_grads = []
-        if lat2_for_gen.requires_grad:
-            traversal_outputs.append(lat2_for_gen)
-            traversal_grads.append(bridge_grad)
-        if traversal_backward_loss.requires_grad:
-            traversal_outputs.append(traversal_backward_loss)
-            traversal_grads.append(torch.ones_like(traversal_backward_loss))
-        if traversal_outputs:
-            torch.autograd.backward(traversal_outputs, grad_tensors=traversal_grads)
-
-        # Cheap metrics needed every step
-        with torch.no_grad():
-            ent = entropy_from_logits(logits.float())
-            z_bk = z.unsqueeze(1).expand(B, K, D)
-            d2 = (latent2_bk - latent1_bk).norm(dim=-1).min()
-            d1 = (latent1_bk - z_bk).norm(dim=-1).min()
-
-        img1_bk = img2_bk = None
-        if need_images:
-            with torch.no_grad():
-                img1_bk = img1.detach().contiguous().view(B, K, *img1.shape[1:])
-                img2_bk = img2.detach().contiguous().view(B, K, *img2.shape[1:])
-
-        loss_dict = {
-            "total_loss": float(loss.detach()),
-            "classification_loss": float(cls_loss.detach()),
-            "pde_loss": float(pde_loss.detach()),
-            "entropy": float(ent),
-            "step1_norm": float(d1.item()),
-            "step2_norm": float(d2.item()),
+    @torch.no_grad()
+    def _loss_metrics(self, cls, pde, logits, z, latent1, latent2, bridge_grad, denominator):
+        """Keep reductions on device and transfer the small scalar bundle once."""
+        norms = bridge_grad.norm(dim=-1)
+        values = {
+            "total_loss": (self.params.lambda_cls * cls + self.params.lambda_pde * pde) / denominator,
+            "classification_loss": cls, "pde_loss": pde,
+            "entropy": entropy_from_logits(logits.float(), as_tensor=True),
+            "step1_norm": (latent1 - z[:, None]).norm(dim=-1).min(),
+            "step2_norm": (latent2 - latent1).norm(dim=-1).min(),
+            "traversal_grad_median": norms.median(),
+            "traversal_grad_max": norms.max(), "traversal_grad_min": norms.min(),
         }
-        
-        latents_out = latent2_bk.detach()
-        return loss_dict, logits.detach(), logits0.detach(), targets, potential_preds.detach(), img1_bk, img2_bk, latents_out
+        scalars = torch.stack([v.detach().float().reshape(()) for v in values.values()])
+        return dict(zip(values, scalars.cpu().tolist()))
+
+    def loss_allK(self, traversal_sets, generator, recognizer,
+                  z, t_index, dt, acc_denominator: int, *, need_images: bool = False):
+        """All-K loss and backward, with the original eight-value return contract.
+
+        Train R on the historical pair first and release that graph before
+        synthesizing the differentiable endpoint. Then pass the endpoint's
+        cotangent through the potential rollout together with the PDE loss.
+        R's BatchNorm sees the same batches, in the same order, as before.
+        """
+        denominator = max(1, int(acc_denominator))
+        cls_scale = float(self.params.lambda_cls) / denominator
+        with self.fp32_context():
+            potentials, latent1, latent2, pde, _ = traversal_sets(z, t_index, dt=dt, direction=dt)
+        B, K, D = latent1.shape
+        targets = torch.arange(K, device=z.device).repeat(B)
+        shared = getattr(self._generator_module(generator), "share_initial_output", False)
+        z0 = z if shared else z[:, None].expand(B, K, D).reshape(B * K, D)
+        with torch.no_grad():
+            img0 = self._synthesize(generator, z0)
+            img1 = self._synthesize(generator, latent1.flatten(0, 1))
+
+        # DO_ANTISYMMETRIC_LOSS = True # TODO: Replace with global flag
+        logits0 = self._pair_logits(recognizer, img0, img1)
+        # if t_index == 0, then img0==img1, so we mask-out the loss from this invalid classification case
+        mask = (t_index.reshape(B, 1) != 0).expand(B, K).reshape(-1)
+        loss0 = nn.functional.cross_entropy(logits0.float(), targets, reduction="none")
+        loss0 = (loss0 * mask).sum() / mask.sum().clamp_min(1)
+        if cls_scale:
+            (cls_scale * loss0).backward()
+        logits0, loss0 = logits0.detach(), loss0.detach()
+        del img0
+
+        bridge = latent2.detach().flatten(0, 1).requires_grad_(True)
+        img2 = self._endpoint_image(generator, bridge)
+        logits = self._pair_logits(recognizer, img1, img2)
+        cls = self.cross_entropy(logits.float(), targets)
+        if cls_scale:
+            (cls_scale * cls).backward()
+            if bridge.grad is None:
+                raise RuntimeError("Generator+Recognizer loss did not produce a latent gradient.")
+        bridge_grad = bridge.grad if cls_scale else torch.zeros_like(bridge)
+
+        outputs = [(latent2, bridge_grad.reshape_as(latent2)),
+                   (pde, torch.full_like(pde, float(self.params.lambda_pde) / denominator))]
+        outputs = [(value, cotangent) for value, cotangent in outputs if value.requires_grad]
+        if outputs:
+            torch.autograd.backward(*zip(*outputs))
+
+        # Preserve legacy spatial-last gradient telemetry for VAE-shaped latents.
+        base = self._generator_module(generator)
+        metric_grad = (bridge_grad.reshape(-1, base.latent_channels, base.latent_size, base.latent_size)
+                       if getattr(base, "uses_vae_latent_shape", False) else bridge_grad)
+        metrics = self._loss_metrics(cls + loss0, pde, logits, z, latent1, latent2,
+                                     metric_grad, denominator)
+        images = [img.detach().unflatten(0, (B, K)) if need_images else None for img in (img1, img2)]
+        return metrics, logits.detach(), logits0, targets, potentials.detach(), *images, latent2.detach()
 
     # ------------------------ train ------------------------
     def train(self, generator, traversal_sets, recognizer):
@@ -516,7 +503,7 @@ class TrainerPotential(object):
             do_imgs = do_log and enable_images and do_freq and (self.img_logger is not None) and is_boundary
             do_hists = do_log and enable_histograms and do_freq and is_boundary
             do_figs = do_log and enable_figures and do_freq and is_boundary
-            do_gradnorm = do_log and enable_analytics and is_boundary
+            do_gradnorm = do_freq and enable_analytics and is_boundary
 
             B = int(self.params.batch_size)
             z = sample_z(B, generator, self.params, self.device)
@@ -554,13 +541,7 @@ class TrainerPotential(object):
 
                 if enable_analytics:
                     preds_np = preds_2d.detach().cpu().numpy()
-                    for k in range(int(self.K)):
-                        self.stat_tracker.update_per_k_after_micro(
-                            true_k=int(k),
-                            preds=preds_np[:, k],
-                            batch_size=int(B),
-                            grad_norm_selected_mlp=(per_k_gn[k] if per_k_gn is not None else None),
-                        )
+                    self.stat_tracker.update_all_k_after_micro(preds=preds_np, grad_norms=per_k_gn)
 
             # ===== recognizer optimizer step @ each micro-step =====
 
@@ -596,7 +577,7 @@ class TrainerPotential(object):
                 win_means = self.stat_tracker.close_window()
 
                 # TB blocks (short calls, right when inputs exist)
-                if do_log:
+                if do_freq:
                     tb_scalars(self.tb_writer, step_idx, win_means, self.stat_tracker)
                     if do_hists:
                         tb_hists(
@@ -663,17 +644,17 @@ class TrainerPotential(object):
 
                 elapsed_time = time.time() - t0
                 mean_step_time = self.stat_tracker.mean_step_time()
-                eta = (total_opt_steps - self.stat_tracker.global_opt_step) * mean_step_time
+                eta = max(0, total_opt_steps - self.stat_tracker.global_opt_step - 1) * mean_step_time
                 iter_t0 = time.time()
 
                 self.stat_tracker.finalize_step(
-                    step_idx=self.stat_tracker.global_opt_step,
+                    step_idx=step_idx,
                     window_means=win_means,
                     elapsed_from_start=elapsed_time,
                     mean_step_time=mean_step_time,
                     eta_seconds=eta,
                 )
-                self.log_progress(self.stat_tracker.global_opt_step, mean_step_time, elapsed_time, eta)
+                self.log_progress(step_idx, mean_step_time, elapsed_time, eta)
 
                 if (self.stat_tracker.global_opt_step % int(self.params.log_freq)) == 0:
                     self._write_stats_json()

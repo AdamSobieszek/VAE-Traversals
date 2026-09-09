@@ -1,11 +1,12 @@
-"""Continue distilling the fixed StyleGAN2 pointwise_style32 generator.
+"""Distill the StyleGAN2 pointwise_style32 generator at 128 or 256 resolution.
 
 Run from train_traversals with Python from the active environment::
 
     python -m models.StyleGAN_SkipNetwork128 --device cuda --amp \
         --out-dir experiments/sg128_pointwise_style32
 
-The default source is the trained sg128_pointwise_style32.pt. Full 128 frames,
+Add --resolution 256 to initialize a b256 model from the full teacher.
+The default source is the trained sg128_pointwise_style32.pt. Full frames,
 constant teacher/student noise, balanced normal/all/first8/odd style sampling,
 and the winning loss recipe are retained. --resume restores a checkpoint from
 this trainer; add --reset-steps for a fresh optimizer and training schedule.
@@ -29,7 +30,7 @@ from torch.amp import GradScaler, autocast
 from PIL import Image
 
 from models.StyleGAN2_mps.early_output_model import (
-    FORMAT_NAME, GENERATOR_CONFIG, _load_full_source_generator,
+    FORMAT_NAME, GENERATOR_CONFIGS, Generator, _load_full_source_generator,
     load_generator_checkpoint,
 )
 
@@ -43,8 +44,9 @@ EVAL_GROUPS = ("normal", "all", "first8", "odd")
 
 @dataclass
 class TrainConfig:
+    resolution: int = 128
     gan_weights: str = DEFAULT_GAN_WEIGHTS
-    early_output_weights: str = DEFAULT_EARLY_OUTPUT_WEIGHTS
+    early_output_weights: Optional[str] = DEFAULT_EARLY_OUTPUT_WEIGHTS
     out_dir: str = "experiments/sg128_pointwise_style32"
     device: str = "auto"
     batch_size: int = 12
@@ -79,12 +81,20 @@ class TrainConfig:
     resume: Optional[str] = None
     reset_steps: bool = False
 
+    def __post_init__(self):
+        if self.resolution == 256:
+            if self.early_output_weights == DEFAULT_EARLY_OUTPUT_WEIGHTS:
+                self.early_output_weights = None  # A new head, initialized from the teacher.
+            if self.out_dir == "experiments/sg128_pointwise_style32":
+                self.out_dir = "experiments/sg256_pointwise_style32"
+
 
 class StyleGANTeacher(nn.Module):
     def __init__(self, cfg, device):
         super().__init__()
         self.G = _load_full_source_generator(cfg.gan_weights).to(device)
         self.truncation_psi, self.noise_mode = cfg.truncation_psi, cfg.noise_mode
+        self.resolution = cfg.resolution
 
     def map_z(self, z):
         return self.G.mapping(z, None, truncation_psi=self.truncation_psi)
@@ -93,7 +103,26 @@ class StyleGANTeacher(nn.Module):
     def target_from_ws(self, ws):
         image = self.G.synthesis(ws.float(), noise_mode=self.noise_mode,
                                 fused_modconv=False if ws.device.type == "mps" else None)
-        return F.interpolate(image.float(), size=(128, 128), mode="area")
+        return F.interpolate(image.float(), size=(self.resolution, self.resolution), mode="area")
+
+
+@torch.no_grad()
+def initialize_from_teacher(teacher, resolution, device):
+    """Copy the prefix and initialize RGB as the final block's average-W toRGB."""
+    model = Generator(img_resolution=resolution).to(device)
+    source = teacher.G.state_dict()
+    model.load_state_dict({name: source[name] if not name.startswith("synthesis.decoder.") else value
+                           for name, value in model.state_dict().items()}, strict=True)
+    head = model.synthesis.decoder
+    torgb = getattr(model.synthesis, f"b{resolution}").torgb
+    style = torgb.affine(model.mapping.w_avg[None]).flatten() * torgb.weight_gain
+    head.linear.weight.zero_()
+    head.linear.weight[:, :, 1, 1].copy_(torgb.weight[:, :, 0, 0] * style[None])
+    head.linear.bias.copy_(torgb.bias)
+    for layer in (head.mix_out, head.spatial_out, head.style[-1]):
+        layer.weight.zero_()
+        layer.bias.zero_()
+    return model
 
 
 class AdamWWithReferenceDecay(torch.optim.AdamW):
@@ -588,10 +617,12 @@ def _atomic_save(value: dict, path: str) -> None:
 
 
 def save_generator(model, path):
-    _atomic_save(dict(format=FORMAT_NAME, config=GENERATOR_CONFIG, generator=model.state_dict()), path)
+    _atomic_save(dict(format=FORMAT_NAME, config=GENERATOR_CONFIGS[model.img_resolution], generator=model.state_dict()), path)
 
 
 def _validate_config(cfg):
+    if cfg.resolution not in GENERATOR_CONFIGS:
+        raise ValueError("Resolution must be 128 or 256")
     for field in fields(cfg):
         value = getattr(cfg, field.name)
         if isinstance(value, (int, float)) and not math.isfinite(value):
@@ -607,7 +638,7 @@ def _validate_config(cfg):
         raise ValueError("Decay coefficients must be nonnegative")
     if cfg.synthesis_lr * max(1., cfg.early_synthesis_lr_scale) * cfg.synthesis_reference_decay > 1:
         raise ValueError("Reference decay times synthesis LR must not exceed 1")
-    if cfg.finetune_min_resolution not in (4, 8, 16, 32, 64, 128):
+    if cfg.finetune_min_resolution not in (4, 8, 16, 32, 64, 128, 256) or cfg.finetune_min_resolution > cfg.resolution:
         raise ValueError("Invalid minimum synthesis resolution")
     if not 0 <= cfg.w_augment_percent <= 1 or not 0 <= cfg.saliency_uniform_mix <= 1:
         raise ValueError("Augmentation and saliency fractions must be in [0, 1]")
@@ -623,8 +654,12 @@ def train(cfg: TrainConfig):
     device = select_device() if cfg.device == "auto" else torch.device(cfg.device)
     set_seed(cfg.seed, device)
     source_path = cfg.resume or cfg.early_output_weights
-    model = load_generator_checkpoint(source_path, device)
+    model = load_generator_checkpoint(source_path, device) if (source_path and os.path.exists(source_path)) else None
     teacher = StyleGANTeacher(cfg, device)
+    if model is None:
+        model = initialize_from_teacher(teacher, cfg.resolution, device)
+    if model.img_resolution != cfg.resolution:
+        raise ValueError("Checkpoint resolution does not match --resolution")
     # A frozen mapping must match the one used to create training Ws; const
     # noise buffers must also match before comparing the two synthesis paths.
     for name, value in model.mapping.state_dict().items():
@@ -637,11 +672,11 @@ def train(cfg: TrainConfig):
     continuing = bool(cfg.resume and not cfg.reset_steps)
     state = torch.load(cfg.resume, map_location="cpu", weights_only=False) if continuing else {}
     if continuing:
-        if state.get("format") != TRAINING_FORMAT:
+        if state.get("format") != TRAINING_FORMAT.replace("128", str(cfg.resolution)):
             raise ValueError("Use --reset-steps to start a fresh run from the uploaded model")
         ignored = {"resume", "reset_steps", "out_dir", "log_every", "plot_every", "ckpt_every", "device"}
         changed = [key for key, value in asdict(cfg).items()
-                   if key not in ignored and state["config"].get(key) != value]
+                   if key not in ignored and state["config"].get(key, 128 if key == "resolution" else None) != value]
         if changed or state["teacher_sha256"] != teacher_hash:
             raise ValueError(f"Continuation configuration changed ({changed}); use --reset-steps")
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -671,7 +706,7 @@ def train(cfg: TrainConfig):
         step, skipped = state["step"], state["skipped_updates"]
     if step >= cfg.max_steps:
         raise ValueError("Checkpoint already reached max-steps")
-    print(f"Finetuning pointwise_style32 on {device} from {source_path}", flush=True)
+    print(f"Finetuning {cfg.resolution} pointwise_style32 on {device} from {source_path or 'full teacher'}", flush=True)
     bank = make_validation_bank(teacher, cfg, device)
     if continuing:
         initial, best_score = state["initial_validation"], state["best_score"]
@@ -685,8 +720,8 @@ def train(cfg: TrainConfig):
             open(osp.join(cfg.out_dir, filename), "w").close()
         with open(osp.join(cfg.out_dir, "initial_validation.json"), "w") as handle:
             json.dump(initial, handle, indent=2)
-    face = face_saliency_mask(128, 128, device=device)
-    mask = ((1 - cfg.saliency_uniform_mix) * face + cfg.saliency_uniform_mix / (128 * 128)) if cfg.saliency else None
+    face = face_saliency_mask(cfg.resolution, cfg.resolution, device=device)
+    mask = ((1 - cfg.saliency_uniform_mix) * face + cfg.saliency_uniform_mix / cfg.resolution**2) if cfg.saliency else None
     trainable = [p for group in groups for p in group["params"]]
     while step < cfg.max_steps:
         update = step + 1
@@ -743,8 +778,8 @@ def train(cfg: TrainConfig):
         if cfg.plot_every and step % cfg.plot_every == 0:
             save_panels(model, bank, cfg, device, osp.join(plots, f"step_{step:06d}"))
         if step % cfg.ckpt_every == 0 or step == cfg.max_steps:
-            checkpoint = dict(format=TRAINING_FORMAT, step=step, generator=model.state_dict(),
-                generator_config=GENERATOR_CONFIG, config=asdict(cfg), optimizer=optimizer.state_dict(),
+            checkpoint = dict(format=TRAINING_FORMAT.replace("128", str(cfg.resolution)), step=step, generator=model.state_dict(),
+                generator_config=GENERATOR_CONFIGS[cfg.resolution], config=asdict(cfg), optimizer=optimizer.state_dict(),
                 scaler=scaler.state_dict(), teacher_sha256=teacher_hash, sampling_rng=private_rng.get_state(),
                 torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
                 best_generator=best_state, best_score=best_score, best_step=best_step,
@@ -771,6 +806,8 @@ def build_argparser():
             options["type"] = type(value) if value is not None else str
         if field.name == "device":
             options["choices"] = ("auto", "cuda", "mps", "cpu")
+        elif field.name == "resolution":
+            options["choices"] = (128, 256)
         elif field.name == "noise_mode":
             options["choices"] = ("const", "none")
         parser.add_argument("--" + field.name.replace("_", "-"), **options)

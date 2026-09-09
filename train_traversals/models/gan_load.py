@@ -38,6 +38,8 @@ def _amp_disabled(device_type: str):
 ##                                                                                                                    ##
 ########################################################################################################################
 class SNGANWrapper(nn.Module):
+    share_initial_output = True
+
     def __init__(self, G):
         super(SNGANWrapper, self).__init__()
         self.G = G.model
@@ -128,6 +130,8 @@ def build_biggan(pretrained_gan_weights, target_classes):
 ##                                                                                                                    ##
 ########################################################################################################################
 class ProgGANWrapper(nn.Module):
+    share_initial_output = True
+
     def __init__(self, G):
         super(ProgGANWrapper, self).__init__()
         self.G = G

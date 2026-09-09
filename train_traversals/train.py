@@ -26,9 +26,9 @@ def main():
 
         --traversal-set-lr           : set learning rate for learning support sets
 
-        ===[ Reconstructor (R) ]========================================================================================
-        --reconstructor-type       : set reconstructor network type
-        --reconstructor-lr         : set learning rate for reconstructor R optimization
+        ===[ recognizer (R) ]========================================================================================
+        --recognizer-type       : set recognizer network type
+        --recognizer-lr         : set learning rate for recognizer R optimization
 
         ===[ Training ]=================================================================================================
         --max-iter                 : set maximum number of training iterations
@@ -44,7 +44,7 @@ def main():
 
     # === Pre-trained GAN Generator (G) ============================================================================== #
     parser.add_argument('--gan-type', type=str, choices=GAN_WEIGHTS.keys(), help='set GAN generator model type')
-    parser.add_argument('--z-truncation', type=float, help="set latent code sampling truncation parameter")
+    parser.add_argument('--z-truncation', type=float, default=1.0, help="set latent code sampling truncation parameter")
     parser.add_argument('--biggan-target-classes', nargs='+', type=int, help="list of classes for conditional BigGAN")
     parser.add_argument('--stylegan2-resolution', type=int, default=1024, choices=(256, 1024),
                         help="StyleGAN2 image resolution")
@@ -55,16 +55,18 @@ def main():
     parser.add_argument('-D', '--num-traversal-timesteps', type=int, help="set number of timesteps per potential")
     parser.add_argument('--traversal-set-lr', type=float, default=3e-4, help="set learning rate")
 
-    # === Reconstructor (R) ========================================================================================== #
-    parser.add_argument('--reconstructor-lr', type=float, default=3e-4,
-                        help="set learning rate for reconstructor R optimization")
-    parser.add_argument('--reconstructor-type', type=str, default='ResNet',
-                        help='set reconstructor network type')
+    # === recognizer (R) ========================================================================================== #
+    parser.add_argument('--recognizer-lr', type=float, default=3e-4,
+                        help="set learning rate for recognizer R optimization")
+    parser.add_argument('--recognizer-type', type=str, default='ResNet',
+                        help='set recognizer network type')
 
     # === Training =================================================================================================== #
     parser.add_argument('--max-iter', type=int, default=100000, help="set maximum number of training iterations")
     parser.add_argument('--batch-size', type=int, default=32, help="set batch size")
     parser.add_argument('--accumulate-grad-steps', type=int, default=1, help="set number of steps to accumulate gradients")
+    parser.add_argument('--generator-recompute-chunk', type=int, default=0,
+                        help="bound frozen deterministic generator activations by replaying chunks in backward; 0 disables")
     parser.add_argument('--warmup-fraction', type=float, default=0.05, help="warmup fraction")
     parser.add_argument('--lambda-cls', type=float, default=1.00, help="classification loss weight")
     parser.add_argument('--lambda-reg', type=float, default=.0, help="regression loss weight")
@@ -72,6 +74,8 @@ def main():
     parser.add_argument('--log-freq', default=10, type=int, help='set number iterations per log')
     parser.add_argument('--ckp-freq', default=1000, type=int, help='set number iterations per checkpoint model saving')
     parser.add_argument('--tensorboard', action='store_true', help="use tensorboard")
+    parser.add_argument('--track-dt-stats', action='store_true',
+                        help="cache per-step dt statistics (adds an accelerator synchronization)")
     # === Validation ===================================================================================================== #
     parser.add_argument('--val-freq', type=int, default=10, help="set number iterations per validation")
     # === Restart ===================================================================================================== #
@@ -92,7 +96,7 @@ def main():
     use_cuda = torch.cuda.is_available()
     use_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
     multi_gpu = use_cuda and (torch.cuda.device_count() > 1)
-    reconstructor_pool_size = 2 if args.reconstructor_type == 'LeNet' and args.gan_type != 'SNGAN_AnimeFaces' else 1
+    recognizer_pool_size = 2 if args.recognizer_type.endswith('LeNet') and args.gan_type != 'SNGAN_AnimeFaces' else 1
 
     device = choose_device()
 
@@ -131,7 +135,7 @@ def main():
                             resolution=args.stylegan2_resolution,
                             shift_in_w_space=args.shift_in_w_space)
         if args.stylegan2_resolution == 1024:
-            reconstructor_pool_size = 4
+            recognizer_pool_size = 4
     # === Spectrally Normalised GAN (SNGAN) ===
     else:
         G = build_sngan(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][GAN_RESOLUTIONS[args.gan_type]],
@@ -146,19 +150,21 @@ def main():
     S = TraversalPDE(num_traversal_sets=args.num_traversal_sets,
                     num_traversal_timesteps=args.num_traversal_timesteps,
                     traversal_vectors_dim=G.dim_z,
+                    n_hidden=32,
                     lambdas={'BB': 0.25, 'signed_g2orth': 1.0},
                     ) 
 
     # Count number of trainable parameters
     print("  \\__Trainable parameters: {:,}".format(sum(p.numel() for p in S.parameters() if p.requires_grad)))
 
-    # Build recognizer model (legacy: reconstructor) R
-    print("#. Build recognizer (reconstructor) model R...")
-    R = Recognizer(reconstructor_type=args.reconstructor_type,
-                      dim_index=S.num_traversal_sets,
-                      dim_time=S.num_traversal_timesteps,
-                      channels=1 if args.gan_type == 'SNGAN_MNIST' else 3,
-                      pool_size=reconstructor_pool_size)
+    # Build recognizer model (legacy: recognizer) R
+    print("#. Build recognizer (recognizer) model R...")
+    recognizer_cls = AntisymmetricRecognizer if args.recognizer_type.startswith('Antisymmetric') else Recognizer
+    recognizer_backbone = args.recognizer_type.removeprefix('Antisymmetric')
+    R = recognizer_cls(recognizer_type=recognizer_backbone,
+                       dim_index=S.num_traversal_sets,
+                       channels=1 if args.gan_type == 'SNGAN_MNIST' else 3,
+                       pool_size=recognizer_pool_size)
 
     # Count number of trainable parameters
     print("  \\__Trainable parameters: {:,}".format(sum(p.numel() for p in R.parameters() if p.requires_grad)))
@@ -168,7 +174,7 @@ def main():
     trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
 
     # Train
-    trn.train(generator=G, traversal_sets=S, reconstructor=R)
+    trn.train(generator=G, traversal_sets=S, recognizer=R)
 
 
 if __name__ == '__main__':

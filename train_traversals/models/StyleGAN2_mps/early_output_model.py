@@ -1,5 +1,5 @@
 # Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.
-"""StyleGAN2 b128 prefix with the trained pointwise_style32 RGB head.
+"""StyleGAN2 b128/b256 prefix with a pointwise_style32 RGB head.
 
 Load the trained model (public export or training checkpoint)::
 
@@ -31,11 +31,12 @@ SOURCE_RESOLUTION = 1024
 OUTPUT_RESOLUTION = 128
 IMG_CHANNELS = 3
 PREFIX_NUM_WS = 12
-# Fixed metadata also validates the uploaded winning checkpoint. No other
-# resolutions, decoder variants, or channel widths are implemented.
+# (feature channels, prefix W count, first conditioning W slot).
+RESOLUTION_SPECS = {128: (256, 12, 9), 256: (128, 14, 11)}
 GENERATOR_CONFIG = dict(z_dim=512, c_dim=0, w_dim=512, img_resolution=128,
                         img_channels=3, decoder_hidden_channels=16,
                         decoder_architecture="pointwise_style", decoder_spatial_channels=32)
+GENERATOR_CONFIGS = {r: dict(GENERATOR_CONFIG, img_resolution=r) for r in RESOLUTION_SPECS}
 
 
 class PointwiseStyleDecoder(nn.Module):
@@ -44,12 +45,13 @@ class PointwiseStyleDecoder(nn.Module):
     Keep trained tensor names (spatial_in/out) so the winning checkpoint loads
     directly. The conditioned branch contains only 1x1 convolutions.
     """
-    def __init__(self):
+    def __init__(self, img_resolution=OUTPUT_RESOLUTION):
         super().__init__()
-        self.linear = nn.Conv2d(256, 3, 3, padding=1)
-        self.mix_in = nn.Conv2d(256, 16, 1)
+        channels, _, self.style_start = RESOLUTION_SPECS[img_resolution]
+        self.linear = nn.Conv2d(channels, 3, 3, padding=1)
+        self.mix_in = nn.Conv2d(channels, 16, 1)
         self.mix_out = nn.Conv2d(16, 3, 1)
-        self.spatial_in = nn.Conv2d(256, 32, 1)
+        self.spatial_in = nn.Conv2d(channels, 32, 1)
         self.spatial_out = nn.Conv2d(32, 3, 1)
         self.style = nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, 64),
                                    nn.SiLU(), nn.Linear(64, 64))
@@ -58,18 +60,18 @@ class PointwiseStyleDecoder(nn.Module):
         features = features.float()
         output = self.linear(features) + self.mix_out(F.silu(self.mix_in(features)))
         hidden = F.silu(self.spatial_in(features))
-        scale, bias = self.style(ws[:, 9:11].flatten(1).float()).chunk(2, dim=1)
+        scale, bias = self.style(ws[:, self.style_start:self.style_start + 2].flatten(1).float()).chunk(2, dim=1)
         hidden = hidden * (1 + scale[:, :, None, None]) + bias[:, :, None, None]
         return output + self.spatial_out(F.silu(hidden))
 
 
 class SynthesisNetwork(nn.Module):
-    """Original 1024 generator's convolution path through b128, then RGB."""
-    def __init__(self):
+    """Original 1024 generator's convolution path through b128 or b256."""
+    def __init__(self, img_resolution=OUTPUT_RESOLUTION):
         super().__init__()
-        self.w_dim, self.num_ws = W_DIM, PREFIX_NUM_WS
-        self.img_resolution, self.img_channels = OUTPUT_RESOLUTION, IMG_CHANNELS
-        self.block_resolutions = [4, 8, 16, 32, 64, 128]
+        self.w_dim, self.num_ws = W_DIM, RESOLUTION_SPECS[img_resolution][1]
+        self.img_resolution, self.img_channels = img_resolution, IMG_CHANNELS
+        self.block_resolutions = [r for r in (4, 8, 16, 32, 64, 128, 256) if r <= img_resolution]
         channels = {r: min(32768 // r, 512) for r in self.block_resolutions}
         for resolution in self.block_resolutions:
             # Retain source toRGB tensors for strict checkpoint loading; they
@@ -77,11 +79,11 @@ class SynthesisNetwork(nn.Module):
             block = SynthesisBlock(
                 channels[resolution // 2] if resolution > 4 else 0,
                 channels[resolution], w_dim=W_DIM, resolution=resolution,
-                img_channels=3, is_last=resolution == 128,
+                img_channels=3, is_last=resolution == img_resolution,
                 use_fp16=resolution >= 128,
             )
             setattr(self, f"b{resolution}", block)
-        self.decoder = PointwiseStyleDecoder()
+        self.decoder = PointwiseStyleDecoder(img_resolution)
 
     def forward(self, ws: torch.Tensor, **block_kwargs) -> torch.Tensor:
         misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
@@ -97,17 +99,18 @@ class SynthesisNetwork(nn.Module):
 
 
 class Generator(nn.Module):
-    """Fixed 128x128 pointwise_style32 generator with the full source mapping."""
-    def __init__(self, **config):
+    """Pointwise_style32 generator; select img_resolution=128 (default) or 256."""
+    def __init__(self, img_resolution=OUTPUT_RESOLUTION, **config):
         super().__init__()
-        if any(key not in GENERATOR_CONFIG or value != GENERATOR_CONFIG[key]
+        expected = GENERATOR_CONFIGS.get(img_resolution)
+        if expected is None or any(key not in expected or value != expected[key]
                for key, value in config.items()):
-            raise ValueError("Only the trained 128x128 pointwise_style32 configuration is supported")
+            raise ValueError("Only 128/256 pointwise_style32 configurations are supported")
         self.z_dim, self.c_dim, self.w_dim = Z_DIM, 0, W_DIM
-        self.img_resolution, self.img_channels = OUTPUT_RESOLUTION, IMG_CHANNELS
-        self.num_ws = PREFIX_NUM_WS
+        self.img_resolution, self.img_channels = img_resolution, IMG_CHANNELS
+        self.num_ws = RESOLUTION_SPECS[img_resolution][1]
         self.mapping = MappingNetwork(Z_DIM, 0, W_DIM, self.num_ws)
-        self.synthesis = SynthesisNetwork()
+        self.synthesis = SynthesisNetwork(img_resolution)
 
     @property
     def device(self):
@@ -157,9 +160,9 @@ def build_optimized_early_output_synthesis(synthesis, cfg, *, copy_module=True):
 def load_generator_checkpoint(path: str, device="cpu") -> Generator:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     config = checkpoint.get("generator_config") or checkpoint.get("config", {})
-    if config != GENERATOR_CONFIG or "generator" not in checkpoint:
+    if config != GENERATOR_CONFIGS.get(config.get("img_resolution")) or "generator" not in checkpoint:
         raise ValueError("Expected a pointwise_style32 generator export or training checkpoint")
-    model = Generator()
+    model = Generator(**config)
     model.load_state_dict(checkpoint["generator"], strict=True)
     return model.eval().requires_grad_(False).to(device)
 

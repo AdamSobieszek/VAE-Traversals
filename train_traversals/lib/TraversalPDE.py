@@ -8,6 +8,26 @@ from lib.pde_ops import PDEState
 from lib.pde_losses import build_losses
 
 
+@torch.no_grad()
+def gaussian_cone_noise(delta: torch.Tensor, aperture: float = 0.2,
+                        gaussian: torch.Tensor = None) -> torch.Tensor:
+    """Sample the transverse part of a fixed-angle Gaussian-cone step.
+
+    Project isotropic Gaussian noise onto delta's orthogonal complement and
+    normalize it to radius aperture*||delta||. Thus the step delta+noise has
+    tan(angle)=aperture away from the numerical clamps: its azimuth is uniform,
+    its angle is fixed. This is
+    the existing normalized-Gaussian kernel, not additive Gaussian diffusion.
+    Noise is stop-gradient; only the deterministic step trains the potential.
+    ``gaussian`` permits reproducible kernel comparisons without changing RNG.
+    """
+    noise = torch.randn_like(delta) if gaussian is None else gaussian.clone()
+    radius2 = delta.square().sum(-1, keepdim=True)
+    projection = (noise * delta).sum(-1, keepdim=True) / radius2.clamp_min(1e-12)
+    noise.addcmul_(delta, projection, value=-1)
+    return noise.mul_(radius2.sqrt().mul_(aperture) / noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12))
+
+
 # ================================================================
 # Core stacked layers (vectorized over traversal-set axis K)
 # ================================================================
@@ -112,13 +132,32 @@ class StackedSemanticPotential(nn.Module):
         x: [B, K, D_in]
         returns: [B, K, n_out]
         """
+        return self._evaluate(x)[0]
+
+    def value_and_grad(self, x: torch.Tensor):
+        """F and its input gradient, with a differentiable explicit chain rule.
+
+        No dense Jacobian or autograd engine invocation is needed for the
+        standard scalar Softplus potential. Other architectures keep autograd.
+        Parameters, weighted coordinates and higher input derivatives retain
+        their graph, including differentiation through the gradient norm.
+        """
+        supported = (type(self) is StackedSemanticPotential and self.n_out == 1
+                     and not hasattr(self, "fc2") and type(self.act1) is nn.Softplus
+                     and type(self.act3) is nn.Softplus and type(self.final_activation) is nn.Identity)
+        if not supported:
+            value = self(x)
+            return value, torch.autograd.grad(value.sum(), x, create_graph=True)[0]
+        return self._evaluate(x, input_gradient=True)
+
+    def _evaluate(self, x, input_gradient=False):
         # Stacked MLP body
-        h = self.fc1(x)
-        h = self.act1(h) + h
+        h1 = self.fc1(x)
+        h = self.act1(h1) + h1
         # h = self.fc2(h)
         # h = self.act2(h) + h
-        h = self.fc3(h)
-        h = self.act3(h)
+        h3 = self.fc3(h)
+        h = self.act3(h3)
 
         # Base potential + direct linear term
         out_mlp = self.fc4(h) * self.c         # [B, K, n_out]
@@ -135,7 +174,19 @@ class StackedSemanticPotential(nn.Module):
         out_centered = out - self.running_mean  # broadcasts [K, n_out] over batch
 
         # Optional nonlinearity on final potentials
-        return self.final_activation(out_centered)
+        value = self.final_activation(out_centered)
+        if not input_gradient:
+            return value, None
+
+        def slope(activation, preactivation):
+            scaled = preactivation * activation.beta
+            return torch.where(scaled > activation.threshold, 1.0, scaled.sigmoid())
+
+        adjoint = slope(self.act3, h3) * (self.fc4.weight[:, 0] * self.c)
+        adjoint = torch.einsum("bko,koi->bki", adjoint, self.fc3.weight)
+        adjoint = adjoint * (1 + slope(self.act1, h1))
+        gradient = torch.einsum("bko,koi->bki", adjoint, self.fc1.weight)
+        return value, gradient + self.dir_linear.weight[:, 0]
 
 
 class TraversalPDE(nn.Module):
@@ -147,6 +198,8 @@ class TraversalPDE(nn.Module):
         num_traversal_sets: int,
         num_traversal_timesteps: int,
         traversal_vectors_dim: int,
+        n_hidden: int = 128,
+        final_activation: nn.Module = nn.Identity(),
         lambdas: Optional[Dict[str, float]] = None,          # ONLY what you want active
         n_laplace_probes: int = 1,
         # PDEState config
@@ -175,7 +228,8 @@ class TraversalPDE(nn.Module):
             K=self.num_traversal_sets,
             n_in=self.traversal_vectors_dim,
             n_out=1,
-            final_activation=nn.Identity(),
+            n_hidden=n_hidden,
+            final_activation=final_activation,
         )
 
         # PDEState config for each step
@@ -209,6 +263,8 @@ class TraversalPDE(nn.Module):
         z_bkd: torch.Tensor,
         dt: torch.Tensor = 1.0,
         direction: int = +1,
+        *,
+        compute_losses: bool = True,
     ):
         st = PDEState(
             f=self.F,
@@ -220,29 +276,15 @@ class TraversalPDE(nn.Module):
         )
 
         # compute & sum selected losses [B,K,1]
-        per_bk = [L(st) for L in self.losses]
-        L_sum = sum(per_bk) if per_bk else st.zeros()
+        L_sum = sum((loss(st) for loss in self.losses), st.zeros()) if compute_losses else st.zeros()
 
         # next latent: x_next = x + dt * v(now)
         x_next = st.x_next()
 
         # optional small step noise
         if self.training:
-            with torch.no_grad():
-                step_delta = x_next - st.x()
-                step_delta_sq_norms = step_delta.pow(2).sum(dim=-1, keepdim=True)
-                step_delta_norms = step_delta_sq_norms.sqrt()
-                latent_noise = torch.randn_like(x_next)
-                latent_noise = latent_noise - step_delta * (
-                    (latent_noise * step_delta).sum(dim=-1, keepdim=True) / step_delta_sq_norms.clamp_min(1e-12)
-                )
-                latent_noise = latent_noise / latent_noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12)
-                latent_noise = latent_noise * (step_delta_norms / 5.0)
-            x_next_noisy = x_next + latent_noise
-        else:
-            x_next_noisy = x_next
-
-        return st, x_next_noisy, L_sum, st.dt()
+            x_next = x_next + gaussian_cone_noise(x_next.detach() - st.x().detach())
+        return st, x_next, L_sum, st.dt()
 
     # ---- unrolled training ----
     def forward(
@@ -275,16 +317,11 @@ class TraversalPDE(nn.Module):
         z_curr = z.unsqueeze(1).expand(B, K, D).contiguous()
 
         potential_preds = []
-        latent1_bk = None
-        latent2_bk = None
-        last_st: Optional[PDEState] = None
-
-        L_accum = None  # accumulate per-[B,K,1]
-
-        step_iter = range(T)
+        path = [z_curr]
+        L_accum = z.new_zeros(B, K, 1)
         self.F.update_batchnorm = True
 
-        for i in step_iter:
+        for _ in range(T):
             st, x_next, L_step, dt = self._per_step(
                 z_curr,
                 dt=dt,
@@ -294,16 +331,10 @@ class TraversalPDE(nn.Module):
             potential_preds.append(st.f().detach())
 
             # accumulate loss per step
-            L_accum = L_step if L_accum is None else L_accum + L_step
+            L_accum = L_accum + L_step
 
             # capture (latent1, latent2) at the requested index
-            mask_b = (i_target == i).view(B, 1, 1)
-            if latent1_bk is None:
-                latent1_bk = torch.where(mask_b, z_curr, torch.zeros_like(z_curr))
-                latent2_bk = torch.where(mask_b, x_next, torch.zeros_like(x_next))
-            else:
-                latent1_bk = torch.where(mask_b, z_curr, latent1_bk)
-                latent2_bk = torch.where(mask_b, x_next, latent2_bk)
+            path.append(x_next)
 
             # advance
             z_curr = x_next
@@ -313,20 +344,21 @@ class TraversalPDE(nn.Module):
             self.F.update_batchnorm = False
 
         # average over steps
-        L_total_per_bk = L_accum / float(T) if L_accum is not None else last_st.zeros()
-        L_total_mean = L_total_per_bk.mean()
+        L_total_mean = (L_accum / T).mean()
 
         # for predicting the attribute
         potential_preds.append(last_st.f("next").detach())
         potential_preds = torch.cat(potential_preds, dim=-1)
 
         self._acc = {
-            "xf_now": last_st.Xf()
-            if last_st is not None
-            else torch.zeros(B, K, D, device=z.device, dtype=z.dtype),
+            "xf_now": last_st.Xf().detach(),
             "L_mean": L_total_mean.detach(),
             **last_st.state["losses"],
         }
+
+        path = torch.stack(path)
+        batch = torch.arange(B, device=z.device)
+        latent1_bk, latent2_bk = path[i_target, batch], path[i_target + 1, batch]
 
         if w_avg is not None:
             latent1_bk = latent1_bk + w_avg.reshape(1, 1, D)
@@ -345,6 +377,11 @@ class TraversalPDE(nn.Module):
         dt: torch.Tensor = 1.0,
         direction: int = +1,
     ) -> List[torch.Tensor]:
+        """One differentiable step; eval mode omits unused training penalties.
+
+        Training mode retains loss evaluation and its RNG draws, preserving
+        the stochastic kernel for callers that intentionally infer in train().
+        """
         if len(z.shape) == 3:
             B, K, D = z.shape
             z_curr = z
@@ -357,5 +394,6 @@ class TraversalPDE(nn.Module):
             z_curr,
             dt=dt,
             direction=direction,
+            compute_losses=self.training,
         )
         return z_curr, x_next - z_curr

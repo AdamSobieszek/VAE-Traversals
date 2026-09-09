@@ -9,3 +9,4 @@
 /train_traversals/models/pretrained
 /train_traversals/tests/results
 .DS_Store
+/train_traversals/experiments

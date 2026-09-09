@@ -222,7 +222,13 @@ class PDEState:
         key = ("f_grad", when)
         if key not in self.state:
             create_graph = bool(self.cfg["track_param_through_xgrads"])
-            self.state[key] = grad(self.f(when).sum(), self.x() if when == "now" else self.x_next(), create_graph=create_graph)[0]
+            x = self.x() if when == "now" else self.x_next()
+            explicit = getattr(self.f_m, "value_and_grad", None)
+            if explicit is not None and ("f", when) not in self.state and self.cfg.get("explicit_input_grad", True):
+                self.state[("f", when)], g = explicit(x)
+                self.state[key] = g if create_graph else g.detach()
+            else:
+                self.state[key] = grad(self.f(when).sum(), x, create_graph=create_graph)[0]
         return self.state[key]
 
     def f_laplace(self, when: When = "now", probes: Optional[int] = None) -> torch.Tensor:
@@ -302,5 +308,4 @@ class PDEState:
     def zeros(self) -> torch.Tensor:
         """A [B,K,1] zero tensor on the state's device/dtype."""
         return torch.zeros((self.B, self.K, 1), device=self.device, dtype=self.dtype)
-
 

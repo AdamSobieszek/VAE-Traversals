@@ -24,7 +24,6 @@ from .aux import (
     tb_start, dual_batch_acc_from_logits,
     entropy_from_logits, collect_wave_stats,
     tb_scalars, tb_grad_norms, tb_hists, tb_figs, tb_images, clip_accum_grads_,
-    tb_path_figs,
 )
 
 DTYPE = torch.float32
@@ -577,7 +576,7 @@ class TrainerPotential(object):
                 win_means = self.stat_tracker.close_window()
 
                 # TB blocks (short calls, right when inputs exist)
-                if do_freq:
+                if do_log:
                     tb_scalars(self.tb_writer, step_idx, win_means, self.stat_tracker)
                     if do_hists:
                         tb_hists(
@@ -603,14 +602,7 @@ class TrainerPotential(object):
                         save_frames = bool(getattr(self.params, "save_plot_frames", True))
                         frames_dir = osp.join(self.wip_dir, "plot_frames") if save_frames else None
                         # tb_figs(self.tb_writer, step_idx, self.stat_tracker, K=int(self.K), log_freq=int(self.params.log_freq))
-                        tb_path_figs(
-                            self.tb_writer,
-                            step_idx,
-                            traversal_sets=traversal_sets,
-                            z_first=z[:16],
-                            dt_first=dt[:16] / dt[:16],
-                            save_dir=frames_dir,
-                        )
+
                         # Information/Confusion panel: use the same batch we already sampled (up to 64 points).
                         z_info = z[: min(int(z.shape[0]), 64)]
                         dt_info = dt[: min(int(dt.shape[0]), 64)]

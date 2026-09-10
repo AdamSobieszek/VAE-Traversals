@@ -2561,33 +2561,6 @@ def tb_images(img_logger, step: int, *, generator, z_first: torch.Tensor,
     )
 
 
-def tb_path_figs(
-    writer,
-    step: int,
-    *,
-    traversal_sets,
-    z_first: torch.Tensor,
-    dt_first: torch.Tensor,
-    save_dir: str | Path | None = None,
-):
-    """
-    Log latent-path projection figures for a single starting point z_first.
-    """
-    return
-    traj_tkd = ImageViz.rollout_latent_paths(traversal_sets, z_first, dt_first)  # [T+1,K,D]
-
-    fig1 = ImageViz.plot_spectral_projection_paths(traj_tkd)
-    writer.add_figure("paths/spectral_projection", fig1, global_step=step)
-    if save_dir is not None:
-        ImageViz.save_fig_copy(fig1, out_dir=save_dir, tag="paths__spectral_projection", step=step)
-    plt.close(fig1)
-
-    fig2 = ImageViz.plot_sector_projection_paths(traj_tkd)
-    writer.add_figure("paths/sector_projection", fig2, global_step=step)
-    if save_dir is not None:
-        ImageViz.save_fig_copy(fig2, out_dir=save_dir, tag="paths__sector_projection", step=step)
-    plt.close(fig2)
-
 
 def tb_pairwise_distance_figs(
     writer,

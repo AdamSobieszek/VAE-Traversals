@@ -1,10 +1,10 @@
 gan_type="SNGAN_AnimeFaces"
-num_traversal_sets=32
+num_traversal_sets=64
 num_traversal_timesteps=20
-warmup_fraction=0.001
+warmup_fraction=0.01
 accumulate_grad_steps=2
 recognizer_type="LeNet"
-batch_size=6
+batch_size=4
 max_iter=10_000
 tensorboard=true
 new_experiment=true
@@ -29,7 +29,7 @@ python train.py $tb \
                 --traversal-set-lr 2e-4 \
                 --warmup-fraction=${warmup_fraction} \
                 --accumulate-grad-steps=${accumulate_grad_steps} \
-                --log-freq=4 \
+                --log-freq=50 \
                 --ckp-freq=1000 \
                 --reset_lr \
                 --reset_weight_decay \

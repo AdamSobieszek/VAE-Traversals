@@ -6,6 +6,15 @@ accumulate_grad_steps=8
 recognizer_type="ResNet"
 z_truncation=0.6
 batch_size=1
+val_batch_size=${batch_size}
+val_freq=100
+val_num_positions=32
+val_seed=12345
+val_dt=""  # Empty uses the timestep-based default.
+val_dt_args=()
+if [ -n "$val_dt" ]; then
+  val_dt_args+=(--val-dt="$val_dt")
+fi
 max_iter=14_000
 tensorboard=true
 new_experiment=true
@@ -35,6 +44,11 @@ python train_StyleGAN.py $tb \
                 --num-traversal-sets=${num_traversal_sets} \
                 --num-traversal-timesteps=${num_traversal_timesteps} \
                 --batch-size=${batch_size} \
+                --val-batch-size=${val_batch_size} \
+                --val-freq=${val_freq} \
+                --val-num-positions=${val_num_positions} \
+                --val-seed=${val_seed} \
+                "${val_dt_args[@]}" \
                 --max-iter=${max_iter} \
                 --recognizer-lr 4e-5 \
                 --traversal-set-lr 2e-4 \

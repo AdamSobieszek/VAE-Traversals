@@ -1,9 +1,12 @@
 import argparse
+from lib.TraversalPDE import add_traversal_arguments, traversal_options
 import torch
 from lib import *
-from models.gan_load import build_biggan, build_proggan, build_stylegan2,build_stylegan2mps, build_sngan
+from models.gan_load import build_biggan, build_proggan, build_stylegan2mps, build_sngan
 from torch import nn
-from lib.aux import choose_device
+from lib.utils import choose_device
+from lib.val_utils import add_validation_arguments
+from lib.recognizer import add_recognizer_arguments, recognizer_options
 
 def main():
     """PotentialFlow -- Training script.
@@ -60,6 +63,7 @@ def main():
                         help="set learning rate for recognizer R optimization")
     parser.add_argument('--recognizer-type', type=str, default='ResNet',
                         help='set recognizer network type')
+    add_recognizer_arguments(parser)
 
     # === Training =================================================================================================== #
     parser.add_argument('--max-iter', type=int, default=100000, help="set maximum number of training iterations")
@@ -74,10 +78,28 @@ def main():
     parser.add_argument('--log-freq', default=10, type=int, help='set number iterations per log')
     parser.add_argument('--ckp-freq', default=1000, type=int, help='set number iterations per checkpoint model saving')
     parser.add_argument('--tensorboard', action='store_true', help="use tensorboard")
+    parser.add_argument(
+        "--mixed-precision",
+        type=str,
+        default="bf16",
+        choices=["no", "bf16"],
+        help="generator and recognizer mixed precision (no or bf16)",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the GAN generator (synthesis only for StyleGAN)",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        type=str,
+        default="default",
+        help="torch.compile mode (default, reduce-overhead, max-autotune)",
+    )
     parser.add_argument('--track-dt-stats', action='store_true',
                         help="cache per-step dt statistics (adds an accelerator synchronization)")
     # === Validation ===================================================================================================== #
-    parser.add_argument('--val-freq', type=int, default=10, help="set number iterations per validation")
+    add_validation_arguments(parser)
     # === Restart ===================================================================================================== #
     parser.add_argument('--new-experiment', action='store_true',default=False, help='set to True to start a new experiment')
     parser.add_argument('--reset_lr', action='store_true', help="reset learning rate")
@@ -87,6 +109,7 @@ def main():
 
 
     # Parse given arguments
+    add_traversal_arguments(parser)
     args = parser.parse_args()
 
     # Create output dir and save current arguments
@@ -115,31 +138,35 @@ def main():
         GAN_WEIGHTS[args.gan_type]['weights'][GAN_RESOLUTIONS[args.gan_type]]))
 
     # === BigGAN ===
+    generator_runtime_options = dict(
+        mixed_precision=args.mixed_precision,
+        compile=args.compile,
+        compile_mode=args.compile_mode,
+    )
     if args.gan_type == 'BigGAN':
         G = build_biggan(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][GAN_RESOLUTIONS[args.gan_type]],
-                         target_classes=args.biggan_target_classes)
+                         target_classes=args.biggan_target_classes,
+                         **generator_runtime_options)
         # print(G.device,G)
         # print(G(torch.randn(1, 512).to(G.device)))
     # === ProgGAN ===
     elif args.gan_type == 'ProgGAN':
-        G = build_proggan(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][GAN_RESOLUTIONS[args.gan_type]])
+        G = build_proggan(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][GAN_RESOLUTIONS[args.gan_type]],
+                          **generator_runtime_options)
     # === StyleGAN ===
     elif args.gan_type == 'StyleGAN2':
-        # TODO: remove this once the StyleGAN2Wrapper is fixed
-        if use_mps:
-            G = build_stylegan2mps(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][args.stylegan2_resolution],
+        G = build_stylegan2mps(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][args.stylegan2_resolution],
                             resolution=args.stylegan2_resolution,
-                            shift_in_w_space=args.shift_in_w_space)
-        else:   
-            G = build_stylegan2(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][args.stylegan2_resolution],
-                            resolution=args.stylegan2_resolution,
-                            shift_in_w_space=args.shift_in_w_space)
+                            shift_in_w_space=args.shift_in_w_space,
+                            use_optimized=args.compile,
+                            **generator_runtime_options)
         if args.stylegan2_resolution == 1024:
             recognizer_pool_size = 4
     # === Spectrally Normalised GAN (SNGAN) ===
     else:
         G = build_sngan(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][GAN_RESOLUTIONS[args.gan_type]],
-                        gan_type=args.gan_type)
+                        gan_type=args.gan_type,
+                        **generator_runtime_options)
 
     # Build Potentials model (legacy: Support Sets) S
     print("#. Build Potentials (Support Sets) S...")
@@ -150,8 +177,8 @@ def main():
     S = TraversalPDE(num_traversal_sets=args.num_traversal_sets,
                     num_traversal_timesteps=args.num_traversal_timesteps,
                     traversal_vectors_dim=G.dim_z,
-                    n_hidden=32,
                     lambdas={'BB': 0.25, 'signed_g2orth': 1.0},
+                    **traversal_options(args),
                     ) 
 
     # Count number of trainable parameters
@@ -164,14 +191,16 @@ def main():
     R = recognizer_cls(recognizer_type=recognizer_backbone,
                        dim_index=S.num_traversal_sets,
                        channels=1 if args.gan_type == 'SNGAN_MNIST' else 3,
-                       pool_size=recognizer_pool_size)
+                       pool_size=args.recognizer_pool_size if args.recognizer_pool_size is not None else recognizer_pool_size,
+                       **recognizer_options(args, args.stylegan2_resolution if args.gan_type == 'StyleGAN2'
+                                            else GAN_RESOLUTIONS[args.gan_type]))
 
     # Count number of trainable parameters
     print("  \\__Trainable parameters: {:,}".format(sum(p.numel() for p in R.parameters() if p.requires_grad)))
 
     # Set up trainer
     print("#. Experiment: {}".format(exp_dir))
-    trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
+    trn = TraversalTrainer(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
 
     # Train
     trn.train(generator=G, traversal_sets=S, recognizer=R)

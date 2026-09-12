@@ -9,7 +9,7 @@
 ##                                                 [ Reconstructor ]                                                  ##
 ##                                                                                                                    ##
 ########################################################################################################################
-RECONSTRUCTOR_TYPES = ('ResNet', 'LeNet', 'AntisymmetricResNet', 'AntisymmetricLeNet')
+RECONSTRUCTOR_TYPES = ('ResNet', 'LeNet', 'AntisymmetricResNet', 'AntisymmetricLeNet', 'CAT')
 
 
 ########################################################################################################################

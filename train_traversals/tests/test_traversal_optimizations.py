@@ -6,9 +6,10 @@ import pytest
 import torch
 from torch import nn
 
-from lib.aux import TrainingStatTracker, sample_z, tb_hists
+from lib.aux import TrainingStatTracker, tb_hists
+from lib.utils import sample_z
 from lib.recognizer import AntisymmetricRecognizer, Recognizer
-from lib.trainer_potential_nue import TrainerPotential
+from lib.trainer import TraversalTrainer
 
 
 pytestmark = pytest.mark.skipif(
@@ -104,6 +105,7 @@ class _FakeTraversal(nn.Module):
         self.scale = nn.Parameter(torch.tensor(0.05))
 
     def forward(self, z, t_index, dt=None, direction=None):
+        self.last_direction = direction
         batch, dim = z.shape
         latent1 = z[:, None].expand(batch, self.k, dim).contiguous() + self.scale
         latent2 = latent1 + 0.1
@@ -134,14 +136,16 @@ class _FakeRecognizer(nn.Module):
         return self.fc(torch.cat((a.flatten(1), b.flatten(1)), dim=1)), None
 
 
-def test_loss_allk_synthesizes_shared_initial_image_once():
+@pytest.mark.parametrize("bidirectional", [False, True])
+def test_loss_allk_synthesizes_shared_initial_image_once(bidirectional):
     batch, k = 2, 4
-    trainer = TrainerPotential.__new__(TrainerPotential)
+    trainer = TraversalTrainer.__new__(TraversalTrainer)
     trainer.params = argparse.Namespace(
         lambda_cls=1.0,
         lambda_pde=1.0,
         detach_img1_for_cls=False,
         mixed_precision="no",
+        bidirectional=bidirectional,
     )
     trainer.device = DEVICE
     trainer.use_cuda = False
@@ -149,6 +153,16 @@ def test_loss_allk_synthesizes_shared_initial_image_once():
     trainer.amp_enabled = False
     trainer.amp_dtype = None
     trainer.cross_entropy = nn.CrossEntropyLoss()
+    trainer.K = k
+    raw_logits = []
+    pair_logits = trainer._pair_logits
+
+    def record_logits(*args):
+        result = pair_logits(*args)
+        raw_logits.append(result.detach())
+        return result
+
+    trainer._pair_logits = record_logits
 
     traversal = _FakeTraversal(k).to(DEVICE)
     generator = _FakeGenerator().to(DEVICE)
@@ -165,3 +179,10 @@ def test_loss_allk_synthesizes_shared_initial_image_once():
     assert logits.shape == logits0.shape == (batch * k, k)
     assert targets.tolist() == list(range(k)) * batch
     assert traversal.scale.grad is not None
+    sign = traversal.last_direction
+    if bidirectional:
+        assert sign.shape == (batch, k, 1)
+        assert torch.all((sign == 1) | (sign == -1))
+        sign = sign.flatten(0, 1)
+    torch.testing.assert_close(logits0, raw_logits[0] * sign)
+    torch.testing.assert_close(logits, raw_logits[1] * sign)

@@ -335,7 +335,9 @@ class SignedGradGroupSecondMomentOrtho(PDELoss):
         normalize = bool(self.ctx.get("normalize", True))
         eps = float(self.ctx.get("eps", st.cfg.get("eps_norm2", 1e-8)))
 
-        g = st.f_grad(when)
+        # Compare canonical semantic orientations, not randomly sampled time
+        # directions (otherwise identical heads evade the positive Gram penalty).
+        g = st.f_grad(when) * st.cfg.get("semantic_direction", 1)
 
         if normalize:
             g = g / (g.pow(2).sum(dim=-1, keepdim=True).add(eps).sqrt())

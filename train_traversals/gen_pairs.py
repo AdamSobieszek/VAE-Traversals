@@ -26,7 +26,7 @@ from models.gan_load import (
     build_stylegan2_early_output,
     build_stylegan2mps,
 )
-from lib.aux import (choose_device, sample_z)
+from lib.utils import choose_device, sample_z
 # ------------------
 # Helpers
 # ------------------
@@ -222,10 +222,12 @@ if __name__ == '__main__':
         if "support_" in k:
             a.__dict__[k.replace("support_", "traversal_")] = a.__dict__[k]
     # Instantiate TraversalPDE with D = G.dim_z (same as train.py), then load weights
+    from lib.TraversalPDE import traversal_options
     S = TraversalPDE(
         num_traversal_sets=a.__dict__['num_traversal_sets'],
         num_traversal_timesteps=a.__dict__['num_traversal_timesteps'],
         traversal_vectors_dim=G.dim_z,
+        **traversal_options(a),
     ).to(device).eval()
     robust_load_waves(S, ckpt)
 

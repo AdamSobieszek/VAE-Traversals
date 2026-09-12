@@ -1,3 +1,4 @@
+from lib.val_utils import add_validation_arguments
 import argparse
 import os 
 
@@ -13,7 +14,8 @@ from models.gan_load import (
     build_stylegan2mps,
 )
 from torch import nn
-from lib.aux import choose_device
+from lib.utils import choose_device
+from lib.recognizer import add_recognizer_arguments, recognizer_options
 
 
 
@@ -80,6 +82,7 @@ def main():
                         help="set learning rate for recognizer R optimization")
     parser.add_argument('--recognizer-type', type=str, default='ResNet',
                         help='set recognizer network type')
+    add_recognizer_arguments(parser)
 
     # === Training =================================================================================================== #
     parser.add_argument('--max-iter', type=int, default=100000, help="set maximum number of training iterations")
@@ -117,7 +120,7 @@ def main():
         help="compile stock synthesis for the original generator (early output always uses its optimized path)",
     )
     # === Validation ===================================================================================================== #
-    parser.add_argument('--val-freq', type=int, default=10, help="set number iterations per validation")
+    add_validation_arguments(parser)
     # === Restart ===================================================================================================== #
     parser.add_argument('--new-experiment', action='store_true',default=False, help='set to True to start a new experiment')
     parser.add_argument('--reset_lr', action='store_true', help="reset learning rate")
@@ -180,39 +183,34 @@ def main():
         G = build_proggan(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][GAN_RESOLUTIONS[args.gan_type]])
     # === StyleGAN ===
     elif args.gan_type == 'StyleGAN2':
-        # TODO: remove this once the StyleGAN2Wrapper is fixed
-        if use_mps:
-            stylegan_builder_kwargs = dict(
-                pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][stylegan2_weight_key],
-                shift_in_w_space=args.shift_in_w_space,
-                compile=args.compile,
-                compile_mode=args.compile_mode,
-                use_optimized=args.compile and (
-                    args.early_output or not args.no_optimized_synthesis
-                ),
-                mixed_precision=args.mixed_precision,
+        stylegan_builder_kwargs = dict(
+            pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][stylegan2_weight_key],
+            shift_in_w_space=args.shift_in_w_space,
+            compile=args.compile,
+            compile_mode=args.compile_mode,
+            use_optimized=args.compile and (
+                args.early_output or not args.no_optimized_synthesis
+            ),
+            mixed_precision=args.mixed_precision,
+        )
+        if args.early_output:
+            G = build_stylegan2_early_output(**stylegan_builder_kwargs)
+        else:
+            G = build_stylegan2mps(
+                resolution=args.stylegan2_resolution,
+                **stylegan_builder_kwargs,
             )
-            if args.early_output:
-                G = build_stylegan2_early_output(**stylegan_builder_kwargs)
-            else:
-                G = build_stylegan2mps(
-                    resolution=args.stylegan2_resolution,
-                    **stylegan_builder_kwargs,
-                )
-            block_dtype = "bf16" if args.compile and args.mixed_precision == "bf16" else "fp16"
-            print("  \\__Precision : recognizer {} / StyleGAN high-res {}".format(
-                args.mixed_precision, block_dtype if args.compile else "fp16 (native)",
-            ))
-            print("  \\__Compile   : {} ({})".format(
-                args.compile,
-                "optimized polyphase"
-                if args.compile and (args.early_output or not args.no_optimized_synthesis)
-                else args.compile_mode,
-            ))
-        else:   
-            G = build_stylegan2(pretrained_gan_weights=GAN_WEIGHTS[args.gan_type]['weights'][args.stylegan2_resolution],
-                            resolution=args.stylegan2_resolution,
-                            shift_in_w_space=args.shift_in_w_space)
+        block_dtype = "bf16" if args.compile and args.mixed_precision == "bf16" else "fp16"
+        print("  \\__Precision : recognizer {} / StyleGAN high-res {}".format(
+            args.mixed_precision, block_dtype if args.compile else "fp16 (native)",
+        ))
+        print("  \\__Compile   : {} ({})".format(
+            args.compile,
+            "optimized polyphase"
+            if args.compile and (args.early_output or not args.no_optimized_synthesis)
+            else args.compile_mode,
+        ))
+
         if args.stylegan2_resolution == 1024 and not args.early_output:
             recognizer_pool_size = 2
     # === Spectrally Normalised GAN (SNGAN) ===
@@ -240,14 +238,17 @@ def main():
     R = Recognizer(recognizer_type=args.recognizer_type,
                       dim_index=S.num_traversal_sets,
                       channels=1 if args.gan_type == 'SNGAN_MNIST' else 3,
-                      pool_size=recognizer_pool_size)
+                      pool_size=args.recognizer_pool_size if args.recognizer_pool_size is not None else recognizer_pool_size,
+                      **recognizer_options(args, (args.early_output_resolution if args.early_output
+                                                 else args.stylegan2_resolution) if args.gan_type == 'StyleGAN2'
+                                           else GAN_RESOLUTIONS[args.gan_type]))
 
     # Count number of trainable parameters
     print("  \\__Trainable parameters: {:,}".format(sum(p.numel() for p in R.parameters() if p.requires_grad)))
 
     # Set up trainer
     print("#. Experiment: {}".format(exp_dir))
-    trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
+    trn = TraversalTrainer(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
 
     # Train
     trn.train(generator=G, traversal_sets=S, recognizer=R)

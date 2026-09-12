@@ -9,3 +9,5 @@ scikit-image
 omegaconf
 ninja
 lpips
+timm
+einops

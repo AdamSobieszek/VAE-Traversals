@@ -22,9 +22,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from lib.TraversalPDE import StackedLinear, TraversalPDE
-from lib.aux import sample_z
+from lib.utils import sample_z
 from lib.recognizer import AntisymmetricRecognizer, Recognizer
-from lib.trainer_potential_nue import TrainerPotential
+from lib.trainer import TraversalTrainer
 from models.gan_load import build_sngan
 
 
@@ -50,8 +50,8 @@ def timed(name, fn, *, warmup=1, repeats=3):
     print(f"{name:36s} median={statistics.median(samples):9.2f} ms  samples={samples}")
 
 
-def make_trainer(k: int) -> TrainerPotential:
-    trainer = TrainerPotential.__new__(TrainerPotential)
+def make_trainer(k: int) -> TraversalTrainer:
+    trainer = TraversalTrainer.__new__(TraversalTrainer)
     trainer.params = argparse.Namespace(
         lambda_cls=1.0,
         lambda_pde=1.0,

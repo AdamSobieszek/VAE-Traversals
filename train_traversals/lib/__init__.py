@@ -1,4 +1,5 @@
-from .aux import create_exp_dir, update_stdout, update_progress, sample_z, create_summarizing_gif
+from .aux import create_exp_dir, update_stdout, update_progress, create_summarizing_gif
+from .utils import sample_z
 from .config import GAN_RESOLUTIONS, GAN_WEIGHTS, RECONSTRUCTOR_TYPES, BIGGAN_CLASSES, SFD, ARCFACE, FAIRFACE, AUDET, \
     HOPENET, CELEBA_ATTRIBUTES, \
     SNGAN_MNIST_LeNet_K64_D128_LearnGammas_eps0d15_0d25, \
@@ -6,8 +7,8 @@ from .config import GAN_RESOLUTIONS, GAN_WEIGHTS, RECONSTRUCTOR_TYPES, BIGGAN_CL
     BigGAN_239_ResNet_K120_D256_LearnGammas_eps0d15_0d25, ProgGAN_ResNet_K200_D512_LearnGammas_eps0d1_0d2, \
     StyleGAN2_1024_W_ResNet_K200_D512_LearnGammas_eps0d1_0d2
 from .TraversalPDE import TraversalPDE
-from .recognizer import AntisymmetricRecognizer, Recognizer
-from .trainer_potential_nue import TrainerPotential
+from .recognizer import Recognizer
+from .trainer import TraversalTrainer
 from .aux import PathImages
 from .evaluation.archface.arcface import IDComparator
 from .evaluation.hopenet.hopenet import Hopenet

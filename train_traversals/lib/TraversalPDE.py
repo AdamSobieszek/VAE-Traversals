@@ -4,12 +4,12 @@ from typing import Callable, Dict, List, Optional
 import torch
 from torch import nn
 
-from lib.pde_ops import PDEState
+from lib.pde_ops import PDEState, broadcast_bk
 from lib.pde_losses import build_losses
 
 
 @torch.no_grad()
-def gaussian_cone_noise(delta: torch.Tensor, aperture: float = 0.2,
+def cone_noise(delta: torch.Tensor, aperture: float = 0.2,
                         gaussian: torch.Tensor = None) -> torch.Tensor:
     """Sample the transverse part of a fixed-angle Gaussian-cone step.
 
@@ -26,6 +26,16 @@ def gaussian_cone_noise(delta: torch.Tensor, aperture: float = 0.2,
     projection = (noise * delta).sum(-1, keepdim=True) / radius2.clamp_min(1e-12)
     noise.addcmul_(delta, projection, value=-1)
     return noise.mul_(radius2.sqrt().mul_(aperture) / noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12))
+
+@torch.no_grad()
+def gaussian_cone_noise(delta: torch.Tensor, aperture: float = 0.5,
+                        gaussian: torch.Tensor = None) -> torch.Tensor:
+    """Sample the transverse part of a fixed-angle Gaussian-cone step.
+    """
+    dim_correction = 1/delta.shape[-1]**0.5
+    noise = torch.randn_like(delta) if gaussian is None else gaussian.clone()
+    radius2 = delta.norm(dim=-1, keepdim=True)
+    return noise.mul_(radius2.mul_(aperture * dim_correction))
 
 
 # ================================================================
@@ -150,7 +160,7 @@ class StackedSemanticPotential(nn.Module):
             return value, torch.autograd.grad(value.sum(), x, create_graph=True)[0]
         return self._evaluate(x, input_gradient=True)
 
-    def _evaluate(self, x, input_gradient=False):
+    def _evaluate(self, x, input_gradient=False, update_stats=True):
         # Stacked MLP body
         h1 = self.fc1(x)
         h = self.act1(h1) + h1
@@ -165,7 +175,7 @@ class StackedSemanticPotential(nn.Module):
         out = out_mlp + out_dir                # [B, K, n_out]
 
         # EMA mean update over batch (per k, per output channel)
-        if self.training and self.update_batchnorm:
+        if update_stats and self.training and self.update_batchnorm:
             with torch.no_grad():
                 batch_mean = out.mean(dim=0)   # [K, n_out]
                 self.running_mean.lerp_(batch_mean, 0.1)
@@ -187,6 +197,125 @@ class StackedSemanticPotential(nn.Module):
         adjoint = adjoint * (1 + slope(self.act1, h1))
         gradient = torch.einsum("bko,koi->bki", adjoint, self.fc1.weight)
         return value, gradient + self.dir_linear.weight[:, 0]
+
+
+def _base_velocity(potential, x, eps):
+    _, g = potential._evaluate(x, input_gradient=True, update_stats=False)
+    return g / (g.square().sum(-1, keepdim=True) + eps)
+
+
+def _fixed_point(function, initial, max_iter, atol, rtol, label):
+    """Check the equation residual, never silently accept an unsolved step."""
+    current = initial
+    for _ in range(max_iter):
+        updated = function(current)
+        error = (updated - current).abs().amax(dim=-1)
+        scale = current.abs().amax(dim=-1)
+        if bool(torch.all(error <= atol + rtol * scale)):
+            return current
+        current = updated
+    raise RuntimeError(
+        f"{label} did not converge in {max_iter} iterations. "
+        "Reduce dt or use potential_jet; increasing max_iter only helps a contracting solve."
+    )
+
+
+class _ImplicitMidpoint(torch.autograd.Function):
+    """Solve m=x+a*v(m), retaining one potential graph, not solver history.
+
+    Backward solves (I-a*J_v)^T lambda = upstream. The explicit potential
+    gradient below means training needs only this first derivative of m.
+    Higher-order differentiation THROUGH this custom backward is unsupported.
+    """
+    @staticmethod
+    def forward(ctx, x, a, potential, eps, max_iter, atol, rtol, *parameters):
+        m = _fixed_point(lambda m: x + a * _base_velocity(potential, m, eps),
+                         x, max_iter, atol, rtol, "Midpoint forward solve")
+        ctx.potential, ctx.eps = potential, eps
+        ctx.settings = max_iter, atol, rtol
+        ctx.save_for_backward(m, a, *parameters)
+        return m.clone()
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, upstream):
+        midpoint, a, *parameters = ctx.saved_tensors
+        with torch.enable_grad():
+            m = midpoint.detach().requires_grad_(True)
+            v = _base_velocity(ctx.potential, m, ctx.eps)
+
+            def adjoint(lam):
+                jtv = torch.autograd.grad(v, m, a * lam, retain_graph=True)[0]
+                return upstream + jtv
+
+            lam = _fixed_point(adjoint, upstream, *ctx.settings, "Midpoint backward solve")
+            parameter_grads = (torch.autograd.grad(v, parameters, a * lam, allow_unused=True)
+                               if parameters else ())
+        grad_a = (lam * v.detach()).sum(-1, keepdim=True)
+        return (lam, grad_a, None, None, None, None, None, *parameter_grads)
+
+
+class DirectionalSemanticPotential:
+    """Parameter-free directional view of one shared scalar network.
+
+    midpoint: m=x+s*h/2*I_eps(grad F(m)); grad F_s(x)=s*grad F(m).
+    potential_jet: F_s(x)=s*F(x)+h/4*log(||grad F(x)||²+eps).
+    See docs/bidirectional_traversals.md for the generating-potential proof.
+    """
+    prefer_explicit_values = True
+
+    def __init__(self, base, direction, dt, architecture, eps, solver_settings):
+        self.base, self.direction, self.dt = base, direction, dt
+        self.architecture, self.eps = architecture, eps
+        self.solver_settings = solver_settings
+
+    def __call__(self, x):
+        return self.value_and_grad(x)[0]
+
+    def value_and_grad(self, x):
+        s, h = self.direction, self.dt
+        if self.architecture == "midpoint":
+            parameters = tuple(p for p in self.base.parameters() if p.requires_grad)
+            m = _ImplicitMidpoint.apply(x, s * h / 2, self.base, self.eps,
+                                        *self.solver_settings, *parameters)
+            value, g = self.base._evaluate(m, input_gradient=True)
+            q = g.square().sum(-1, keepdim=True)
+            # The rational term is constant only when eps=0. Keeping it
+            # makes the scalar identity exact for our regularized inversion.
+            value = s * value + h / 4 * (q + self.eps).log() - h / 2 * q / (q + self.eps)
+            return value, s * g
+
+        # One scalar correction, no directional heads or detached gates.
+        # Differentiating log(q) is a Hessian-vector product, not a Hessian.
+        with torch.enable_grad():
+            x = x.requires_grad_(True)
+            value, g = self.base._evaluate(x, input_gradient=True)
+            log_q = (g.square().sum(-1, keepdim=True) + self.eps).log()
+            correction = torch.autograd.grad(log_q.sum(), x, create_graph=True)[0]
+            return s * value + h / 4 * log_q, s * g + h / 4 * correction
+
+
+def add_traversal_arguments(parser):
+    parser.add_argument("--potential-hidden", type=int, default=32,
+                        help="potential hidden width, saved for checkpoint reconstruction")
+    parser.add_argument("--traversal-architecture", choices=("euler", "potential_jet", "midpoint"),
+                        default="euler", help="shared directional potential / step architecture")
+    parser.add_argument("--bidirectional", action="store_true", help="sample a sign per sample and traversal")
+    parser.add_argument("--midpoint-max-iter", type=int, default=80)
+    parser.add_argument("--midpoint-atol", type=float, default=1e-6)
+    parser.add_argument("--midpoint-rtol", type=float, default=1e-6)
+    parser.add_argument("--traversal-noise", type=float, default=0.5,
+                        help="training Gaussian aperture; 0 for deterministic reversal")
+
+
+def traversal_options(args):
+    """Shared by training and checkpoint reconstruction; old args use Euler."""
+    return dict(n_hidden=getattr(args, "potential_hidden", 128),
+                architecture=getattr(args, "traversal_architecture", "euler"),
+                midpoint_max_iter=getattr(args, "midpoint_max_iter", 80),
+                midpoint_atol=getattr(args, "midpoint_atol", 1e-6),
+                midpoint_rtol=getattr(args, "midpoint_rtol", 1e-6),
+                noise_aperture=getattr(args, "traversal_noise", 0.5))
 
 
 class TraversalPDE(nn.Module):
@@ -211,10 +340,34 @@ class TraversalPDE(nn.Module):
         seed: Optional[int] = None,
         # optional: prior score function for DivPrior/Poisson (defaults to Gaussian score -x)
         prior_score: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        architecture: str = "euler",
+        midpoint_max_iter: int = 80,
+        midpoint_atol: float = 1e-6,
+        midpoint_rtol: float = 1e-6,
+        noise_aperture: float = 0.5,
     ):
         super().__init__()
         if lambdas is None:
             lambdas = {}
+
+        if architecture not in ("euler", "potential_jet", "midpoint"):
+            raise ValueError(f"Unknown traversal architecture: {architecture}")
+        if architecture != "euler" and type(final_activation) is not nn.Identity:
+            raise ValueError("Directional architectures require the standard scalar Softplus/Identity potential")
+        if midpoint_max_iter < 1 or midpoint_atol <= 0 or midpoint_rtol < 0 or noise_aperture < 0:
+            raise ValueError("Invalid midpoint solver settings or noise aperture")
+        if eps_norm2 < 0:
+            raise ValueError("eps_norm2 must be nonnegative")
+        if architecture == "midpoint":
+            # These losses use only explicit first input gradients. Other
+            # PINNs may differentiate through the implicit backward twice.
+            supported = {"bb", "g2orth", "signed_g2orth", "epsilon"}
+            unsupported = [key for key, weight in lambdas.items() if weight and key.lower() not in supported]
+            if unsupported:
+                raise ValueError(f"midpoint supports BB/g2orth/signed_g2orth losses; got {unsupported}")
+        self.architecture = architecture
+        self.midpoint_settings = (int(midpoint_max_iter), float(midpoint_atol), float(midpoint_rtol))
+        self.noise_aperture = float(noise_aperture)
 
         self.num_traversal_sets = int(num_traversal_sets)
         self.num_traversal_timesteps = int(num_traversal_timesteps)
@@ -266,12 +419,26 @@ class TraversalPDE(nn.Module):
         *,
         compute_losses: bool = True,
     ):
+        sign = broadcast_bk(direction, z_bkd, "direction")
+        if not bool(torch.all((sign == 1) | (sign == -1))):
+            raise ValueError("direction must contain only -1 or +1")
+        step = broadcast_bk(dt, z_bkd, "dt")
+        if not bool(torch.isfinite(step).all()):
+            raise ValueError("dt must be finite")
+        # Preserve signed-dt inference used by existing visualizers.
+        sign = sign * torch.where(step < 0, -1.0, 1.0)
+        step = step.abs()
+        potential = self.F
+        if self.architecture != "euler":
+            potential = DirectionalSemanticPotential(self.F, sign, step, self.architecture,
+                                                     self._pde_cfg["eps_norm2"], self.midpoint_settings)
         st = PDEState(
-            f=self.F,
+            f=potential,
             z=z_bkd,
-            direction=1,
+            direction=sign if self.architecture == "euler" else 1,
             need_next=self._needs_next,
-            dt_value=dt,
+            dt_value=step,
+            semantic_direction=sign if self.architecture != "euler" else 1,
             **self._pde_cfg,
         )
 
@@ -282,9 +449,11 @@ class TraversalPDE(nn.Module):
         x_next = st.x_next()
 
         # optional small step noise
-        if self.training:
-            x_next = x_next + gaussian_cone_noise(x_next.detach() - st.x().detach())
-        return st, x_next, L_sum, st.dt()
+        if self.training and self.noise_aperture:
+            x_next = x_next + gaussian_cone_noise(x_next.detach() - st.x().detach(), self.noise_aperture)
+        # Do not feed the signed state timestep back into the next rollout
+        # iteration: direction remains fixed for the whole trajectory.
+        return st, x_next, L_sum, dt
 
     # ---- unrolled training ----
     def forward(

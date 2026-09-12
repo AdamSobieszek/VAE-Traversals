@@ -53,11 +53,11 @@ def main():
     torch.set_default_device('mps')
     torch.manual_seed(71)
     from lib.TraversalPDE import TraversalPDE, gaussian_cone_noise
-    from lib.trainer_potential_nue import TrainerPotential
+    from lib.trainer import TraversalTrainer
     from lib.recognizer import Recognizer
     from models.gan_load import build_sngan
     old_pde = load_old(args.baseline, 'TraversalPDE')
-    old_trainer = load_old(args.baseline, 'trainer_potential_nue').TrainerPotential
+    old_trainer = load_old(args.baseline, 'trainer').TraversalTrainer
     cfg = dict(num_traversal_sets=32, num_traversal_timesteps=20, traversal_vectors_dim=128,
                n_hidden=32, lambdas={'BB': .25, 'signed_g2orth': 1.})
     before, after = old_pde.TraversalPDE(**cfg), TraversalPDE(**cfg)
@@ -126,7 +126,7 @@ def main():
         obj.use_cuda = obj.amp_enabled = False
         obj.cross_entropy = torch.nn.CrossEntropyLoss()
         return obj
-    old, new = trainer(old_trainer), trainer(TrainerPotential)
+    old, new = trainer(old_trainer), trainer(TraversalTrainer)
     def run(tr, model):
         recognizer.zero_grad(set_to_none=True)
         model.zero_grad(set_to_none=True)

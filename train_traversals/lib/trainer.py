@@ -1,4 +1,4 @@
-# trainer_potential.py
+# trainer.py
 import os
 import os.path as osp
 import sys
@@ -14,17 +14,16 @@ from typing import Optional
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
-from .recognizer import Recognizer, AntisymmetricRecognizer
-from .generator_vjp import FrozenGeneratorVJP
-
 from .aux import (
-    sample_z, TrainingStatTracker, update_progress, update_stdout, sec2dhms,
-    CosineScheduleWithWarmup, build_adamw, ImageLogger,
-    _per_k_grad_norms,
-    tb_start, dual_batch_acc_from_logits,
+    TrainingStatTracker, update_progress, update_stdout, sec2dhms, ImageLogger,
+    _per_k_grad_norms, tb_start, twostep_batch_acc_from_logits,
     entropy_from_logits, collect_wave_stats,
-    tb_scalars, tb_grad_norms, tb_hists, tb_figs, tb_images, clip_accum_grads_,
+    tb_scalars, tb_grad_norms, tb_hists, tb_figs, tb_images,
+    tb_information_matrix_figs, tb_pairwise_distance_figs,
 )
+from .utils import sample_z, CosineScheduleWithWarmup, build_adamw, clip_accum_grads_, FrozenGeneratorVJP
+
+from .val_utils import TraversalValidation
 
 DTYPE = torch.float32
 
@@ -37,7 +36,7 @@ class DataParallelPassthrough(nn.DataParallel):
             return getattr(self.module, name)
 
 
-class TrainerPotential(object):
+class TraversalTrainer(object):
     def __init__(self, params=None, exp_dir=None, device=torch.device("cuda"), multi_gpu=False):
         if params is None:
             raise ValueError(f"Cannot build a Trainer instance with empty params: params={params}")
@@ -103,7 +102,7 @@ class TrainerPotential(object):
             json.dump(self.stat_tracker.stats_by_step, out)
 
     def log_progress(self, step_idx, mean_step_time, elapsed_time, eta):
-        if step_idx > 1:
+        if step_idx > 0:
             update_stdout(12)
         stats = self.stat_tracker.stats_by_step.get(int(step_idx), {})
         total_opt_steps = math.ceil(self.params.max_iter / max(1, int(getattr(self.params, "accumulate_grad_steps", 1))))
@@ -120,9 +119,7 @@ class TrainerPotential(object):
         print("   \\__Step 1 accuracy           : {:.03f}".format(stats.get("step1_accuracy", 0.0)))
         print("   \\__Step 2 accuracy           : {:.03f}".format(stats.get("step2_accuracy", 0.0)))
         print("   \\__Classification loss       : {:.08f}".format(stats.get("classification_loss", 0.0)))
-        print("   \\__Wave loss (PDE-JVP combo) : {:.08f}".format(
-            stats.get("wave_loss", stats.get("pde_loss", 0.0))
-        ))
+        print("   \\__PDE loss                  : {:.08f}".format(stats.get("pde_loss", 0.0)))
         print("   \\__Total loss                : {:.08f}".format(stats.get("total_loss", 0.0)))
         print("      ==============================================================")
         print("   \\__Opt-step time  : {:.3f} sec".format(mean_step_time))
@@ -153,7 +150,7 @@ class TrainerPotential(object):
 
     @torch.no_grad()
     def sample_dt(self, B: int, half_range: int, total_opt_steps: int) -> torch.Tensor:
-        from .aux import sample_dt as sample_dt_util
+        from .utils import sample_dt as sample_dt_util
         return sample_dt_util(self, B, half_range, total_opt_steps, dtype=DTYPE)
 
     @torch.no_grad()
@@ -232,8 +229,8 @@ class TrainerPotential(object):
 
     # ------------------------ optim/sched ------------------------
     def init_optimizers(self, traversal_sets, recognizer, acc_steps: int):
-        traversal_set_wd = float(getattr(self.params, "traversal_set_wd", 0.01))
-        recognizer_wd = float(getattr(self.params, "recognizer_wd", 0.01))
+        traversal_set_wd = float(getattr(self.params, "traversal_set_wd", 0.001))
+        recognizer_wd = float(getattr(self.params, "recognizer_wd", 0.1))
         betas = tuple(getattr(self.params, "adam_betas", (0.9, 0.999)))
         eps = float(getattr(self.params, "adam_eps", 1e-8))
 
@@ -329,21 +326,10 @@ class TrainerPotential(object):
         with self.gan_recognizer_context():
             return generator(latents)
 
-    def _pair_logits(self, recognizer, center, endpoint):
+    def _pair_logits(self, recognizer, img0, img1):
         """Whiten once; shared centers broadcast over the traversal axis."""
-        if center.shape[0] != endpoint.shape[0]:
-            pairs = endpoint.unflatten(0, (center.shape[0], -1))
-            reflected = (2 * center[:, None] - pairs).flatten(0, 1)
-        else:
-            reflected = 2 * center - endpoint
         with self.gan_recognizer_context():
-            # Invoke DataParallel.forward, not a bound method of its module.
-            if isinstance(recognizer, nn.DataParallel):
-                if isinstance(recognizer.module, (Recognizer, AntisymmetricRecognizer)):
-                    return recognizer(reflected, endpoint, antisymmetric=True)[0]
-            elif hasattr(recognizer, "antisymmetric_pair_logits"):
-                return recognizer.antisymmetric_pair_logits(reflected, endpoint)
-            return recognizer(reflected, endpoint)[0] - recognizer(endpoint, reflected)[0]
+            return recognizer.whitened_antisymmetric_logits(img0, img1)
 
     def _endpoint_image(self, generator, latents):
         chunk = int(getattr(self.params, "generator_recompute_chunk", 0))
@@ -381,10 +367,16 @@ class TrainerPotential(object):
         R's BatchNorm sees the same batches, in the same order, as before.
         """
         denominator = max(1, int(acc_denominator))
-        cls_scale = float(self.params.lambda_cls) / denominator
+        cls_loss_scale = float(self.params.lambda_cls) / denominator
+        direction = 1.0
+        if getattr(self.params, "bidirectional", False):
+            # One sign per path, retained through its entire rollout. x0
+            # remains shared by all K heads; synthesis batch sizes are unchanged.
+            direction = torch.randint(0, 2, (z.shape[0], self.K, 1), device=z.device).to(z.dtype) * 2 - 1
         with self.fp32_context():
-            potentials, latent1, latent2, pde, _ = traversal_sets(z, t_index, dt=dt, direction=dt)
+            potentials, latent1, latent2, pde, _ = traversal_sets(z, t_index, dt=dt, direction=direction)
         B, K, D = latent1.shape
+        logit_direction = direction.flatten(0, 1) if isinstance(direction, torch.Tensor) else direction
         targets = torch.arange(K, device=z.device).repeat(B)
         shared = getattr(self._generator_module(generator), "share_initial_output", False)
         z0 = z if shared else z[:, None].expand(B, K, D).reshape(B * K, D)
@@ -392,26 +384,28 @@ class TrainerPotential(object):
             img0 = self._synthesize(generator, z0)
             img1 = self._synthesize(generator, latent1.flatten(0, 1))
 
-        # DO_ANTISYMMETRIC_LOSS = True # TODO: Replace with global flag
-        logits0 = self._pair_logits(recognizer, img0, img1)
-        # if t_index == 0, then img0==img1, so we mask-out the loss from this invalid classification case
-        mask = (t_index.reshape(B, 1) != 0).expand(B, K).reshape(-1)
+        logits0 = self._pair_logits(recognizer, img0, img1) * logit_direction
+        # if t_index == 0, then img0==img1, so we mask-out the loss entry of this invalid classification case
+        mask0 = (t_index.reshape(B, 1) != 0).expand(B, K).reshape(-1)
         loss0 = nn.functional.cross_entropy(logits0.float(), targets, reduction="none")
-        loss0 = (loss0 * mask).sum() / mask.sum().clamp_min(1)
-        if cls_scale:
-            (cls_scale * loss0).backward()
+        loss0 = (loss0 * mask0).sum() / (B * K)
+        if cls_loss_scale:
+            (cls_loss_scale * loss0).backward()
         logits0, loss0 = logits0.detach(), loss0.detach()
         del img0
 
         bridge = latent2.detach().flatten(0, 1).requires_grad_(True)
         img2 = self._endpoint_image(generator, bridge)
-        logits = self._pair_logits(recognizer, img1, img2)
-        cls = self.cross_entropy(logits.float(), targets)
-        if cls_scale:
-            (cls_scale * cls).backward()
+        logits1 = self._pair_logits(recognizer, img1, img2) * logit_direction
+        # if t_index == 0, we count the loss1 entry double
+        mask1 = torch.ones_like(mask0) + (t_index.reshape(B, 1) == 0).expand(B, K).reshape(-1)
+        loss1 = nn.functional.cross_entropy(logits1.float(), targets, reduction="none")
+        loss1 = (loss1 * mask1).sum() / (B * K)
+        if cls_loss_scale:
+            (cls_loss_scale * loss1).backward()
             if bridge.grad is None:
                 raise RuntimeError("Generator+Recognizer loss did not produce a latent gradient.")
-        bridge_grad = bridge.grad if cls_scale else torch.zeros_like(bridge)
+        bridge_grad = bridge.grad if cls_loss_scale else torch.zeros_like(bridge)
 
         outputs = [(latent2, bridge_grad.reshape_as(latent2)),
                    (pde, torch.full_like(pde, float(self.params.lambda_pde) / denominator))]
@@ -423,10 +417,12 @@ class TrainerPotential(object):
         base = self._generator_module(generator)
         metric_grad = (bridge_grad.reshape(-1, base.latent_channels, base.latent_size, base.latent_size)
                        if getattr(base, "uses_vae_latent_shape", False) else bridge_grad)
-        metrics = self._loss_metrics(cls + loss0, pde, logits, z, latent1, latent2,
-                                     metric_grad, denominator)
-        images = [img.detach().unflatten(0, (B, K)) if need_images else None for img in (img1, img2)]
-        return metrics, logits.detach(), logits0, targets, potentials.detach(), *images, latent2.detach()
+        with torch.no_grad():
+            logits0[~mask0] = logits1[~mask0]
+            metrics = self._loss_metrics(loss0 + loss1, pde, logits1, z, latent1, latent2,
+                                        metric_grad, denominator)
+            images = [img.detach().unflatten(0, (B, K)) if need_images else None for img in (img1, img2)]
+        return metrics, logits1, logits0, targets, potentials.detach(), *images, latent2.detach()
 
     # ------------------------ train ------------------------
     def train(self, generator, traversal_sets, recognizer):
@@ -434,6 +430,7 @@ class TrainerPotential(object):
         enable_analytics = bool(getattr(self.params, "enable_analytics", True))
         enable_histograms = bool(getattr(self.params, "enable_histograms", False))
         enable_figures = bool(getattr(self.params, "enable_figures", True))
+        enable_advanced_figures = bool(getattr(self.params, "enable_advanced_figures", False))
         enable_images = bool(getattr(self.params, "enable_images", True))
         save_checkpoints = bool(getattr(self.params, "save_checkpoints", True))
 
@@ -476,6 +473,7 @@ class TrainerPotential(object):
          sched_support, sched_recon) = self.init_optimizers(traversal_sets, recognizer, acc_steps)
 
         self._maybe_init_image_logger(recognizer)
+        validation = TraversalValidation(self, generator)
 
         t0 = time.time()
 
@@ -503,6 +501,7 @@ class TrainerPotential(object):
             do_hists = do_log and enable_histograms and do_freq and is_boundary
             do_figs = do_log and enable_figures and do_freq and is_boundary
             do_gradnorm = do_freq and enable_analytics and is_boundary
+            do_val = is_boundary and validation.frequency > 0 and (step_idx + 1) % validation.frequency == 0
 
             B = int(self.params.batch_size)
             z = sample_z(B, generator, self.params, self.device)
@@ -510,7 +509,7 @@ class TrainerPotential(object):
             dt = self.sample_dt(B, half_range, total_opt_steps) 
             t_idx = self.sample_t_idx(B, target_step)
 
-            loss_dict, logits_det, logits0_det, targets, potential_preds_det, img1_bk, img2_bk, latent2_bk_det = self.loss_allK(
+            loss_dict, logits1_det, logits0_det, targets, potential_preds_det, img1_bk, img2_bk, latent2_bk_det = self.loss_allK(
                 traversal_sets, generator, recognizer,
                 z, t_idx, dt,
                 acc_denominator=acc_steps,
@@ -519,8 +518,8 @@ class TrainerPotential(object):
 
             # ===== analytics & stats (micro) =====
             with torch.no_grad():
-                batch_acc, step1_acc, step2_acc, preds_2d = dual_batch_acc_from_logits(
-                    logits0_det, logits_det, B, self.K, self.device
+                batch_acc, step1_acc, step2_acc, preds_2d = twostep_batch_acc_from_logits(
+                    logits0_det, logits1_det, B, self.K, self.device
                 )
 
                 wave_stats = {}
@@ -581,7 +580,7 @@ class TrainerPotential(object):
                     if do_hists:
                         tb_hists(
                             self.tb_writer, step_idx,
-                            logits_det=logits_det,
+                            logits_det=logits1_det,
                             potential_preds_det=potential_preds_det,
                             K=int(self.K),
                             log_potential=True,
@@ -598,7 +597,7 @@ class TrainerPotential(object):
                     if do_figs and enable_analytics:
                         tb_figs(self.tb_writer, step_idx, self.stat_tracker, int(self.K), int(self.params.log_freq))
                                 # ===== optional figures (latent-path projections etc.) =====
-                    if do_figs:
+                    if do_figs and enable_advanced_figures:
                         save_frames = bool(getattr(self.params, "save_plot_frames", True))
                         frames_dir = osp.join(self.wip_dir, "plot_frames") if save_frames else None
                         # tb_figs(self.tb_writer, step_idx, self.stat_tracker, K=int(self.K), log_freq=int(self.params.log_freq))
@@ -606,37 +605,42 @@ class TrainerPotential(object):
                         # Information/Confusion panel: use the same batch we already sampled (up to 64 points).
                         z_info = z[: min(int(z.shape[0]), 64)]
                         dt_info = dt[: min(int(dt.shape[0]), 64)]
-                        # tb_information_matrix_figs(
-                        #     self.tb_writer,
-                        #     step_idx,
-                        #     stat_tracker=self.stat_tracker,
-                        #     traversal_sets=traversal_sets,
-                        #     recognizer=recognizer,
-                        #     z_bd=z_info,
-                        #     dt=dt_info,
-                        #     save_dir=frames_dir,
-                        # )
-                        # if latent2_bk_det is not None:
-                        #     tb_pairwise_distance_figs(
-                        #         self.tb_writer,
-                        #         step_idx,
-                        #         stat_tracker=self.stat_tracker,
-                        #         z_bkd=latent2_bk_det,
-                        #         solver=str(getattr(self.params, "pairwise_ot_solver", "sinkhorn")),
-                        #         reg=float(getattr(self.params, "pairwise_ot_reg", 5e-2)),
-                        #         ot_numItermax=int(getattr(self.params, "pairwise_ot_iters", 5_000)),
-                        #         max_points_per_class=getattr(self.params, "pairwise_max_points_per_class", None),
-                        #         save_dir=frames_dir,
-                        #     )
+                        tb_information_matrix_figs(
+                            self.tb_writer,
+                            step_idx,
+                            stat_tracker=self.stat_tracker,
+                            traversal_sets=traversal_sets,
+                            recognizer=recognizer,
+                            z_bd=z_info,
+                            dt=dt_info,
+                            save_dir=frames_dir,
+                        )
+                        if latent2_bk_det is not None:
+                            tb_pairwise_distance_figs(
+                                self.tb_writer,
+                                step_idx,
+                                stat_tracker=self.stat_tracker,
+                                z_bkd=latent2_bk_det,
+                                solver=str(getattr(self.params, "pairwise_ot_solver", "sinkhorn")),
+                                reg=float(getattr(self.params, "pairwise_ot_reg", 5e-2)),
+                                ot_numItermax=int(getattr(self.params, "pairwise_ot_iters", 5_000)),
+                                max_points_per_class=getattr(self.params, "pairwise_max_points_per_class", None),
+                                save_dir=frames_dir,
+                            )
 
 
-                # timing + finalize
+                # timing + validate
                 step_dt = time.time() - iter_t0
                 self.stat_tracker.push_step_time(step_dt)
 
                 elapsed_time = time.time() - t0
                 mean_step_time = self.stat_tracker.mean_step_time()
                 eta = max(0, total_opt_steps - self.stat_tracker.global_opt_step - 1) * mean_step_time
+
+                if do_val:
+                    validation.run(self, generator, traversal_sets, recognizer, step_idx)
+
+                # timing + finalize
                 iter_t0 = time.time()
 
                 self.stat_tracker.finalize_step(

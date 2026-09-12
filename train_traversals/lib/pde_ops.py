@@ -54,6 +54,23 @@ def _ensure_bkd(z: torch.Tensor) -> Tuple[torch.Tensor, int]:
     if z.dim() == 3:
         return z, z.shape[1]
     raise ValueError(f"z must be [B,D] or [B,K,D], got {tuple(z.shape)}")
+
+
+def broadcast_bk(value, reference: torch.Tensor, name: str) -> torch.Tensor:
+    """Scalar, [B], [B,1], [1,K], [B,K], or [B,K,1] -> [B,K,1].
+
+    Use [1,K] or [1,K,1] for per-traversal values; [B] is per sample.
+    """
+    B, K = reference.shape[:2]
+    value = torch.as_tensor(value, device=reference.device, dtype=reference.dtype)
+    if value.ndim == 1:
+        value = value[:, None, None]
+    elif value.ndim == 2:
+        value = value[..., None]
+    try:
+        return torch.broadcast_to(value, (B, K, 1))
+    except RuntimeError as exc:
+        raise ValueError(f"{name} must broadcast to [B,K,1]; got {tuple(value.shape)}") from exc
 # --- robust HVP / Laplacian that handle affine cases cleanly ---
 
 def _hvp_from_grad(g: torch.Tensor,
@@ -178,14 +195,8 @@ class PDEState:
         else:
             x_leaf = z_bk.requires_grad_(True)
 
-        if not isinstance(self.direction, torch.Tensor) and not isinstance(self.cfg["dt_value"], torch.Tensor):
-            dt = torch.full((self.B, self.K, 1),
-                            float(self.cfg["dt_value"]) * float(self.direction),
-                            device=self.device, dtype=self.dtype)
-        else:
-            dt = (self.direction * self.cfg["dt_value"]).reshape(self.B, -1, 1)
-            if self.K>dt.shape[1]:
-                dt = dt.repeat(1, self.K//dt.shape[1], 1)
+        dt = (broadcast_bk(self.direction, z_bk, "direction") *
+              broadcast_bk(self.cfg["dt_value"], z_bk, "dt"))
         self.state["x"] = x_leaf           # [B,K,D]
         self.state["dt"] = dt              # [B,K,1]
         self.state["losses"] = {}
@@ -211,6 +222,10 @@ class PDEState:
     def f(self, when: When = "now") -> torch.Tensor:
         key = ("f", when)
         if key not in self.state:
+            if getattr(self.f_m, "prefer_explicit_values", False):
+                x = self.x() if when == "now" else self.x_next()
+                self.state[key], self.state[("f_grad", when)] = self.f_m.value_and_grad(x)
+                return self.state[key]
             if when == "now":
                 self.state[key] = self.f_m(self.x())
             elif when == "next":
@@ -308,4 +323,3 @@ class PDEState:
     def zeros(self) -> torch.Tensor:
         """A [B,K,1] zero tensor on the state's device/dtype."""
         return torch.zeros((self.B, self.K, 1), device=self.device, dtype=self.dtype)
-

@@ -1,3 +1,4 @@
+from lib.val_utils import add_validation_arguments
 import argparse
 from pathlib import Path
 
@@ -6,11 +7,12 @@ from lib import (
     GAN_RESOLUTIONS,
     GAN_WEIGHTS,
     Recognizer,
-    TrainerPotential,
+    TraversalTrainer,
     TraversalPDE,
     create_exp_dir,
 )
 from models.gan_load import build_gat
+from lib.recognizer import add_recognizer_arguments, recognizer_options
 
 
 def resolve_gat_checkpoint(args, script_dir):
@@ -119,6 +121,7 @@ def main():
                         help="learning rate for recognizer optimization")
     parser.add_argument("--recognizer-type", type=str, default="ResNet",
                         help="recognizer network type")
+    add_recognizer_arguments(parser)
 
     # === Training =============================================================================== #
     parser.add_argument("--max-iter", type=int, default=100000, help="maximum training iterations")
@@ -147,6 +150,7 @@ def main():
     parser.add_argument("--reset_schedulers", action="store_true", help="reset schedulers")
     parser.add_argument("--reset_start_iter", action="store_true", help="reset start iteration")
 
+    add_validation_arguments(parser)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -182,7 +186,8 @@ def main():
         recognizer_type=args.recognizer_type,
         dim_index=S.num_traversal_sets,
         channels=4 if args.gan_type == "GAT" else 3,
-        pool_size=1,
+        pool_size=args.recognizer_pool_size if args.recognizer_pool_size is not None else 1,
+        **recognizer_options(args, G.latent_size),
     )
     print("  \\__Channels: {}".format(4 if args.gan_type == "GAT" else 3))
     print("  \\__Trainable parameters: {:,}".format(
@@ -190,7 +195,7 @@ def main():
     ))
 
     print("#. Experiment: {}".format(exp_dir))
-    trn = TrainerPotential(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
+    trn = TraversalTrainer(params=args, exp_dir=exp_dir, device=device, multi_gpu=multi_gpu)
     trn.train(generator=G, traversal_sets=S, recognizer=R)
 
 

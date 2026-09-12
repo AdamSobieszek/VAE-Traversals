@@ -37,20 +37,60 @@ def _amp_disabled(device_type: str):
 ##                                                     [ SNGAN ]                                                      ##
 ##                                                                                                                    ##
 ########################################################################################################################
-class SNGANWrapper(nn.Module):
+class _GeneratorRuntime(nn.Module):
+    """AMP and lazy compilation for generators with standard PyTorch forwards."""
+
+    def _init_runtime(self, compile, compile_mode, mixed_precision):
+        self.compile_enabled = bool(compile)
+        self.compile_mode = str(compile_mode)
+        self.set_mixed_precision(mixed_precision)
+
+    def set_mixed_precision(self, mixed_precision="no"):
+        # Keep checkpoint weights in FP32, including spectral-normalization state.
+        self.compute_dtype = _dtype_from_mixed_precision(mixed_precision)
+        self.mixed_precision = mixed_precision or "no"
+        self._compiled = None
+
+    def _run_generator(self, z, *args):
+        with torch.amp.autocast(
+            device_type=z.device.type,
+            dtype=self.compute_dtype if self.compute_dtype != torch.float32 else None,
+            enabled=self.compute_dtype != torch.float32,
+        ):
+            if self.compile_enabled and self._compiled is None:
+                # Compile the callable without registering a second copy of G.
+                self._compiled = torch.compile(
+                    self.G.forward, mode=self.compile_mode, fullgraph=False,
+                )
+            forward = self._compiled if self.compile_enabled else self.G
+            return forward(z, *args)
+
+    def prepare_runtime(self, example_z):
+        """Warm forward and latent-backward graphs after device placement."""
+        self.eval().requires_grad_(False)
+        with torch.no_grad():
+            self(example_z.detach())
+        with torch.enable_grad():
+            z = example_z.detach().clone().requires_grad_(True)
+            image = self(z)
+            torch.autograd.grad(image.float().square().mean(), z)
+
+
+class SNGANWrapper(_GeneratorRuntime):
     share_initial_output = True
 
-    def __init__(self, G):
+    def __init__(self, G, *, compile=False, compile_mode="default", mixed_precision="no"):
         super(SNGANWrapper, self).__init__()
         self.G = G.model
         self.dim_z = G.distribution.dim
         self.shift_in_w_space = False
+        self._init_runtime(compile, compile_mode, mixed_precision)
 
     def forward(self, z, shift=None):
-        return self.G(z if shift is None else z + shift)
+        return self._run_generator(z if shift is None else z + shift)
 
 
-def build_sngan(pretrained_gan_weights, gan_type):
+def build_sngan(pretrained_gan_weights, gan_type, *, compile=False, compile_mode="default", mixed_precision="no"):
     # SNGAN configuration for MNIST and AnimeFaces datasets
     SNGAN_CONFIG = {
         'SNGAN_MNIST': {
@@ -76,7 +116,7 @@ def build_sngan(pretrained_gan_weights, gan_type):
     # Load pre-trained weights
     G.load_state_dict(torch.load(pretrained_gan_weights, map_location=torch.device('cpu')), strict=False)
 
-    return SNGANWrapper(G)
+    return SNGANWrapper(G, compile=compile, compile_mode=compile_mode, mixed_precision=mixed_precision)
 
 
 ########################################################################################################################
@@ -84,27 +124,28 @@ def build_sngan(pretrained_gan_weights, gan_type):
 ##                                                   [ BigGAN ]                                                       ##
 ##                                                                                                                    ##
 ########################################################################################################################
-class BigGANWrapper(nn.Module):
-    def __init__(self, G, target_classes=(239, )):
+class BigGANWrapper(_GeneratorRuntime):
+    def __init__(self, G, target_classes=(239, ), *, compile=False, compile_mode="default", mixed_precision="no"):
         super(BigGANWrapper, self).__init__()
         self.G = G
         self.target_classes = nn.Parameter(data=torch.tensor(target_classes, dtype=torch.int64),
                                            requires_grad=False)
         self.dim_z = self.G.dim_z
         self.shift_in_w_space = False
+        self._init_runtime(compile, compile_mode, mixed_precision)
 
     def mixed_classes(self, batch_size):
         if len(self.target_classes.data.shape) == 0:
-            return self.target_classes.repeat(batch_size).cuda()
+            return self.target_classes.repeat(batch_size)
         else:
-            return torch.from_numpy(np.random.choice(self.target_classes.cpu(), [batch_size])).cuda()
+            return torch.from_numpy(np.random.choice(self.target_classes.cpu(), [batch_size]))
 
     def forward(self, z, shift=None):
         target_classes = self.mixed_classes(z.shape[0]).to(z.device)
-        return self.G(z if shift is None else z + shift, self.G.shared(target_classes))
+        return self._run_generator(z if shift is None else z + shift, self.G.shared(target_classes))
 
 
-def build_biggan(pretrained_gan_weights, target_classes):
+def build_biggan(pretrained_gan_weights, target_classes, *, compile=False, compile_mode="default", mixed_precision="no"):
     # Get BigGAN configuration
     with open('models/BigGAN/generator_config.json') as f:
         config = json.load(f)
@@ -121,7 +162,7 @@ def build_biggan(pretrained_gan_weights, target_classes):
     # Load pre-trained weights
     G.load_state_dict(torch.load(pretrained_gan_weights, map_location=torch.device('cpu')), strict=True)
 
-    return BigGANWrapper(G, target_classes)
+    return BigGANWrapper(G, target_classes, compile=compile, compile_mode=compile_mode, mixed_precision=mixed_precision)
 
 
 ########################################################################################################################
@@ -129,30 +170,31 @@ def build_biggan(pretrained_gan_weights, target_classes):
 ##                                                    [ ProgGAN ]                                                     ##
 ##                                                                                                                    ##
 ########################################################################################################################
-class ProgGANWrapper(nn.Module):
+class ProgGANWrapper(_GeneratorRuntime):
     share_initial_output = True
 
-    def __init__(self, G):
+    def __init__(self, G, *, compile=False, compile_mode="default", mixed_precision="no"):
         super(ProgGANWrapper, self).__init__()
         self.G = G
         self.dim_z = 512
         self.shift_in_w_space = False
+        self._init_runtime(compile, compile_mode, mixed_precision)
 
     @staticmethod
     def _reshape(z):
         return z.reshape(z.size()[0], z.size()[1], 1, 1)
 
     def forward(self, z, shift=None):
-        return self.G(self._reshape(z) if shift is None else self._reshape(z + shift))
+        return self._run_generator(self._reshape(z) if shift is None else self._reshape(z + shift))
 
 
-def build_proggan(pretrained_gan_weights):
+def build_proggan(pretrained_gan_weights, *, compile=False, compile_mode="default", mixed_precision="no"):
     # Build ProgGAN generator model
     G = ProgGANGenerator()
     # Load pre-trained generator model
     G.load_state_dict(torch.load(pretrained_gan_weights, map_location='cpu'))
 
-    return ProgGANWrapper(G)
+    return ProgGANWrapper(G, compile=compile, compile_mode=compile_mode, mixed_precision=mixed_precision)
     
 
 ########################################################################################################################
@@ -161,7 +203,7 @@ def build_proggan(pretrained_gan_weights):
 ##                                                                                                                    ##
 ########################################################################################################################
 class StyleGAN2MPSWrapper(nn.Module):
-    """Frozen StyleGAN2 wrapper used by TrainerPotential.
+    """Frozen StyleGAN2 wrapper used by TraversalTrainer.
 
     Trainer autocast is disabled around synthesis. The opt-in compiled path
     runs high-resolution blocks in FP16 or BF16 explicitly, matching
@@ -306,7 +348,7 @@ class StyleGAN2MPSWrapper(nn.Module):
                     fullgraph=False,
                 )
 
-        # TrainerPotential evaluates img0/img1 under no_grad, then img2 with
+        # TraversalTrainer evaluates img0/img1 under no_grad, then img2 with
         # gradients with respect to the latent.  Warm both Dynamo guard sets
         # here so the first training iteration does not compile another graph.
         with torch.no_grad():
@@ -425,64 +467,6 @@ def build_stylegan2_early_output(
         isolate_amp=isolate_amp,
     )
 
-########################################################################################################################
-##                                                                                                                    ##
-##                                                  [ StyleGAN2 ]                                                     ##
-##                                                                                                                    ##
-########################################################################################################################
-class StyleGAN2Wrapper(nn.Module):
-    def __init__(self, G, shift_in_w_space):
-        super(StyleGAN2Wrapper, self).__init__()
-        self.G = G
-        self.shift_in_w_space = shift_in_w_space
-        self.dim_z = 512
-        self.dim_w = self.G.style_dim if self.shift_in_w_space else self.dim_z
-
-    def get_w(self, z, truncation_psi=1):
-        """Return batch of w latent codes given a batch of z latent codes.
-
-        Args:
-            z (torch.Tensor) : Z-space latent code of size [batch_size, 512]
-
-        Returns:
-            w (torch.Tensor) : W-space latent code of size [batch_size, 512]
-
-        """
-        return self.G.get_latent(z, truncation_psi=truncation_psi)
-
-    def forward(self, z, shift=None):
-        """StyleGAN2 generator forward function.
-
-        Args:
-            z (torch.Tensor)     : Batch of latent codes in Z-space
-            shift (torch.Tensor) : Batch of shift vectors in Z- or W-space (based on self.shift_in_w_space)
-            latent_is_w (bool)   : Input latent code (denoted by z here) is in W-space
-
-        Returns:
-            I (torch.Tensor)     : Output images of size [batch_size, 3, resolution, resolution]
-        """
-        # The given latent codes lie on Z- or W-space, while the given shifts lie on the W-space
-        if self.shift_in_w_space:
-            #if latent_is_w:
-                # Input latent code is in W-space
-            return self.G([z if shift is None else z + shift] if not isinstance(z,list) else z, input_is_latent=True)[0]
-            #else:
-                # Input latent code is in Z-space -- get w code first
-                #w = self.G.get_latent(z)
-                #return self.G([w if shift is None else w + shift], input_is_latent=True)[0]
-        # The given latent codes and shift vectors lie on the Z-space
-        else:
-            return self.G([z if shift is None else z + shift] if not isinstance(z,list) else z, input_is_latent=False)[0]
-
-
-def build_stylegan2(pretrained_gan_weights, resolution, shift_in_w_space=False):
-    # Build StyleGAN2 generator model
-    from models.StyleGAN2.model import Generator as StyleGAN2Generator
-    G = StyleGAN2Generator(resolution, 512, 8)
-    # Load pre-trained weights
-    G.load_state_dict(torch.load(pretrained_gan_weights)['g_ema'], strict=False)
-
-    return StyleGAN2Wrapper(G, shift_in_w_space=shift_in_w_space)
 
 ########################################################################################################################
 ##                                                                                                                    ##

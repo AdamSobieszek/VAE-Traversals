@@ -13,8 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from lib.trainer_potential_nue import (
-    TrainerPotential,
+from lib.trainer import (
+    TraversalTrainer,
     choose_generator_chunk_size,
     estimate_stylegan_backward_gib,
 )
@@ -73,8 +73,8 @@ class _FakeRecognizer(nn.Module):
         return self.fc(x), None
 
 
-def _cpu_trainer(chunk_size: int) -> TrainerPotential:
-    trainer = TrainerPotential.__new__(TrainerPotential)
+def _cpu_trainer(chunk_size: int) -> TraversalTrainer:
+    trainer = TraversalTrainer.__new__(TraversalTrainer)
     trainer.params = argparse.Namespace(
         lambda_cls=1.0,
         lambda_pde=1.0,

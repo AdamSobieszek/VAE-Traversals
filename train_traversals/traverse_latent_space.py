@@ -14,7 +14,7 @@ from models.gan_load import (
     build_stylegan2_early_output,
     build_stylegan2mps,
 )
-from lib.aux import choose_device, sample_z
+from lib.utils import choose_device, sample_z
 
 
 class DataParallelPassthrough(nn.DataParallel):
@@ -323,9 +323,11 @@ def main():
     if args.verbose:
         print("#. Build traversal model S...")
 
+    from lib.TraversalPDE import traversal_options
     S = TraversalPDE(num_traversal_sets=a.__dict__["num_traversal_sets"],
                      num_traversal_timesteps=a.__dict__["num_traversal_timesteps"],
-                     traversal_vectors_dim=G.dim_z).to(device).eval()
+                     traversal_vectors_dim=G.dim_z,
+                     **traversal_options(a)).to(device).eval()
     if args.verbose:
         print("  \\__Pre-trained weights: {}".format(ckpt_path))
     load_traversal_weights(S, ckpt)

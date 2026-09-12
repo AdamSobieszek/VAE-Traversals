@@ -1,4 +1,4 @@
-"""Smoke the StyleGAN wrapper under TrainerPotential's BF16 autocast + compile path."""
+"""Smoke the StyleGAN wrapper under TraversalTrainer's BF16 autocast + compile path."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def _make_w(G, batch: int, device: torch.device, seed: int = 0) -> torch.Tensor:
 
 
 def _trainer_like_step(G, w, *, autocast_dtype):
-    """Match TrainerPotential: no-grad img0/img1, grad through img2, optional BF16 autocast."""
+    """Match TraversalTrainer: no-grad img0/img1, grad through img2, optional BF16 autocast."""
     device_type = w.device.type
     amp = (
         torch.amp.autocast(device_type=device_type, dtype=autocast_dtype, enabled=True)

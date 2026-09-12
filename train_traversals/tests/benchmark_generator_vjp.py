@@ -51,7 +51,7 @@ def main():
     torch.set_default_device("mps")
     torch.manual_seed(81)
     from models.gan_load import build_sngan
-    from lib.generator_vjp import FrozenGeneratorVJP
+    from lib.utils import FrozenGeneratorVJP
 
     generator = build_sngan(str(ROOT / "models/pretrained/generators/SNGAN_AnimeFaces/generator.pt"),
                             "SNGAN_AnimeFaces").eval().requires_grad_(False)

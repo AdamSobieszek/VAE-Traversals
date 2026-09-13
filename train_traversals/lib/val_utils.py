@@ -132,8 +132,8 @@ class TraversalValidation:
         self.positions = None
         if self.frequency:
             base = trainer._generator_module(generator)
-            # sample_z pads batches above dim_z with zeros; sample small cohorts
-            # so every requested position is a real sample, even when N > D.
+            # Keep mapping/truncation per dimension-sized cohort for compatibility
+            # with previously generated fixed validation positions.
             dim = int(base.dim_z if hasattr(base, 'dim_z') else base.latent_size)
             with _fixed_rng(self.seed, trainer.device), _evaluation(generator):
                 self.positions = torch.cat([

@@ -14,6 +14,24 @@ from torch import nn
 from torch.autograd import grad
 
 When = Literal["now", "next"]
+
+
+def metric_gradient(g: torch.Tensor, cov_matrix=None):
+    """Return (C g, g^T C g); C=None is Euclidean geometry.
+
+    C is a given, spatially constant SPD covariance, i.e. the inverse of
+    the Mahalanobis metric. No matrix inverse is needed. SPD is the caller's
+    responsibility; we deliberately avoid a factorization in the hot path.
+    Keep C fixed until backward completes; learned/spatial metrics are unsupported.
+    """
+    if cov_matrix is None:
+        return g, g.square().sum(-1, keepdim=True)
+    cov = torch.as_tensor(cov_matrix, device=g.device, dtype=g.dtype)
+    if cov.shape != (g.shape[-1], g.shape[-1]) or cov.requires_grad:
+        raise ValueError("cov_matrix must be a fixed [D,D] SPD tensor (detach covariance estimates)")
+    raised = g @ cov.mT
+    return raised, (g * raised).sum(-1, keepdim=True)
+
 # --- RNG helpers (generator-safe across PyTorch versions) ---
 
 def _make_gen(seed: Optional[int], device: torch.device) -> Optional[torch.Generator]:
@@ -157,6 +175,7 @@ class PDEState:
       rng: str = "rademacher"   # or "gaussian"
       seed: Optional[int] = None
       need_next: bool = False   # if True, makes "next" timepoint available
+      cov_matrix: optional fixed global SPD covariance [D,D]; metric is its inverse
     """
 
     def __init__(self,
@@ -265,9 +284,15 @@ class PDEState:
     def Xf(self, when: When = "now") -> torch.Tensor:
         key = ("Xf", when)
         if key not in self.state:
-            g = self.f_grad(when)
-            norm2 = g.pow(2).sum(dim=-1, keepdim=True).add_(float(self.cfg["eps_norm2"]))
-            self.state[key] = g / norm2
+            raised, norm2 = self.f_metric_grad(when)
+            self.state[key] = raised / (norm2 + float(self.cfg["eps_norm2"]))
+        return self.state[key]
+
+    def f_metric_grad(self, when: When = "now"):
+        """Cached (metric gradient, dual squared norm); f_grad stays Euclidean."""
+        key = ("f_metric_grad", when)
+        if key not in self.state:
+            self.state[key] = metric_gradient(self.f_grad(when), self.cfg.get("cov_matrix"))
         return self.state[key]
 
 

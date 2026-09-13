@@ -1,10 +1,10 @@
 gan_type="StyleGAN2"
-num_traversal_sets=200
+num_traversal_sets=20
 num_traversal_timesteps=20
 warmup_fraction=0.001
-accumulate_grad_steps=8
-recognizer_type="ResNet"
-z_truncation=0.6
+accumulate_grad_steps=1
+recognizer_type="CAT"
+z_truncation=1.0
 batch_size=1
 val_batch_size=${batch_size}
 val_freq=100
@@ -50,7 +50,7 @@ python train_StyleGAN.py $tb \
                 --val-seed=${val_seed} \
                 "${val_dt_args[@]}" \
                 --max-iter=${max_iter} \
-                --recognizer-lr 4e-5 \
+                --recognizer-lr 8e-5 \
                 --traversal-set-lr 2e-4 \
                 --shift-in-w-space \
                 --warmup-fraction=${warmup_fraction} \
@@ -58,6 +58,7 @@ python train_StyleGAN.py $tb \
                 --z-truncation=${z_truncation} \
                 --stylegan2-resolution=1024 \
                 --early-output \
+                --early-output-resolution 256 \
                 --mixed-precision=${mixed_precision} \
                 $compile_flag \
                 --log-freq=20 \

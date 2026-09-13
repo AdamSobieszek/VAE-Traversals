@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from lib.TraversalPDE import TraversalPDE, DirectionalSemanticPotential, _base_velocity
-from lib.pde_ops import broadcast_bk
+from lib.pde_ops import broadcast_bk, metric_gradient
 
 pytestmark = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS required")
 
@@ -63,8 +63,11 @@ def test_midpoint_retraces_curved_path_and_is_a_scalar_potential(eps):
                                atol=3e-6, rtol=3e-6)
 
 
-def test_implicit_gradient_matches_differentiated_solver():
+@pytest.mark.parametrize("mahalanobis", [False, True])
+def test_implicit_gradient_matches_differentiated_solver(mahalanobis):
     net = model("midpoint")
+    if mahalanobis:
+        net.cov_matrix = torch.eye(4) + torch.ones(4, 4) * .05
     reference = copy.deepcopy(net)
     x = torch.randn(2, 2, 4).requires_grad_()
     xr = x.detach().clone().requires_grad_()
@@ -74,8 +77,8 @@ def test_implicit_gradient_matches_differentiated_solver():
     _, actual = net.inference(x, dt=h, direction=signs)
     m = xr
     for _ in range(30):
-        m = xr + signs * hr / 2 * _base_velocity(reference.F, m, 1e-8)
-    expected = signs * hr * _base_velocity(reference.F, m, 1e-8)
+        m = xr + signs * hr / 2 * _base_velocity(reference.F, m, 1e-8, reference.cov_matrix)
+    expected = signs * hr * _base_velocity(reference.F, m, 1e-8, reference.cov_matrix)
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
     probe = torch.randn_like(actual)
     actual_grads = torch.autograd.grad((actual * probe).sum(), (x, h, *net.F.parameters()), allow_unused=True)
@@ -158,3 +161,61 @@ def test_random_signs_do_not_hide_duplicate_semantic_directions(mode):
     _, _, mixed, _ = net._per_step(x, dt=.1, direction=torch.tensor([[1., -1.]]))
     torch.testing.assert_close(mixed, canonical)
     assert mixed.min() > .9
+
+
+@pytest.mark.parametrize("mode", ["euler", "potential_jet", "midpoint"])
+@pytest.mark.parametrize("eps", [0., .02])
+def test_mahalanobis_equals_euclidean_whitening(mode, eps):
+    # Independent reference: x=Lz, C=LL^T, F_tilde(z)=F(Lz).
+    L = torch.tensor([[1.2, 0., 0., 0.], [.3, .8, 0., 0.],
+                      [0., .2, 1.1, 0.], [.1, 0., .2, .9]])
+    net = model(mode, eps_norm2=eps, cov_matrix=L @ L.mT,
+                lambdas={"BB": .25, "g2orth": .3, "signed_g2orth": 1.})
+    with torch.no_grad():
+        net.F.dir_linear.weight.mul_(3)
+    reference = copy.deepcopy(net)
+    reference.cov_matrix = None
+    with torch.no_grad():
+        reference.F.fc1.weight.copy_(net.F.fc1.weight @ L)
+        reference.F.dir_linear.weight.copy_(net.F.dir_linear.weight @ L)
+    z = torch.randn(2, 2, 4).requires_grad_()
+    x = (z.detach() @ L.mT).requires_grad_()
+    signs = torch.tensor([[1., -1.]])
+    st, y, penalty, _ = net._per_step(x, dt=.05, direction=signs)
+    rst, ry, rpenalty, _ = reference._per_step(z, dt=.05, direction=signs)
+    torch.testing.assert_close(y, ry @ L.mT, atol=3e-6, rtol=2e-5)
+    torch.testing.assert_close(st.f(), rst.f(), atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(st.f_grad() @ L, rst.f_grad(), atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(penalty, rpenalty, atol=2e-5, rtol=2e-5)
+    direct_grad = torch.autograd.grad(st.f().sum(), x, retain_graph=True)[0]
+    torch.testing.assert_close(st.f_grad(), direct_grad, atol=2e-6, rtol=3e-5)
+
+    # Compare input/parameter gradients through the different coordinates.
+    probe = torch.randn_like(y)
+    a = torch.autograd.grad((y * probe).sum() + penalty.sum(),
+                            (x, net.F.fc1.weight, net.F.dir_linear.weight, net.F.fc3.weight))
+    b = torch.autograd.grad(((ry @ L.mT) * probe).sum() + rpenalty.sum(),
+                            (z, reference.F.fc1.weight, reference.F.dir_linear.weight, reference.F.fc3.weight))
+    for actual, expected in zip((a[0] @ L, a[1], a[2], a[3]),
+                                (b[0], b[1] @ L.mT, b[2] @ L.mT, b[3])):
+        torch.testing.assert_close(actual, expected, atol=3e-5, rtol=3e-4)
+    if mode == "midpoint":
+        _, back = net.inference(y.detach(), dt=.05, direction=-signs)
+        torch.testing.assert_close(y.detach() + back, x.detach(), atol=5e-6, rtol=5e-6)
+
+
+def test_metric_norm_and_optional_covariance_contract():
+    g = torch.randn(2, 2, 4)
+    raised, q = metric_gradient(g, torch.diag(torch.tensor([.5, 1., 2., 3.])))
+    torch.testing.assert_close(q, (g * raised).sum(-1, keepdim=True))
+    # The denominator is g^T C g, NOT ||C g||_Euclidean^2.
+    assert not torch.allclose(q, raised.square().sum(-1, keepdim=True))
+    for a, b in zip(metric_gradient(g), metric_gradient(g, torch.eye(4))):
+        torch.testing.assert_close(a, b)
+    with pytest.raises(ValueError, match="fixed"):
+        metric_gradient(g, torch.eye(4).requires_grad_())
+    with pytest.raises(ValueError, match="D,D"):
+        metric_gradient(g, torch.ones(4))
+    net = model("midpoint", cov_matrix=torch.eye(4))
+    assert "cov_matrix" in dict(net.named_buffers())
+    assert "cov_matrix" not in net.state_dict()  # Runtime estimate, not a learned/checkpointed weight.

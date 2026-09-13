@@ -573,6 +573,16 @@ class Generator(torch.nn.Module):
 
         return latent
 
+    def cov_latent(self, n_latent):
+        latent_in = torch.randn(
+            n_latent, self.z_dim, device=self.device
+        )
+        latent = self.get_latent(latent_in)
+        latent = latent - latent.mean(0, keepdim=True)
+        cov = (latent.T @ latent) / (n_latent - 1)
+
+        return cov
+
     def get_latent(self, z, truncation_psi=1):
         return self.mapping(z, None, truncation_psi=truncation_psi)[:,0]
         

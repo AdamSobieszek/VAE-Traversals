@@ -17,7 +17,8 @@ Semantic potential f and geometry:
   - st.f(when)        -> [B,K,1]  f(x) or f(x_next)
   - st.f_grad(when)   -> [B,K,D]  grad_x f at x or x_next
   - st.f_laplace(when, probes=None) -> [B,K,1]  Hutchinson Laplacian of f
-  - st.Xf(when)       -> [B,K,D]  grad f / (||grad f||^2 + eps_norm2)
+  - st.f_metric_grad(when) -> (C grad f, grad f^T C grad f); C defaults to I
+  - st.Xf(when)       -> [B,K,D]  C grad f / (grad f^T C grad f + eps_norm2)
 
 Velocity and divergence:
   - st.v(when)        -> [B,K,D]  X_f(when)
@@ -76,12 +77,12 @@ class OT(PDELoss):
         return st.zeros()
 
 class BB(PDELoss):
-    """Benamou-Brenier kinetic energy for v = grad f / ||grad f||^2."""
+    """Reciprocal dual norm, 1/(g^T C g + eps), retaining legacy regularization."""
     name = "bb"
 
     def _loss(self, st: PDEState) -> torch.Tensor:
         eps = float(self.ctx.get("epsilon", 1e-4))
-        return 1.0 / (st.f_grad("now").pow(2).sum(dim=-1, keepdim=True) + eps)
+        return 1.0 / (st.f_metric_grad("now")[1] + eps)
 
 class UnitSpeed(PDELoss):
     """(<grad f, v> - 1)^2, with grad f detached to avoid batch-coupled grads."""
@@ -316,11 +317,13 @@ class GradGroupSecondMomentOrtho(PDELoss):
         eps = float(self.ctx.get("eps", st.cfg.get("eps_norm2", 1e-8)))
 
         g = st.f_grad(when)
+        raised, q = st.f_metric_grad(when)
 
         if normalize:
-            g = g / (g.pow(2).sum(dim=-1, keepdim=True).add(eps).sqrt())
+            scale = (q + eps).sqrt()
+            g, raised = g / scale, raised / scale
 
-        gram = torch.einsum("bkd,bld->bkl", g, g)                      # [B,K,K]
+        gram = torch.einsum("bkd,bld->bkl", g, raised)                 # [B,K,K]
         gram = gram - torch.diag_embed(torch.diagonal(gram, dim1=-2, dim2=-1))
         return gram.pow(2).sum(dim=-1, keepdim=True)                   # [B,K,1]
 
@@ -338,11 +341,14 @@ class SignedGradGroupSecondMomentOrtho(PDELoss):
         # Compare canonical semantic orientations, not randomly sampled time
         # directions (otherwise identical heads evade the positive Gram penalty).
         g = st.f_grad(when) * st.cfg.get("semantic_direction", 1)
+        raised, q = st.f_metric_grad(when)
+        raised = raised * st.cfg.get("semantic_direction", 1)
 
         if normalize:
-            g = g / (g.pow(2).sum(dim=-1, keepdim=True).add(eps).sqrt())
+            scale = (q + eps).sqrt()
+            g, raised = g / scale, raised / scale
 
-        gram = torch.einsum("bkd,bld->bkl", g, g)                      # [B,K,K]
+        gram = torch.einsum("bkd,bld->bkl", g, raised)                 # [B,K,K]
         gram = gram - torch.diag_embed(torch.diagonal(gram, dim1=-2, dim2=-1))
         return gram.clamp_min(0.0).pow(2).sum(dim=-1, keepdim=True)     # [B,K,1]
 

@@ -29,28 +29,23 @@ def choose_device() -> torch.device:
 @torch.no_grad()
 def sample_z(batch_size, generator, params, device = torch.device('cuda')):
     """
-    Instead of sampling batch_size independent random vectors,
-    sample one random vector and generate the rest as an orthonormal basis
-    (Gram-Schmidt) to it. If batch_size > generator.dim_z, will pad with zeros.
+    Sample equal-norm orthogonal vectors in blocks of at most dim_z.
+    Larger batches use fresh random blocks: more than dim_z nonzero vectors
+    cannot all be mutually orthogonal. Mapping/truncation applies to the full batch.
     """
     dim_z = generator.dim_z if hasattr(generator, 'dim_z') else generator.latent_size
 
     # Reduced QR is the vectorized equivalent of Gram-Schmidt on Gaussian
     # columns. Correcting the arbitrary QR signs also makes the first basis
     # vector equal to the normalized first sample, as in the legacy code.
-    basis_size = min(batch_size, dim_z)
-    raw = torch.randn(dim_z, basis_size, device=device)
-    z0_norm = raw[:, 0].norm()
-    q, r = torch.linalg.qr(raw, mode="reduced")
-    signs = r.diagonal().sign().masked_fill_(r.diagonal() == 0, 1)
-    z = q.mul(signs.unsqueeze(0)).mT.mul_(z0_norm)
-    # If batch_size > dim_z, pad with zeros
-    if batch_size > dim_z:
-        pad = torch.zeros(batch_size - dim_z, dim_z, device=device)
-        z = torch.cat([z, pad], dim=0)
-    # If batch_size < dim_z, truncate
-    if z.shape[0] > batch_size:
-        z = z[:batch_size]
+    blocks = []
+    for start in range(0, batch_size, dim_z):
+        raw = torch.randn(dim_z, min(batch_size - start, dim_z), device=device)
+        z0_norm = raw[:, 0].norm()
+        q, r = torch.linalg.qr(raw, mode="reduced")
+        signs = r.diagonal().sign().masked_fill_(r.diagonal() == 0, 1)
+        blocks.append(q.mul(signs.unsqueeze(0)).mT.mul_(z0_norm))
+    z = torch.cat(blocks, dim=0) if len(blocks) > 1 else blocks[0]
 
     # Move to correct device if needed
     if z.device.type == 'cuda':

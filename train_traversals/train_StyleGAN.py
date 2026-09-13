@@ -9,7 +9,6 @@ from models.gan_load import (
     build_biggan,
     build_proggan,
     build_sngan,
-    build_stylegan2,
     build_stylegan2_early_output,
     build_stylegan2mps,
 )
@@ -40,6 +39,8 @@ def main():
         -D, --num-traversal-timesteps  : set number of support dipoles per support set
 
         --traversal-set-lr           : set learning rate for learning support sets
+        --traversal-architecture     : shared directional potential / step architecture
+        --bidirectional              : sample a sign per sample and traversal
 
         ===[ Recognizer (R) ]========================================================================================
         --recognizer-type       : set recognizer network type
@@ -76,6 +77,9 @@ def main():
     parser.add_argument('-K', '--num-traversal-sets', type=int, help="set number of support sets (potential functions)")
     parser.add_argument('-D', '--num-traversal-timesteps', type=int, help="set number of timesteps per potential")
     parser.add_argument('--traversal-set-lr', type=float, default=3e-4, help="set learning rate")
+    parser.add_argument("--traversal-architecture", choices=("euler", "potential_jet", "midpoint"),
+                        default="euler", help="shared directional potential / step architecture")
+    parser.add_argument("--bidirectional", action="store_true", help="sample a sign per sample and traversal")
 
     # === Recognizer (R) ========================================================================================== #
     parser.add_argument('--recognizer-lr', type=float, default=3e-4,
@@ -137,14 +141,9 @@ def main():
         parser.error("--early-output-resolution requires --early-output")
 
     if args.early_output:
-        stylegan2_weight_key = (
-            "early_output_128"
-            if args.early_output_resolution == 128
-            else "early_output"
-        )
+        stylegan2_weight_key = f"early_output_{args.early_output_resolution}"
     else:
         stylegan2_weight_key = args.stylegan2_resolution
-
     # Create output dir and save current arguments
     exp_dir = create_exp_dir(args, new_experiment=args.new_experiment)
 
@@ -222,12 +221,15 @@ def main():
     print("#. Build Potentials (Support Sets) S...")
     print("  \\__Number of Potentials    : {}".format(args.num_traversal_sets))
     print("  \\__Number of Timesteps : {}".format(args.num_traversal_timesteps))
+    print("  \\__Architecture            : {}".format(args.traversal_architecture))
     print("  \\__Support Vectors dim       : {}".format(G.dim_z))
 
     S = TraversalPDE(num_traversal_sets=args.num_traversal_sets,
                     num_traversal_timesteps=args.num_traversal_timesteps,
                     traversal_vectors_dim=G.dim_z,
-                    lambdas={'BB': 0.1, 'signed_g2orth': 1.5, 'g2orth': 0.5, "fconvex":1.0},
+                    n_hidden=48,
+                    architecture=args.traversal_architecture,
+                    lambdas={'BB': 0.15, 'signed_g2orth': 1.5, 'g2orth': 0.5, "fconvex":1.0},
                     ) 
 
     # Count number of trainable parameters

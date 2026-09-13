@@ -4,7 +4,7 @@ from typing import Callable, Dict, List, Optional
 import torch
 from torch import nn
 
-from lib.pde_ops import PDEState, broadcast_bk
+from lib.pde_ops import PDEState, broadcast_bk, metric_gradient
 from lib.pde_losses import build_losses
 
 
@@ -199,9 +199,10 @@ class StackedSemanticPotential(nn.Module):
         return value, gradient + self.dir_linear.weight[:, 0]
 
 
-def _base_velocity(potential, x, eps):
+def _base_velocity(potential, x, eps, cov_matrix=None):
     _, g = potential._evaluate(x, input_gradient=True, update_stats=False)
-    return g / (g.square().sum(-1, keepdim=True) + eps)
+    raised, q = metric_gradient(g, cov_matrix)
+    return raised / (q + eps)
 
 
 def _fixed_point(function, initial, max_iter, atol, rtol, label):
@@ -228,21 +229,21 @@ class _ImplicitMidpoint(torch.autograd.Function):
     Higher-order differentiation THROUGH this custom backward is unsupported.
     """
     @staticmethod
-    def forward(ctx, x, a, potential, eps, max_iter, atol, rtol, *parameters):
-        m = _fixed_point(lambda m: x + a * _base_velocity(potential, m, eps),
+    def forward(ctx, x, a, potential, eps, max_iter, atol, rtol, cov_matrix, *parameters):
+        m = _fixed_point(lambda m: x + a * _base_velocity(potential, m, eps, cov_matrix),
                          x, max_iter, atol, rtol, "Midpoint forward solve")
         ctx.potential, ctx.eps = potential, eps
         ctx.settings = max_iter, atol, rtol
-        ctx.save_for_backward(m, a, *parameters)
+        ctx.save_for_backward(m, a, cov_matrix, *parameters)
         return m.clone()
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, upstream):
-        midpoint, a, *parameters = ctx.saved_tensors
+        midpoint, a, cov_matrix, *parameters = ctx.saved_tensors
         with torch.enable_grad():
             m = midpoint.detach().requires_grad_(True)
-            v = _base_velocity(ctx.potential, m, ctx.eps)
+            v = _base_velocity(ctx.potential, m, ctx.eps, cov_matrix)
 
             def adjoint(lam):
                 jtv = torch.autograd.grad(v, m, a * lam, retain_graph=True)[0]
@@ -252,22 +253,23 @@ class _ImplicitMidpoint(torch.autograd.Function):
             parameter_grads = (torch.autograd.grad(v, parameters, a * lam, allow_unused=True)
                                if parameters else ())
         grad_a = (lam * v.detach()).sum(-1, keepdim=True)
-        return (lam, grad_a, None, None, None, None, None, *parameter_grads)
+        return (lam, grad_a, None, None, None, None, None, None, *parameter_grads)
 
 
 class DirectionalSemanticPotential:
     """Parameter-free directional view of one shared scalar network.
 
     midpoint: m=x+s*h/2*I_eps(grad F(m)); grad F_s(x)=s*grad F(m).
-    potential_jet: F_s(x)=s*F(x)+h/4*log(||grad F(x)||²+eps).
+    potential_jet: F_s(x)=s*F(x)+h/4*log(grad F(x)^T C grad F(x)+eps).
     See docs/bidirectional_traversals.md for the generating-potential proof.
     """
     prefer_explicit_values = True
 
-    def __init__(self, base, direction, dt, architecture, eps, solver_settings):
+    def __init__(self, base, direction, dt, architecture, eps, solver_settings, cov_matrix=None):
         self.base, self.direction, self.dt = base, direction, dt
         self.architecture, self.eps = architecture, eps
         self.solver_settings = solver_settings
+        self.cov_matrix = cov_matrix
 
     def __call__(self, x):
         return self.value_and_grad(x)[0]
@@ -277,9 +279,9 @@ class DirectionalSemanticPotential:
         if self.architecture == "midpoint":
             parameters = tuple(p for p in self.base.parameters() if p.requires_grad)
             m = _ImplicitMidpoint.apply(x, s * h / 2, self.base, self.eps,
-                                        *self.solver_settings, *parameters)
+                                        *self.solver_settings, self.cov_matrix, *parameters)
             value, g = self.base._evaluate(m, input_gradient=True)
-            q = g.square().sum(-1, keepdim=True)
+            _, q = metric_gradient(g, self.cov_matrix)
             # The rational term is constant only when eps=0. Keeping it
             # makes the scalar identity exact for our regularized inversion.
             value = s * value + h / 4 * (q + self.eps).log() - h / 2 * q / (q + self.eps)
@@ -290,7 +292,8 @@ class DirectionalSemanticPotential:
         with torch.enable_grad():
             x = x.requires_grad_(True)
             value, g = self.base._evaluate(x, input_gradient=True)
-            log_q = (g.square().sum(-1, keepdim=True) + self.eps).log()
+            _, q = metric_gradient(g, self.cov_matrix)
+            log_q = (q + self.eps).log()
             correction = torch.autograd.grad(log_q.sum(), x, create_graph=True)[0]
             return s * value + h / 4 * log_q, s * g + h / 4 * correction
 
@@ -345,6 +348,7 @@ class TraversalPDE(nn.Module):
         midpoint_atol: float = 1e-6,
         midpoint_rtol: float = 1e-6,
         noise_aperture: float = 0.5,
+        cov_matrix: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         if lambdas is None:
@@ -410,6 +414,9 @@ class TraversalPDE(nn.Module):
         # for telemetry
         self._acc: Dict[str, torch.Tensor] = {}
 
+        # Runtime geometry, recomputed externally rather than learned/checkpointed.
+        self.register_buffer("cov_matrix", cov_matrix, persistent=False)
+
     # ---- one step ----
     def _per_step(
         self,
@@ -429,9 +436,11 @@ class TraversalPDE(nn.Module):
         sign = sign * torch.where(step < 0, -1.0, 1.0)
         step = step.abs()
         potential = self.F
+        cov = (None if self.cov_matrix is None else
+               self.cov_matrix.to(device=z_bkd.device, dtype=z_bkd.dtype))
         if self.architecture != "euler":
             potential = DirectionalSemanticPotential(self.F, sign, step, self.architecture,
-                                                     self._pde_cfg["eps_norm2"], self.midpoint_settings)
+                                                     self._pde_cfg["eps_norm2"], self.midpoint_settings, cov)
         st = PDEState(
             f=potential,
             z=z_bkd,
@@ -439,6 +448,7 @@ class TraversalPDE(nn.Module):
             need_next=self._needs_next,
             dt_value=step,
             semantic_direction=sign if self.architecture != "euler" else 1,
+            cov_matrix=cov,
             **self._pde_cfg,
         )
 

@@ -45,8 +45,8 @@ def test_pairs_match_original(tmp_path, monkeypatch, architecture, layout, filen
         (root / 'models').mkdir(parents=True)
         (root / 'args.json').write_text(json.dumps(params))
         torch.save({layout: state} if layout else state, root / 'models' / filename)
-    # Five pairs forces a partial second batch; non-default dt/resize/quality matter.
-    options = ['--n-samples', '5', '--batch-size', '2', '--shift-leap', '.3',
+    # Packed batches exceed dim_z; thirteen pairs also forces a partial final batch.
+    options = ['--n-samples', '13', '--batch-size', '3', '--shift-leap', '.3',
                '--img-size', '7', '--img-quality', '81', '--gif',
                '--gif-size', '128', '--gif-fps', '12', '--seed', '123']
     if bidirectional:
@@ -61,10 +61,10 @@ def test_pairs_match_original(tmp_path, monkeypatch, architecture, layout, filen
     assert sorted(p.name for p in old.iterdir()) == sorted(p.name for p in new.iterdir())
     for path in old.iterdir():
         assert path.read_bytes() == (new / path.name).read_bytes(), path.name
-    assert np.load(new / 'labels.npy').shape == (5, 2)
+    assert np.load(new / 'labels.npy').shape == (13, 2)
     if bidirectional:
         directions = np.load(new / 'directions.npy')
-        assert directions.shape == (5,)
+        assert directions.shape == (13,)
         assert set(directions) == {-1, 1}
     else:
         assert not (new / 'directions.npy').exists()
@@ -126,3 +126,33 @@ def test_negative_pairs_are_reordered(tmp_path, monkeypatch):
     assert torch.all(second > first)
     assert (first < 0).any() and (first == 0).any()  # both sampled directions
     assert torch.all((first == 0) | (second == 0))  # same original latent is retained
+
+
+@pytest.mark.parametrize('device', ['cpu', pytest.param('mps', marks=pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason='MPS unavailable'))])
+@pytest.mark.parametrize('count', [3, 4, 13])
+def test_sampling_never_zero_pads_and_is_repeatable(device, count):
+    from argparse import Namespace
+    from lib.utils import sample_z
+
+    params = Namespace(z_truncation=.8)
+    generator = TinyGenerator()
+    torch.manual_seed(123)
+    actual = sample_z(count, generator, params, device)
+    assert actual.shape == (count, 4)
+    assert torch.all(actual.norm(dim=1) > 0)
+    assert torch.isfinite(actual).all()
+    torch.manual_seed(123)
+    torch.testing.assert_close(sample_z(count, generator, params, device), actual, rtol=0, atol=0)
+    # Orthogonality and equal norms still hold within each independently sampled block.
+    for block in actual.split(4):
+        gram = block @ block.T
+        torch.testing.assert_close(gram, torch.eye(len(block), device=device) * gram[0, 0],
+                                   rtol=1e-5, atol=1e-5)
+    # The original algorithm is unchanged for a single non-padded block.
+    torch.manual_seed(123)
+    raw = torch.randn(4, min(count, 4), device=device)
+    q, r = torch.linalg.qr(raw, mode='reduced')
+    signs = r.diagonal().sign().masked_fill_(r.diagonal() == 0, 1)
+    previous = q.mul(signs[None]).T.mul_(raw[:, 0].norm()) * .8
+    torch.testing.assert_close(actual[:min(count, 4)], previous, rtol=0, atol=0)

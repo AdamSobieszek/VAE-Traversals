@@ -241,6 +241,94 @@ y, backward_delta = S.inference(x + forward_delta, dt=dt, direction=-signs)
 # Compare y + backward_delta with x, accounting for solver conditioning.
 ```
 
+## Optional constant Mahalanobis geometry
+
+Let C be a given symmetric positive-definite covariance, held fixed in x and
+during the rollout/backward pass. The metric on tangent vectors is M=C^{-1}.
+The Euclidean gradient g is a covector; its metric gradient is Cg. Crucially,
+
+\[
+\|\operatorname{grad}_M F\|_M^2
+=(Cg)^T C^{-1}(Cg)=g^TCg=:q.
+\]
+
+Using `||C g||_Euclidean²` in the denominator would introduce an incorrect
+second factor of C. The minimum-Mahalanobis-norm solution of `g^T v=1` is
+
+\[
+v=\frac{Cg}{q},\qquad
+v_\epsilon=\frac{Cg}{q+\epsilon},\qquad
+\|v_\epsilon\|_M^2=\frac{q}{(q+\epsilon)^2}.
+\]
+
+No inverse of C is needed for any of these computations. The BB regularizer
+keeps its existing reciprocal convention, now `1/(q+epsilon_loss)`; this equals
+the squared metric speed in the unregularized case. With finite regularizers,
+it is a surrogate rather than the exact last expression above. Orthogonality
+uses the dual Gram matrix `g_i^T C g_j`, normalized by the corresponding dual
+norms, with the existing canonical sign correction.
+
+For both directional architectures, replace the original Hamiltonian by
+
+\[
+H_{C,\epsilon}(g)=\tfrac12\log(g^TCg+\epsilon),\qquad
+\nabla_g H_{C,\epsilon}=\frac{Cg}{g^TCg+\epsilon}.
+\]
+
+Its gradient Jacobian is symmetric, so the previous differential proof applies
+unchanged. Specifically, with `m=x+s h v_epsilon(m)/2`, midpoint uses
+
+\[
+F_s(x)=sF(m)+\frac h4\log(q(m)+\epsilon)
+-\frac h2\frac{q(m)}{q(m)+\epsilon},\qquad
+\nabla_xF_s=s\nabla F(m).
+\]
+
+The endpoint step is `x+h C grad F_s/(grad F_s^T C grad F_s+epsilon)`.
+Thus midpoint still retraces the deterministic segment on a corresponding
+converged solution branch. Both directions must use the same covariance.
+
+The explicit approximation becomes
+
+\[
+F_s^{\rm jet}(x)=sF(x)+\frac h4\log(q(x)+\epsilon),\qquad
+\nabla_xF_s^{\rm jet}=s g+\frac h{2(q+\epsilon)}(\operatorname{Hess}F)Cg.
+\]
+
+Its velocity expansion is again `s v_epsilon + h Dv_epsilon v_epsilon/2 + O(h²)`.
+The Hessian-vector product now acts on Cg; autograd handles it through the
+shared q calculation. Spatially varying C(x) introduces additional derivatives
+and is outside this implementation's contract. Singular covariance estimates
+need their own SPD regularization; denominator epsilon does not make C invertible.
+
+Implementation is isolated in `metric_gradient` in `lib/pde_ops.py`, which
+returns `(C g, q)`, and its small cached `PDEState.f_metric_grad` wrapper.
+Euler, both directional potentials, implicit forward/backward, and the active
+BB/orthogonality losses use this same calculation. `f_grad` remains Euclidean;
+other PDE penalties and the existing training noise retain their prior
+definitions. Covariance is a nonpersistent buffer, so `.to(device)` moves it
+but checkpoints retain their existing keys. Recompute or reassign the estimate
+after loading a checkpoint:
+
+```python
+S.cov_matrix = covariance.detach()  # Fixed global SPD tensor [D,D].
+# Alternatively: TraversalPDE(..., cov_matrix=covariance.detach()).
+S.cov_matrix = None                # Restore Euclidean behavior in all modes.
+```
+
+No covariance estimator, extra learned parameters, factorization, or matrix
+inverse is added. Shapes and detached status are checked; SPD is the caller's
+responsibility to avoid a factorization on every step. The covariance tensor
+is saved with the implicit autograd context, so backward uses the same metric
+as its forward solve. Replace the estimate between updates, not in-place
+while a backward graph is outstanding.
+
+The metric tests independently transform to whitened coordinates: for C=LL^T
+and x=Lz, the reference is an ordinary Euclidean traversal of F(Lz). Tests
+compare potentials, steps, BB/orthogonality losses, and input/parameter gradients
+for all three architectures, including nonzero epsilon. Midpoint reversal and
+its implicit backward against a differentiated solve are also checked.
+
 ## Validation and references
 
 The small MPS tests cover scalar-gradient identities (including epsilon=.01),

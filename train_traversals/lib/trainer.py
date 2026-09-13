@@ -15,6 +15,7 @@ import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
 from .aux import (
+    save_experiment_config, object_settings,
     TrainingStatTracker, update_progress, update_stdout, sec2dhms, ImageLogger,
     _per_k_grad_norms, tb_start, twostep_batch_acc_from_logits,
     entropy_from_logits, collect_wave_stats,
@@ -52,7 +53,10 @@ class TraversalTrainer(object):
             self.amp_dtype = None
         else:
             raise ValueError(f"Unsupported mixed precision mode: {self.mixed_precision!r}")
-        self.amp_enabled = self.use_cuda and self.amp_dtype is not None
+        self.amp_enabled = (
+            self.amp_dtype is not None
+            and torch.amp.autocast_mode.is_autocast_available(self.device.type)
+        )
 
         # dirs
         self.tensorboard = bool(getattr(self.params, "tensorboard", False))
@@ -166,7 +170,7 @@ class TraversalTrainer(object):
         return torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=True)
 
     def fp32_context(self):
-        if not self.use_cuda:
+        if not torch.amp.autocast_mode.is_autocast_available(self.device.type):
             return nullcontext()
         return torch.amp.autocast(device_type=self.device.type, enabled=False)
 
@@ -230,7 +234,7 @@ class TraversalTrainer(object):
     # ------------------------ optim/sched ------------------------
     def init_optimizers(self, traversal_sets, recognizer, acc_steps: int):
         traversal_set_wd = float(getattr(self.params, "traversal_set_wd", 0.001))
-        recognizer_wd = float(getattr(self.params, "recognizer_wd", 0.1))
+        recognizer_wd = float(getattr(self.params, "recognizer_wd", 0.001))
         betas = tuple(getattr(self.params, "adam_betas", (0.9, 0.999)))
         eps = float(getattr(self.params, "adam_eps", 1e-8))
 
@@ -269,7 +273,7 @@ class TraversalTrainer(object):
             lr=self.params.recognizer_lr,
             weight_decay=recognizer_wd,
             extra_no_decay_names=(),
-            betas=betas,
+            betas=(0.,0.99),
             eps=eps,
         )
 
@@ -474,6 +478,27 @@ class TraversalTrainer(object):
 
         self._maybe_init_image_logger(recognizer)
         validation = TraversalValidation(self, generator)
+
+        save_experiment_config(
+            self.wip_dir, self.params,
+            models={"generator": generator, "recognizer": recognizer},
+            traversals={"pde": traversal_sets},
+            optimizers={"traversal": traversal_sets_optim, "recognizer": recognizer_optim},
+            schedulers={"traversal": sched_support, "recognizer": sched_recon},
+            training={**object_settings(self), "starting_micro_step": starting_micro,
+                      "starting_optimizer_step": _opt_step_idx, "accumulate_grad_steps": acc_steps,
+                      "total_optimizer_steps": total_opt_steps,
+                      "z_truncation": init_truncation,
+                      "randomize_target_step": getattr(self.params, "randomize_target_step", True),
+                      "generator_recompute_chunk": getattr(self.params, "generator_recompute_chunk", 0),
+                      "bidirectional": getattr(self.params, "bidirectional", False),
+                      "validation": object_settings(validation),
+                      "traversal_clip_mode": getattr(self.params, "traversal_clip_mode", "delta_prophet"),
+                      "traversal_clip_end": getattr(self.params, "traversal_clip_end", 1.0),
+                      "traversal_clip_step": getattr(self.params, "traversal_clip_step", None),
+                      "traversal_clip_alpha": getattr(self.params, "traversal_clip_alpha", 3.0),
+                      "traversal_clip_final": getattr(self.params, "traversal_clip_final", None)},
+        )
 
         t0 = time.time()
 

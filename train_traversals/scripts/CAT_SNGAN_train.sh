@@ -11,7 +11,7 @@ num_traversal_timesteps=20
 warmup_fraction=0.001
 accumulate_grad_steps=2
 recognizer_type="CAT"
-batch_size=3
+batch_size=4
 val_batch_size=6
 val_freq=250
 val_num_positions=18
@@ -48,12 +48,14 @@ python train.py $tb \
                 --val-seed=${val_seed} \
                 "${val_dt_args[@]}" \
                 --max-iter=${max_iter} \
-                --recognizer-lr 2e-4 \
+                --recognizer-lr 8e-4 \
                 --traversal-set-lr 2e-4 \
                 --warmup-fraction=${warmup_fraction} \
                 --accumulate-grad-steps=${accumulate_grad_steps} \
                 --log-freq=50 \
-                --ckp-freq=200 \
+                --ckp-freq=100 \
+                --mixed-precision=bf16 \
+                --compile \
                 --reset_lr \
                 --reset_weight_decay \
                 --reset_schedulers \

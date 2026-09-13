@@ -1,3 +1,6 @@
+# torch/torchvision are intentionally omitted; use the preinstalled CUDA build.
+# lpips and timm declare torch as a dependency; scripts/setup_train_traversals.sh
+# installs them with --no-deps so pip does not pull torch from PyPI.
 tensorboard
 scipy
 matplotlib
@@ -11,3 +14,4 @@ ninja
 lpips
 timm
 einops
+PyYAML

@@ -53,7 +53,9 @@ python train.py $tb \
                 --warmup-fraction=${warmup_fraction} \
                 --accumulate-grad-steps=${accumulate_grad_steps} \
                 --log-freq=50 \
-                --ckp-freq=200 \
+                --ckp-freq=100 \
+                --mixed-precision=bf16 \
+                --compile \
                 --reset_lr \
                 --reset_weight_decay \
                 --reset_schedulers \

@@ -189,7 +189,6 @@ def robust_load_waves(S: nn.Module, ckpt):
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description='Generate paired images for VP metric')
     p.add_argument('--exp', type=str, required=True, help="experiment dir (created by train.py)")
-    p.add_argument('--eps', type=float, default=0.2, help="shift magnitude (unused for PDE rollout)")
     p.add_argument('--shift-leap', type=float, default=1.0, help="frame stride for saving (unused here)")
     p.add_argument('--batch-size', type=int, default=2, help="generator batch size")
     p.add_argument('--img-size', type=int, default=256, help="saved image size (resized)")
@@ -198,7 +197,8 @@ if __name__ == '__main__':
     p.add_argument('--gif-size', type=int, default=256)
     p.add_argument('--gif-fps', type=int, default=30)
     p.add_argument('--n-samples', type=int, default=10000, help="number of samples to generate")
-    p.add_argument('--only-potential', type=bool, default=True, help="only generate potential pairs")
+    p.add_argument('--seed', type=int, default=None, help='seed sampling and random directions')
+    p.add_argument('--bidirectional', action='store_true', help='sample each pair in either direction with equal probability')
     args = p.parse_args()   
 
     device = choose_device()
@@ -247,7 +247,14 @@ if __name__ == '__main__':
     z_trunc = a.__dict__.get('z_truncation', None)
 
     all_labels = []
+    all_directions = []
     pair_idx = 0  # global pair counter (across all batches)
+    # Seed after model loading so initialization cannot affect the sampling sequence.
+    if args.seed is not None:
+        import random
+        random.seed(args.seed)
+        np.random.seed(args.seed % (2**32))
+        torch.manual_seed(args.seed)
 
     # Generate until we have exactly n_samples pairs (each pair corresponds to one support set)
     while pair_idx < n_samples:
@@ -261,6 +268,10 @@ if __name__ == '__main__':
         z0 = sample_z(cur_B*K, G, params=a, device=device)
         z_cur = z0.reshape(cur_B, K, G.dim_z)
         z0_batch = z0.reshape(cur_B * K, G.dim_z)
+        if args.bidirectional:
+            direction = torch.randint(0, 2, (cur_B, K), device=device) * 2 - 1
+        else:
+            direction = torch.ones(cur_B, K, device=device)
 
         # Rollout by PDE: latent_{t+1} = latent_t + ∇_z u(latent_t, t)
         with torch.no_grad():
@@ -272,7 +283,7 @@ if __name__ == '__main__':
                     device=device,
                     dtype=z_cur.dtype,
                 )
-                z_cur, dz = S.inference(z_cur, t_b, dt=dt_b)  # returns (z_curr, delta_z), with K paths batched
+                z_cur, dz = S.inference(z_cur, t_b, dt=dt_b, direction=direction)
                 z_cur = z_cur + dz
 
         # One-hot labels for VP: [cur_B*K, K]
@@ -284,6 +295,8 @@ if __name__ == '__main__':
         take = min(batch_pairs, remaining)
 
         all_labels.append(label[:take].cpu().numpy())
+        if args.bidirectional:
+            all_directions.append(direction.reshape(-1)[:take].cpu().numpy())
 
         # Generate images for the selected pairs
         with torch.no_grad():
@@ -300,7 +313,10 @@ if __name__ == '__main__':
         img1 = img1.to(torch.float32).clamp(-1, 1)
         img2 = img2.to(torch.float32).clamp(-1, 1)
 
-        for im1, im2 in zip(img1, img2):
+        for local_idx, (im1, im2) in enumerate(zip(img1, img2)):
+            # Negative endpoints precede the initial image in the positive direction.
+            if direction.reshape(-1)[local_idx] < 0:
+                im1, im2 = im2, im1
             a1 = im1.detach().cpu().numpy().transpose(1, 2, 0)  # HWC, RGB
             a2 = im2.detach().cpu().numpy().transpose(1, 2, 0)
             pair = np.concatenate([a1, a2], axis=1)
@@ -319,4 +335,8 @@ if __name__ == '__main__':
     # Be safe and trim to exactly n_samples in case of any rounding
     labels = labels[:n_samples]
     np.save(osp.join(out_dir, 'labels.npy'), labels)
+    if args.bidirectional:
+        np.save(osp.join(out_dir, 'directions.npy'), np.concatenate(all_directions))
+    elif osp.exists(osp.join(out_dir, 'directions.npy')):
+        os.remove(osp.join(out_dir, 'directions.npy'))
     print(f"Done. Saved {n_samples} pairs and labels.npy to {out_dir}")

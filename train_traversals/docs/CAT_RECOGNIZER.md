@@ -135,9 +135,8 @@ explicitly. Integer and one-hot CE targets are unchanged.
   and sine/cosine position helpers, reusing its existing attention, RoPE, and
   SwiGLU modules.
 - `../CAT/models/discriminator.py`: import those extracted components.
-- `lib/cat_components.py`: import only that shared code through a private
-  package namespace, avoiding the two projects' conflicting `models` names.
-- `lib/cat_recognizer.py`: pair pyramid, positional caches, scale-wise backbone,
+- `lib/cat_recognizer.py`: import shared CAT code through a private package
+  namespace, avoiding conflicting `models` names; pair pyramid, positional caches, scale-wise backbone,
   shared classification head and optional checkpointing.
 - `lib/recognizer.py`: CAT dispatch, optional architecture kwargs, shared CLI
   helpers, and the repaired forward antisymmetry dispatch.

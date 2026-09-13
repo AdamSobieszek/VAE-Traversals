@@ -1,11 +1,17 @@
 """Fixed-cohort, noise-free traversal validation and compact TensorBoard logging."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from io import BytesIO
 import json
 from pathlib import Path
 import time
+
+# Support both `python -m lib.val_utils` and `python lib/val_utils.py`.
+if __name__ == '__main__' and not __package__:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = 'lib'
 
 import numpy as np
 import torch
@@ -88,6 +94,16 @@ def accuracy_curve(correct, seed, bootstrap_samples=1000):
     return correct.mean(axis=(0, 1)), low, high
 
 
+def unroll_traversal(traversal, current, steps, dt, direction=1, fp32_context=nullcontext):
+    """Yield detached successive vertices for [B, K, D] starts, without retaining a path."""
+    dt = current.new_full((len(current), 1), dt)
+    for _ in range(steps):
+        with torch.no_grad(), fp32_context():
+            origin, delta = traversal.inference(current, dt=dt, direction=direction)
+            current = origin.detach() + delta.detach()
+        yield current
+
+
 class TraversalValidation:
     """Own the cohort, rollout, statistics and output; trainer only schedules run()."""
 
@@ -142,15 +158,12 @@ class TraversalValidation:
         signs = z.new_tensor(self.directions).repeat_interleave(b)
         path = z.new_empty(directions * self.steps + 1, b, k, d)
         path[self.center].copy_(current[:b])
-        for index in range(self.steps):
-            with trainer.fp32_context():
-                origin, delta = traversal.inference(current, dt=self.dt, direction=signs)
-            following = (origin.detach() + delta.detach()).reshape(directions, b, k, d)
+        for index, vertex in enumerate(unroll_traversal(
+                traversal, current, self.steps, self.dt, signs, trainer.fp32_context)):
+            following = vertex.reshape(directions, b, k, d)
             path[self.center + index + 1].copy_(following[0])
             if self.center:
                 path[self.center - index - 1].copy_(following[1])
-            current = following.view(directions * b, k, d)
-            del origin, delta
         return path.view(-1, b * k, d)
 
     def _capture_path_images(self, generator, images, vertex, start):
@@ -172,12 +185,13 @@ class TraversalValidation:
         images = torch.cat([ImageViz.to_uint01(row) for row in rows])
         grid = make_grid(images, nrow=self._image_columns, padding=2)
         pixels = grid.mul(255).clamp_(0, 255).byte().permute(1, 2, 0).numpy()
-        with BytesIO() as buffer:
-            Image.fromarray(pixels).save(buffer, format='PNG', optimize=True, compress_level=6)
-            encoded = buffer.getvalue()
-        (output / f'path_{int(step):08d}.png').write_bytes(encoded)
+        image = Image.fromarray(pixels)
+        image.save(output / f'path_{int(step):08d}.webp', format='WEBP', quality=80, method=6)
         if writer is not None:
-            # Reuse the compressed PNG rather than encoding it again in add_image.
+            with BytesIO() as buffer:
+                image.save(buffer, format='PNG', optimize=True, compress_level=6)
+                encoded = buffer.getvalue()
+            # TensorBoard Image summaries expect PNG (or JPEG), not WebP.
             summary = Summary(value=[Summary.Value(tag='validation/path_images', image=Summary.Image(
                 height=pixels.shape[0], width=pixels.shape[1], colorspace=pixels.shape[2],
                 encoded_image_string=encoded))])
@@ -298,3 +312,169 @@ class TraversalValidation:
             return record
         finally:
             update_stdout(3)
+
+
+def load_pair_generator(args, device):
+    """Rebuild the generator with the same defaults and weight choices as gen_pairs.py."""
+    from models import gan_load
+    from .config import GAN_WEIGHTS, GAN_RESOLUTIONS
+
+    a, kind = vars(args), args.gan_type
+    cfg = GAN_WEIGHTS[kind]
+    if kind == 'GAT':
+        resolution = int(a.get('resolution') or GAN_RESOLUTIONS[kind])
+        checkpoint = Path(a.get('gat_ckpt') or cfg['weights'][resolution]).expanduser()
+        if not checkpoint.is_absolute():
+            checkpoint = Path(__file__).resolve().parents[1] / checkpoint
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f'GAT checkpoint not found: {checkpoint}')
+        generator = gan_load.build_gat(
+            str(checkpoint.resolve()), target_classes=tuple(a.get('target_classes', [239])),
+            model_name=a.get('gat_model') or cfg.get('model'), resolution=resolution,
+            vae_variant=a.get('vae_variant') or cfg.get('vae_variant', 'ema'),
+            truncation_psi=float(a.get('truncation_psi', .2)),
+            mixed_precision=a.get('mixed_precision', 'bf16'), load_vae=True)
+    elif kind == 'StyleGAN2':
+        early, compile = a.get('early_output', False), a.get('compile', False)
+        resolution = a.get('stylegan2_resolution', 1024)
+        builder = gan_load.build_stylegan2_early_output if early else gan_load.build_stylegan2mps
+        generator = builder(
+            pretrained_gan_weights=cfg['weights']['early_output' if early else resolution],
+            shift_in_w_space=a.get('shift_in_w_space', False), compile=compile,
+            compile_mode=a.get('compile_mode', 'default'),
+            use_optimized=compile and (early or not a.get('no_optimized_synthesis', False)),
+            mixed_precision=a.get('mixed_precision', 'bf16'),
+            **({} if early else {'resolution': resolution}))
+    else:
+        builder, options = {
+            'BigGAN': (gan_load.build_biggan, {'target_classes': a.get('biggan_target_classes')}),
+            'ProgGAN': (gan_load.build_proggan, {}),
+        }.get(kind, (gan_load.build_sngan, {'gan_type': kind}))
+        generator = builder(pretrained_gan_weights=cfg['weights'][GAN_RESOLUTIONS[kind]], **options)
+    return generator.to(device).eval()
+
+
+def load_pair_experiment(directory, device):
+    """Load args, generator and strict PDE weights, retaining legacy checkpoint precedence."""
+    from argparse import Namespace
+    from .TraversalPDE import TraversalPDE, traversal_options
+
+    directory = Path(directory)
+    for folder in (directory, directory / 'models'):
+        if not folder.is_dir():
+            raise NotADirectoryError(f'Invalid experiment/models directory: {folder}')
+    with (directory / 'args.json').open() as stream:
+        args = Namespace(**json.load(stream))
+    models = directory / 'models'
+    checkpoint = models / 'checkpoint.pt'
+    if not checkpoint.is_file():
+        candidates = ([models / 'traversal_sets.pt'] if (models / 'traversal_sets.pt').is_file() else [])
+        candidates += sorted(models.glob('traversal_sets-*'))
+        if not candidates:
+            raise FileNotFoundError(f'No checkpoint found in {models}')
+        checkpoint = candidates[-1]
+    state = torch.load(checkpoint, map_location=device)
+    generator = load_pair_generator(args, device)
+    for key, value in list(vars(args).items()):
+        if 'support_' in key:
+            setattr(args, key.replace('support_', 'traversal_'), value)
+    traversal = TraversalPDE(args.num_traversal_sets, args.num_traversal_timesteps,
+                             generator.dim_z, **traversal_options(args)).to(device).eval()
+    if isinstance(state, dict):
+        for key in ('traversal_sets', 'support_sets', 'state_dict'):
+            if isinstance(state.get(key), dict):
+                state = state[key]
+                break
+    if not isinstance(state, dict) or not any(
+            key == 'c' or key.startswith(('F.', 'PSI')) for key in state):
+        raise RuntimeError('Could not find TraversalPDE weights in checkpoint')
+    traversal.load_state_dict(state, strict=True)
+    return args, generator, traversal
+
+
+def save_pair_images(directory, first, second, start, img_size=256, img_quality=75):
+    """Write side-by-side JPEGs using gen_pairs' resize, rounding and RGB/BGR conversion."""
+    import cv2
+
+    if img_size is not None:
+        first, second = (torch.nn.functional.interpolate(
+            image, size=(img_size, img_size), mode='bilinear', align_corners=False)
+            for image in (first, second))
+    first, second = (image.float().clamp(-1, 1) for image in (first, second))
+    for index, (a, b) in enumerate(zip(first, second), start):
+        pair = torch.cat((a, b), dim=-1).detach().cpu().permute(1, 2, 0).numpy()
+        pixels = ((pair + 1.) * 127.5).round().astype(np.uint8)[:, :, ::-1]
+        path = Path(directory) / f'pair_{index:06d}.jpg'
+        if not cv2.imwrite(str(path), pixels, [cv2.IMWRITE_JPEG_QUALITY, int(img_quality)]):
+            raise OSError(f'Could not write {path}')
+
+
+@torch.no_grad()
+def generate_pairs(args, params, generator, traversal, device):
+    """Stream legacy VP endpoints; starts are independent per head, unlike validation."""
+    if args.batch_size < 1 or args.n_samples < 1:
+        raise ValueError('batch-size and n-samples must be positive')
+    if getattr(args, 'seed', None) is not None:
+        import random
+        random.seed(args.seed)
+        np.random.seed(args.seed % (2**32))
+        torch.manual_seed(args.seed)
+    output = Path(args.exp) / 'vp_pairs'
+    output.mkdir(parents=True, exist_ok=True)
+    k, steps = int(traversal.num_traversal_sets), traversal.num_traversal_timesteps // 2 - 1
+    labels = []
+    directions = []
+    for start in range(0, args.n_samples, args.batch_size * k):
+        remaining = args.n_samples - start
+        batch = min(args.batch_size, (remaining + k - 1) // k)
+        print(f'Generating image pairs batch with base batch-size={batch}, remaining={remaining} ...')
+        initial = sample_z(batch * k, generator, params, device)
+        endpoint = initial.reshape(batch, k, generator.dim_z)
+        direction = (torch.randint(0, 2, (batch, k), device=device) * 2 - 1
+                     if getattr(args, 'bidirectional', False) else torch.ones(batch, k, device=device))
+        for endpoint in unroll_traversal(
+                traversal, endpoint, steps, args.shift_leap * 2 / max(1, steps), direction):
+            pass
+        take = min(batch * k, remaining)
+        labels.append(torch.eye(k, device=device).repeat(batch, 1)[:take].cpu().numpy())
+        if getattr(args, 'bidirectional', False):
+            directions.append(direction.flatten()[:take].cpu().numpy())
+        first = decode_generator_output_for_viz(generator, generator(initial[:take]))
+        second = decode_generator_output_for_viz(generator, generator(endpoint.reshape(-1, generator.dim_z)[:take]))
+        reverse = (direction.flatten()[:take] < 0).view(-1, 1, 1, 1)
+        first, second = torch.where(reverse, second, first), torch.where(reverse, first, second)
+        save_pair_images(output, first, second, start, args.img_size, args.img_quality)
+    np.save(output / 'labels.npy', np.concatenate(labels))
+    if directions:
+        np.save(output / 'directions.npy', np.concatenate(directions))
+    else:
+        (output / 'directions.npy').unlink(missing_ok=True)
+    print(f'Done. Saved {args.n_samples} pairs and labels.npy to {output}')
+
+
+def pairs_main(argv=None):
+    """The gen_pairs CLI, also available as `python -m lib.val_utils`."""
+    import argparse
+    from .utils import choose_device
+
+    parser = argparse.ArgumentParser(description='Generate paired images for VP metric')
+    parser.add_argument('--exp', type=str, required=True, help='experiment dir (created by train.py)')
+    parser.add_argument('--shift-leap', type=float, default=1., help='PDE step-size multiplier')
+    parser.add_argument('--batch-size', type=int, default=2, help='generator batch size')
+    parser.add_argument('--img-size', type=int, default=256, help='saved image size (resized)')
+    parser.add_argument('--img-quality', type=int, default=75, help='JPEG quality')
+    parser.add_argument('--gif', action='store_true', help='(unused)')
+    parser.add_argument('--gif-size', type=int, default=256)
+    parser.add_argument('--gif-fps', type=int, default=30)
+    parser.add_argument('--n-samples', type=int, default=10000, help='number of samples to generate')
+    parser.add_argument('--seed', type=int, default=None, help='seed sampling and random directions')
+    parser.add_argument('--bidirectional', action='store_true', help='sample each pair in either direction with equal probability')
+    args = parser.parse_args(argv)
+    torch.set_float32_matmul_precision('high')
+    device = choose_device()
+    params, generator, traversal = load_pair_experiment(args.exp, device)
+    generate_pairs(args, params, generator, traversal, device)
+
+
+if __name__ == '__main__':
+    pairs_main()

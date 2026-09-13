@@ -23,11 +23,131 @@ import re
 import cv2
 from torch.utils import data
 import glob
+from datetime import datetime, timezone
+import platform
+import shlex
+import shutil
+import yaml
 
 try:
     import imageio.v2 as imageio
 except Exception:
     imageio = None
+
+
+def snapshot_source(directory):
+    """Copy lib verbatim, except bytecode caches; never replace an earlier snapshot."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    if not (directory / "lib").exists():
+        shutil.copytree(Path(__file__).resolve().parent, directory / "lib",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
+        entrypoint = Path(sys.argv[0])
+        if entrypoint.is_file():
+            shutil.copy2(entrypoint, directory / entrypoint.name)
+    return directory
+
+
+def _class(obj):
+    return f"{type(obj).__module__}.{type(obj).__qualname__}"
+
+
+def _plain(value):
+    """YAML-safe metadata, never weights, optimizer moments, or object reprs."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return str(value) if isinstance(value, str) else value
+    if isinstance(value, (Path, torch.device, torch.dtype)):
+        return str(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1 and not isinstance(value, torch.nn.Parameter):
+            return value.detach().item()
+        return {"shape": list(value.shape), "dtype": str(value.dtype)}
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if callable(value) and hasattr(value, "__qualname__"):
+        return f"{value.__module__}.{value.__qualname__}"
+    return {"class": _class(value)}
+
+
+def object_settings(obj):
+    # Module/optimizer internals contain tensors, caches and cyclic references.
+    return {k: _plain(v) for k, v in vars(obj).items()
+            if (not k.startswith("_") or k.endswith("_cfg"))
+            and isinstance(v, (type(None), bool, int, float, str, dict, list, tuple,
+                               Path, torch.device, torch.dtype))}
+
+
+def _model(model):
+    wrappers = []
+    while isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) or hasattr(model, "_orig_mod"):
+        wrappers.append(_class(model))
+        model = model._orig_mod if hasattr(model, "_orig_mod") else model.module
+    params = list(model.parameters())
+    return {
+        "class": _class(model),
+        "wrappers": wrappers,
+        "settings": object_settings(model),
+        "losses": [{"class": _class(loss), **object_settings(loss)}
+                   for loss in getattr(model, "losses", [])],
+        "parameter_count": sum(p.numel() for p in params),
+        "trainable_parameter_count": sum(p.numel() for p in params if p.requires_grad),
+        "dtypes": sorted({str(p.dtype) for p in params}),
+        "devices": sorted({str(p.device) for p in params}),
+        "modules": {name: {"class": _class(module), "settings": object_settings(module)}
+                    for name, module in model.named_modules() if name},
+    }
+
+
+def save_experiment_config(directory, args, *, models, traversals, optimizers,
+                           schedulers, training=None):
+    """Save resolved objects after checkpoint restore/reset and before training.
+
+    Named mappings form the YAML sections. The first launch lives at the experiment
+    root; later launches get independent runs/<UTC timestamp>/ records and source.
+    This inventories configuration, not RNG state or model weights.
+    """
+    directory = Path(directory)
+    created = datetime.now(timezone.utc)
+    if (directory / "config.yaml").exists():
+        directory = directory / "runs" / created.strftime("%Y%m%dT%H%M%S.%fZ")
+    snapshot_source(directory)
+    all_models = {**models, **traversals}
+    names = {id(p): f"{name}.{key}" for name, model in all_models.items()
+             for key, p in model.named_parameters()}
+    optimizer_configs = {}
+    for name, optimizer in optimizers.items():
+        groups = []
+        for group in optimizer.param_groups:
+            groups.append({**{k: _plain(v) for k, v in group.items() if k != "params"},
+                           "parameters": [names.get(id(p), "<unnamed>") for p in group["params"]]})
+        optimizer_configs[name] = {"class": _class(optimizer),
+                                   "defaults": _plain(optimizer.defaults), "param_groups": groups}
+    config = {
+        "created_at": created.isoformat(),
+        "command": shlex.join(sys.argv),
+        "source_snapshot": "lib",
+        "environment": {"python": platform.python_version(), "torch": str(torch.__version__),
+                        "platform": platform.platform(), "cuda": torch.version.cuda,
+                        "torch_initial_seed": torch.initial_seed(),
+                        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+                        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+                        "cudnn_deterministic": torch.backends.cudnn.deterministic},
+        "args": _plain(args if isinstance(args, dict) else vars(args)),
+        "training": _plain(training or {}),
+        "models": {name: _model(obj) for name, obj in models.items()},
+        "traversals": {name: _model(obj) for name, obj in traversals.items()},
+        "optimizers": optimizer_configs,
+        "schedulers": {name: {"class": _class(obj), "state": _plain(obj.state_dict())}
+                       for name, obj in schedulers.items()},
+    }
+    # Serialize before opening the destination so a conversion error leaves no partial YAML.
+    content = yaml.safe_dump(config, sort_keys=False, allow_unicode=True, width=100)
+    path = directory / "config.yaml"
+    with path.open("x") as output:
+        output.write(content)
+    return path
 
 
 def create_exp_dir(args, new_experiment=False):
@@ -83,6 +203,7 @@ def create_exp_dir(args, new_experiment=False):
     # Create output directory (wip)
     wip_dir = osp.join("experiments", "wip", exp_dir)
     os.makedirs(wip_dir, exist_ok=True)
+    snapshot_source(wip_dir)
     # Save args namespace object in json format
     with open(osp.join(wip_dir, 'args.json'), 'w') as args_json_file:
         json.dump(args.__dict__, args_json_file)

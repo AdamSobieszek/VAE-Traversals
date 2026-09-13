@@ -71,5 +71,25 @@ Seeding occurs after model loading. Compare with the same batch size, device,
 weights and arguments; this does not enforce deterministic backend kernels.
 Omitting the seed retains unseeded behavior. Use separate copies of an experiment
 when comparing outputs, since both entry points write the same output names.
-`bash scripts/SNGAN_genpairs.sh` runs both implementations with seed 123 in isolated
-folders under the configured experiment and compares all output files byte for byte.
+
+## Generate pairs and run VP automatically
+
+`bash scripts/SNGAN_genpairs.sh /path/to/experiment` generates 20,000 pairs with
+`lib/val_utils.py`, seed 123 and bidirectional sampling, then invokes the sister
+project's SNGAN VP runner. Data goes to `EXPERIMENT/vp_pairs`; scores go to
+`EXPERIMENT/vp_results`. The VP output dimension is read from the generated labels.
+Without an argument, SNGAN uses the previously configured AnimeFaces experiment.
+
+Equivalent launchers are `StyleGAN_genpairs.sh` (StyleGAN2), `GAT_genpairs.sh`,
+`BigGAN_genpairs.sh`, and `ProgGAN_genpairs.sh`. Each accepts one or more experiment
+directories and uses the shared `genpairs_vp.sh` pipeline. The current pair loader
+does not support SD-VAE, so there is no SD-VAE generation launcher.
+
+The VP project defaults to `../VP-metric-pytorch`; set `VP_ROOT` to override it.
+Set `PAIR_PYTHON` / `VP_PYTHON` to choose runtimes. The default uses manip311 when
+installed locally, otherwise `python`. Other overrides are `N_SAMPLES`, `SEED`,
+`BIDIRECTIONAL` (0 or 1), `PAIR_BATCH_SIZE`, `PAIR_IMG_SIZE`, `SHIFT_LEAP`,
+`IMG_QUALITY`, and `VP_EPOCHS` (default 300).
+
+VP runners can also be invoked independently:
+`bash ../VP-metric-pytorch/scripts/run_vp_sngan.sh --data-dir DATA --result-dir RESULTS --out-dim K`.

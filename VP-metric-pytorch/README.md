@@ -47,6 +47,7 @@ size. For example:
 
 ```bash
 scripts/run_vp_biggan.sh \
+    --data-dir /path/to/vp_pairs --result-dir /path/to/vp_results \
     --mode learning-curve \
     --n_fold=2 \
     --train-fractions 0.1 0.2 0.4 0.8
@@ -103,6 +104,7 @@ therefore **off by default**:
 
 ```bash
 scripts/run_vp_biggan.sh \
+    --data-dir /path/to/vp_pairs --result-dir /path/to/vp_results \
     --device-preprocessing \
     --amp bfloat16 \
     --tf32 \
@@ -121,11 +123,11 @@ MPS supports `float16` rather than `bfloat16`, while CPU autocast supports
 (4x less transfer data) and normalizes them on the accelerator. It is opt-in
 because the historical benchmark normalized inside CPU loader workers.
 
-The `scripts/` directory contains the exact settings used for each recorded
-model dataset. For example, run `scripts/run_vp_biggan.sh`. These scripts may be
+The `scripts/` directory contains model presets. Supply dataset and results
+paths, for example: `bash scripts/run_vp_biggan.sh --data-dir DATA --result-dir RESULTS`. These scripts may be
 called from any working directory; set `PYTHON` to select a particular Python
 interpreter. Extra arguments are forwarded, so
-`scripts/run_vp_biggan.sh --dry-run` can inspect a preset without starting
+`bash scripts/run_vp_biggan.sh --data-dir DATA --result-dir RESULTS --dry-run` can inspect a preset without starting
 training.
 
 ## Citation
@@ -137,3 +139,9 @@ booktitle={ECCV},
 year={2020}
 }
 ```
+
+All model runners accept `--data-dir` and `--result-dir` through the shared CLI;
+there are no machine-specific dataset paths in these scripts. Override `--out-dim`
+when the traversal count differs from the preset. The sibling train_traversals
+`MODEL_genpairs.sh` scripts generate the dataset first and pass all three values
+automatically. Set `PYTHON` to select the VP runtime.

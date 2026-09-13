@@ -1,15 +1,6 @@
-declare -a EXPERIMENTS=("/workspace/experiments/wip/BigGAN-239-LeNet-K120-D20__20260627_164520")
-gan_type="BigGAN"
-
-
-for exp in "${EXPERIMENTS[@]}"
-do
-  # Traverse latent space
-  python gen_pairs.py --exp="${exp}" \
-                --batch-size 8 \
-                --img-size 256 \
-                --shift-leap 1.0 \
-                --img-quality 85 \
-                --n-samples 20000 \
-                --only-potential=true
-done
+#!/usr/bin/env bash
+set -euo pipefail
+train_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export VP_RUNNER=run_vp_gat.sh
+export PAIR_BATCH_SIZE="${PAIR_BATCH_SIZE:-1}" PAIR_IMG_SIZE="${PAIR_IMG_SIZE:-256}"
+exec bash "${train_dir}/scripts/genpairs_vp.sh" "$@"

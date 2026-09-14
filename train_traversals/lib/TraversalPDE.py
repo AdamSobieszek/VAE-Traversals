@@ -8,36 +8,6 @@ from lib.pde_ops import PDEState, broadcast_bk, metric_gradient
 from lib.pde_losses import build_losses
 
 
-@torch.no_grad()
-def cone_noise(delta: torch.Tensor, aperture: float = 0.2,
-                        gaussian: torch.Tensor = None) -> torch.Tensor:
-    """Sample the transverse part of a fixed-angle Gaussian-cone step.
-
-    Project isotropic Gaussian noise onto delta's orthogonal complement and
-    normalize it to radius aperture*||delta||. Thus the step delta+noise has
-    tan(angle)=aperture away from the numerical clamps: its azimuth is uniform,
-    its angle is fixed. This is
-    the existing normalized-Gaussian kernel, not additive Gaussian diffusion.
-    Noise is stop-gradient; only the deterministic step trains the potential.
-    ``gaussian`` permits reproducible kernel comparisons without changing RNG.
-    """
-    noise = torch.randn_like(delta) if gaussian is None else gaussian.clone()
-    radius2 = delta.square().sum(-1, keepdim=True)
-    projection = (noise * delta).sum(-1, keepdim=True) / radius2.clamp_min(1e-12)
-    noise.addcmul_(delta, projection, value=-1)
-    return noise.mul_(radius2.sqrt().mul_(aperture) / noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12))
-
-@torch.no_grad()
-def gaussian_cone_noise(delta: torch.Tensor, aperture: float = 0.5,
-                        gaussian: torch.Tensor = None) -> torch.Tensor:
-    """Sample the transverse part of a fixed-angle Gaussian-cone step.
-    """
-    dim_correction = 1/delta.shape[-1]**0.5
-    noise = torch.randn_like(delta) if gaussian is None else gaussian.clone()
-    radius2 = delta.norm(dim=-1, keepdim=True)
-    return noise.mul_(radius2.mul_(aperture * dim_correction))
-
-
 # ================================================================
 # Core stacked layers (vectorized over traversal-set axis K)
 # ================================================================
@@ -319,6 +289,17 @@ def traversal_options(args):
                 midpoint_atol=getattr(args, "midpoint_atol", 1e-6),
                 midpoint_rtol=getattr(args, "midpoint_rtol", 1e-6),
                 noise_aperture=getattr(args, "traversal_noise", 0.5))
+
+
+@torch.no_grad()
+def gaussian_cone_noise(delta: torch.Tensor, aperture: float = 0.5,
+                        gaussian: torch.Tensor = None) -> torch.Tensor:
+    """Sample the transverse part of a fixed-angle Gaussian-cone step.
+    """
+    dim_correction = 1/delta.shape[-1]**0.5
+    noise = torch.randn_like(delta) if gaussian is None else gaussian.clone()
+    radius2 = delta.norm(dim=-1, keepdim=True)
+    return noise.mul_(radius2.mul_(aperture * dim_correction))
 
 
 class TraversalPDE(nn.Module):

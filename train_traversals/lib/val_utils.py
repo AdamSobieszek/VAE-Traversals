@@ -455,8 +455,14 @@ def generate_pairs(args, params, generator, traversal, device):
 def pairs_main(argv=None):
     """The gen_pairs CLI, also available as `python -m lib.val_utils`."""
     import argparse
+    import sys
     from .utils import choose_device
 
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if '--explainability' in argv:
+        from .explainability import main
+        argv.remove('--explainability')
+        return main(argv)
     parser = argparse.ArgumentParser(description='Generate paired images for VP metric')
     parser.add_argument('--exp', type=str, required=True, help='experiment dir (created by train.py)')
     parser.add_argument('--shift-leap', type=float, default=1., help='PDE step-size multiplier')

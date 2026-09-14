@@ -15,6 +15,25 @@ from .aux import ImageViz
 from .utils import CosineScheduleWithWarmup
 
 
+@torch.no_grad()
+def cone_noise(delta: torch.Tensor, aperture: float = 0.2,
+                        gaussian: torch.Tensor = None) -> torch.Tensor:
+    """Sample the transverse part of a fixed-angle Gaussian-cone step.
+
+    Project isotropic Gaussian noise onto delta's orthogonal complement and
+    normalize it to radius aperture*||delta||. Thus the step delta+noise has
+    tan(angle)=aperture away from the numerical clamps: its azimuth is uniform,
+    its angle is fixed. This is
+    the existing normalized-Gaussian kernel, not additive Gaussian diffusion.
+    Noise is stop-gradient; only the deterministic step trains the potential.
+    ``gaussian`` permits reproducible kernel comparisons without changing RNG.
+    """
+    noise = torch.randn_like(delta) if gaussian is None else gaussian.clone()
+    radius2 = delta.square().sum(-1, keepdim=True)
+    projection = (noise * delta).sum(-1, keepdim=True) / radius2.clamp_min(1e-12)
+    noise.addcmul_(delta, projection, value=-1)
+    return noise.mul_(radius2.sqrt().mul_(aperture) / noise.norm(dim=-1, keepdim=True).clamp_min_(1e-12))
+    
 class PhasedCosineWithRestarts(_LRScheduler):
     """
     Cosine LR with warmup + SGDR-style restarts + phase offset (radians).
